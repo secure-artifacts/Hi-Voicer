@@ -37,11 +37,23 @@ export interface HotwordRule {
 
 export interface UserSettings {
   shortcut: string;
+  selectedModelId: string;
   modelDir: string;
   outputDir: string;
   pasteMode: PasteMode;
   saveRecordings: boolean;
   launchAtStartup: boolean;
+}
+
+export interface ModelPreset {
+  id: string;
+  name: string;
+  size: string;
+  quality: string;
+  memory: string;
+  recommendedFor: string;
+  license: string;
+  downloadUrl: string;
 }
 
 export interface DiagnosticItem {

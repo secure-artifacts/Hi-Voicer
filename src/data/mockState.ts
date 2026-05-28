@@ -27,6 +27,7 @@ export const initialHotwords: HotwordRule[] = [
 
 export const initialSettings: UserSettings = {
   shortcut: "CapsLock",
+  selectedModelId: "vosk-small-cn-0.22",
   modelDir: "",
   outputDir: "",
   pasteMode: "clipboard",

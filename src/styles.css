@@ -307,6 +307,7 @@ textarea {
   border-radius: 8px;
   cursor: pointer;
   font-weight: 700;
+  gap: 8px;
 }
 
 .primary-button {
@@ -435,7 +436,9 @@ textarea {
   justify-content: flex-end;
 }
 
-.setting-control input {
+.setting-control input,
+.shortcut-capture,
+.path-button {
   width: 100%;
   min-height: 38px;
   padding: 0 12px;
@@ -445,11 +448,119 @@ textarea {
   color: #101828;
 }
 
+.shortcut-capture,
+.path-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.shortcut-capture {
+  justify-content: center;
+  font-weight: 800;
+}
+
+.shortcut-capture--active {
+  border-color: #0f766e;
+  outline: 3px solid rgb(15 118 110 / 16%);
+}
+
+.path-button {
+  justify-content: flex-start;
+  min-width: 0;
+  text-align: left;
+}
+
+.path-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .setting-control input[type="checkbox"] {
   width: 20px;
   min-height: 20px;
   padding: 0;
   accent-color: #0f766e;
+}
+
+.setting-row--stacked {
+  display: grid;
+  align-items: stretch;
+}
+
+.setting-heading,
+.model-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.model-card {
+  min-height: 142px;
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #475467;
+  cursor: pointer;
+  text-align: left;
+}
+
+.model-card:hover {
+  border-color: #0f766e;
+}
+
+.model-card--selected {
+  border-color: #0f766e;
+  background: #f0fdfa;
+}
+
+.model-card__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #101828;
+  font-weight: 800;
+}
+
+.model-card small {
+  color: #667085;
+  line-height: 1.5;
+}
+
+.model-actions {
+  padding-top: 4px;
+}
+
+.model-actions div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.model-actions span {
+  color: #667085;
+  font-size: 13px;
+}
+
+.model-actions strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .diagnostic-row {
