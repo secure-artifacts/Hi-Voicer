@@ -1,0 +1,18 @@
+[package]
+name = "hi-voicer"
+version = "0.1.0"
+description = "Offline Chinese voice input and transcription desktop app"
+authors = ["Hi-Voicer"]
+edition = "2021"
+
+[lib]
+name = "hi_voicer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
