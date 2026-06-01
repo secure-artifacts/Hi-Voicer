@@ -4,15 +4,26 @@ import { initialSettings } from "../data/mockState";
 import { SettingsPage } from "../pages/SettingsPage";
 
 vi.mock("../lib/api", () => ({
+  installModel: vi.fn(() => Promise.resolve("C:\\Users\\TOM\\AppData\\Local\\Hi-Voicer\\models\\sherpa-paraformer-zh")),
+  listenModelInstallProgress: vi.fn(() => Promise.resolve(() => {})),
   openExternalUrl: vi.fn(),
   selectDirectory: vi.fn(() => Promise.resolve(null)),
 }));
 
+function renderSettings(onSettingsChange = vi.fn()) {
+  render(
+    <SettingsPage
+      settings={initialSettings}
+      onOpenRecordingsFolder={vi.fn()}
+      onSettingsChange={onSettingsChange}
+    />,
+  );
+  return onSettingsChange;
+}
+
 describe("SettingsPage", () => {
   it("captures keyboard shortcuts by pressing keys", () => {
-    const onSettingsChange = vi.fn();
-
-    render(<SettingsPage settings={initialSettings} onSettingsChange={onSettingsChange} />);
+    const onSettingsChange = renderSettings();
 
     const shortcutButton = screen.getByRole("button", { name: "CapsLock" });
     fireEvent.click(shortcutButton);
@@ -25,16 +36,46 @@ describe("SettingsPage", () => {
     );
   });
 
-  it("selects a preset model and updates the download action", () => {
-    const onSettingsChange = vi.fn();
+  it("selects a preset model and updates the selected model", () => {
+    const onSettingsChange = renderSettings();
 
-    render(<SettingsPage settings={initialSettings} onSettingsChange={onSettingsChange} />);
-
-    fireEvent.click(screen.getByRole("button", { name: /Vosk 中文高精度/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Sherpa FunASR-Nano/ }));
 
     expect(onSettingsChange).toHaveBeenCalledWith(
       expect.objectContaining({
-        selectedModelId: "vosk-cn-0.22",
+        selectedModelId: "sherpa-funasr-nano",
+      }),
+    );
+  });
+
+  it("selects dark theme", () => {
+    const onSettingsChange = renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: "暗色" }));
+
+    expect(onSettingsChange).toHaveBeenCalledWith(expect.objectContaining({ theme: "dark" }));
+  });
+
+  it("toggles launch at startup", () => {
+    const onSettingsChange = renderSettings();
+
+    fireEvent.click(screen.getByLabelText("开机启动"));
+
+    expect(onSettingsChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        launchAtStartup: true,
+      }),
+    );
+  });
+
+  it("toggles mini window visibility", () => {
+    const onSettingsChange = renderSettings();
+
+    fireEvent.click(screen.getByLabelText("显示悬浮按钮"));
+
+    expect(onSettingsChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        showMiniWindow: false,
       }),
     );
   });

@@ -4,3 +4,6 @@ src-tauri/target/
 src-tauri/gen/
 .vite/
 *.log
+log.txt
+.inspect-*/
+.reference/

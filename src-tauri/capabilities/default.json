@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default desktop permissions for Hi-Voicer",
-  "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "shell:allow-open"]
+  "windows": ["main", "mini", "wave"],
+  "permissions": ["core:default", "core:window:allow-start-dragging", "dialog:default", "shell:allow-open"]
 }

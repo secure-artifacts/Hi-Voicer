@@ -13,10 +13,41 @@
     "windows": [
       {
         "title": "Hi-Voicer",
-        "width": 1180,
-        "height": 760,
-        "minWidth": 1024,
-        "minHeight": 720
+        "width": 1040,
+        "height": 680,
+        "minWidth": 760,
+        "minHeight": 520
+      },
+      {
+        "label": "mini",
+        "title": "Hi-Voicer Mini",
+        "url": "index.html",
+        "width": 46,
+        "height": 46,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "x": 1200,
+        "y": 760
+      },
+      {
+        "label": "wave",
+        "title": "Hi-Voicer Wave",
+        "url": "index.html",
+        "width": 156,
+        "height": 42,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "x": 830,
+        "y": 920
       }
     ],
     "security": {

@@ -7,6 +7,7 @@ export const initialStatus: AppStatus = {
   microphoneName: "默认麦克风",
   lastResult: "模型配置完成后，这里会显示最近一次识别结果。",
   isRecording: false,
+  recordingMode: "hold",
 };
 
 export const initialTasks: TranscriptTask[] = [
@@ -15,24 +16,27 @@ export const initialTasks: TranscriptTask[] = [
     fileName: "会议录音示例.wav",
     status: "queued",
     progress: 0,
-    outputFormats: ["txt", "srt", "json"],
-    message: "等待模型准备完成",
+    outputFormats: ["txt"],
+    message: "等待选择文件",
   },
 ];
 
 export const initialHotwords: HotwordRule[] = [
-  { id: "rule-1", source: "太瑞", target: "Tauri", enabled: true },
+  { id: "rule-1", source: "陶瑞", target: "Tauri", enabled: true },
   { id: "rule-2", source: "阿萨尔", target: "ASR", enabled: true },
 ];
 
 export const initialSettings: UserSettings = {
   shortcut: "CapsLock",
-  selectedModelId: "vosk-small-cn-0.22",
+  selectedModelId: "sensevoice-small",
   modelDir: "",
   outputDir: "",
   pasteMode: "clipboard",
+  recordingMode: "hold",
+  theme: "light",
   saveRecordings: false,
   launchAtStartup: false,
+  showMiniWindow: true,
 };
 
 export const initialDiagnostics: DiagnosticItem[] = [
@@ -46,12 +50,12 @@ export const initialDiagnostics: DiagnosticItem[] = [
     id: "microphone",
     label: "麦克风",
     status: "ok",
-    detail: "已检测到默认麦克风。",
+    detail: "使用系统默认麦克风。",
   },
   {
     id: "shortcut",
     label: "快捷键",
     status: "ok",
-    detail: "默认快捷键 CapsLock 可用于按住说话。",
+    detail: "默认快捷键 CapsLock 可用于语音输入。",
   },
 ];
