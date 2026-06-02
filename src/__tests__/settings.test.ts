@@ -35,6 +35,7 @@ describe("settings fallback storage", () => {
     await expect(loadSettings(initialSettings)).resolves.toMatchObject({
       shortcut: "Mouse4",
       recordingMode: "hold",
+      accelerationMode: "cpu",
       theme: "light",
       showMiniWindow: true,
     });
@@ -73,6 +74,7 @@ describe("settings fallback storage", () => {
       request: expect.objectContaining({
         audioPath: "C:\\audio\\demo.wav",
         outputFormat: "srt",
+        accelerationMode: "cpu",
         saveOutput: true,
       }),
     });

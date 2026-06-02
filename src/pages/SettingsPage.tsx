@@ -1,4 +1,4 @@
-import { Check, Download, FolderOpen, Keyboard, Moon, Sun } from "lucide-react";
+import { Check, Cpu, Download, FolderOpen, Keyboard, Moon, Sun, Zap } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { SettingRow } from "../components/SettingRow";
@@ -162,6 +162,28 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
           <Keyboard size={18} />
           {isCapturingShortcut ? "请按键..." : settings.shortcut}
         </button>
+      </SettingRow>
+
+      <SettingRow label="识别加速" description="0.2.0 正式版使用 CPU 稳定路线；GPU 后续作为实验后端单独验证。">
+        <div className="segmented-control" role="group" aria-label="识别加速">
+          <button
+            className={settings.accelerationMode === "cpu" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            onClick={() => onSettingsChange({ ...settings, accelerationMode: "cpu" })}
+          >
+            <Cpu size={16} />
+            CPU
+          </button>
+          <button
+            className={settings.accelerationMode === "cuda" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            disabled
+            title="GPU 加速后续实验，0.2.0 不作为正式功能发布"
+          >
+            <Zap size={16} />
+            CUDA 后续
+          </button>
+        </div>
       </SettingRow>
 
       <div className="setting-row setting-row--stacked">

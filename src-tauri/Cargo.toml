@@ -1,6 +1,6 @@
 [package]
 name = "hi-voicer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline Chinese voice input and transcription desktop app"
 authors = ["Hi-Voicer"]
 edition = "2021"

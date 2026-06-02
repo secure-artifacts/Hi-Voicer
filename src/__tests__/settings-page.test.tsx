@@ -56,6 +56,17 @@ describe("SettingsPage", () => {
     expect(onSettingsChange).toHaveBeenCalledWith(expect.objectContaining({ theme: "dark" }));
   });
 
+  it("keeps CUDA acceleration disabled for the CPU release", () => {
+    const onSettingsChange = renderSettings();
+
+    const cudaButton = screen.getByRole("button", { name: "CUDA 后续" });
+
+    expect(cudaButton).toHaveProperty("disabled", true);
+    fireEvent.click(cudaButton);
+
+    expect(onSettingsChange).not.toHaveBeenCalledWith(expect.objectContaining({ accelerationMode: "cuda" }));
+  });
+
   it("toggles launch at startup", () => {
     const onSettingsChange = renderSettings();
 

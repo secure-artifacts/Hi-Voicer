@@ -1,7 +1,14 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Clock, Download, FileAudio, Gauge, Upload } from "lucide-react";
+import { Clock, Download, FileAudio, FolderOpen, Gauge, Trash2, Upload } from "lucide-react";
+import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useState } from "react";
-import { listenTranscriptionProgress, saveExistingFile, selectAudioFiles, transcribeFile } from "../lib/api";
+import {
+  listenTranscriptionProgress,
+  saveExistingFile,
+  selectAudioFiles,
+  selectDirectory,
+  transcribeFile,
+} from "../lib/api";
 import type {
   TranscriptTask,
   TranscriptionOutputFile,
@@ -10,7 +17,8 @@ import type {
 } from "../types";
 
 interface TranscriptionPageProps {
-  initialTasks: TranscriptTask[];
+  tasks: TranscriptTask[];
+  onTasksChange: Dispatch<SetStateAction<TranscriptTask[]>>;
   settings: UserSettings;
 }
 
@@ -68,15 +76,28 @@ function formatElapsed(milliseconds: number) {
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
-export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageProps) {
-  const [tasks, setTasks] = useState<TranscriptTask[]>(initialTasks);
+export function TranscriptionPage({
+  tasks,
+  onTasksChange,
+  settings,
+}: TranscriptionPageProps) {
   const [isSelecting, setIsSelecting] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [performanceMode, setPerformanceMode] = useState<TranscriptionPerformanceMode>("balanced");
+  const [exportDir, setExportDir] = useState("");
   const [now, setNow] = useState(() => Date.now());
+  const hasActiveTasks = isSelecting || tasks.some((task) => task.status === "running");
+  const downloadableTasks = tasks.filter((task) => task.outputFiles && task.outputFiles.length > 0);
 
   function updateTask(id: string, patch: Partial<TranscriptTask>) {
-    setTasks((current) => current.map((task) => (task.id === id ? { ...task, ...patch } : task)));
+    onTasksChange((current) => current.map((task) => (task.id === id ? { ...task, ...patch } : task)));
+  }
+
+  function clearTasks() {
+    if (hasActiveTasks) {
+      return;
+    }
+    onTasksChange([]);
   }
 
   async function runTask(task: TranscriptTask) {
@@ -138,7 +159,7 @@ export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageP
         outputFormats: ["txt", "srt"] as Array<"txt" | "srt">,
         message: "等待转录",
       }));
-      setTasks((current) => [...queuedTasks, ...current.filter((item) => item.id !== "sample-1")]);
+      onTasksChange((current) => [...queuedTasks, ...current.filter((item) => item.id !== "sample-1")]);
 
       let nextIndex = 0;
       const selectedMode = performanceModes.find((mode) => mode.id === performanceMode) ?? performanceModes[1];
@@ -169,7 +190,7 @@ export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageP
       const savedPath = await saveExistingFile(
         file.path,
         suggestedNameFromPath(file.path),
-        directoryFromPath(task.filePath),
+        exportDir || directoryFromPath(task.filePath),
       );
       updateTask(task.id, {
         message: savedPath ? `已导出：${savedPath}` : "已取消导出。",
@@ -179,6 +200,41 @@ export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageP
         message: errorMessage(error, "导出失败"),
       });
     }
+  }
+
+  async function handleSelectExportDir() {
+    const selected = await selectDirectory();
+    if (selected) {
+      setExportDir(selected);
+    }
+  }
+
+  async function handleBatchDownload() {
+    if (downloadableTasks.length === 0) {
+      return;
+    }
+
+    let savedCount = 0;
+    for (const task of downloadableTasks) {
+      for (const file of task.outputFiles ?? []) {
+        const savedPath = await saveExistingFile(
+          file.path,
+          suggestedNameFromPath(file.path),
+          exportDir || directoryFromPath(task.filePath),
+        );
+        if (savedPath) {
+          savedCount += 1;
+        }
+      }
+    }
+
+    onTasksChange((current) =>
+      current.map((task) =>
+        task.outputFiles && task.outputFiles.length > 0
+          ? { ...task, message: `批量导出完成：已保存 ${savedCount} 个文件。` }
+          : task,
+      ),
+    );
   }
 
   useEffect(() => {
@@ -226,19 +282,19 @@ export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageP
     try {
       void getCurrentWebview()
         .onDragDropEvent((event) => {
-        if (event.payload.type === "enter" || event.payload.type === "over") {
-          setIsDragging(true);
-          return;
-        }
-        if (event.payload.type === "leave") {
-          setIsDragging(false);
-          return;
-        }
-        if (event.payload.type === "drop") {
-          setIsDragging(false);
-          void transcribePaths(event.payload.paths);
-        }
-      })
+          if (event.payload.type === "enter" || event.payload.type === "over") {
+            setIsDragging(true);
+            return;
+          }
+          if (event.payload.type === "leave") {
+            setIsDragging(false);
+            return;
+          }
+          if (event.payload.type === "drop") {
+            setIsDragging(false);
+            void transcribePaths(event.payload.paths);
+          }
+        })
         .then((nextUnlisten) => {
           if (disposed) {
             nextUnlisten();
@@ -290,52 +346,89 @@ export function TranscriptionPage({ initialTasks, settings }: TranscriptionPageP
       </section>
 
       <section className="panel">
-        <p className="section-label">任务队列</p>
-        <div className="task-list">
-          {tasks.map((task) => (
-            <div className={`task-row task-row--${task.status}`} key={task.id}>
-              <div>
-                <strong>{task.fileName}</strong>
-                <p>{task.message}</p>
-                <div className="task-progress" aria-label={`${task.fileName} 进度 ${task.progress}%`}>
-                  <span style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }} />
-                </div>
-                <div className="task-meta">
-                  <span>
-                    <Clock size={13} />
-                    {task.finishedAt && task.elapsedMs !== undefined
-                      ? `用时 ${formatElapsed(task.elapsedMs)}`
-                      : task.startedAt
-                        ? `已用时 ${formatElapsed(now - Date.parse(task.startedAt))}`
-                        : "等待开始"}
-                  </span>
-                  {task.totalSegments !== undefined && task.totalSegments > 0 && (
-                    <span>
-                      分段 {task.completedSegments ?? 0}/{task.totalSegments}
-                    </span>
-                  )}
-                </div>
-                {task.outputFiles && task.outputFiles.length > 0 && (
-                  <div className="task-export-list">
-                    {task.outputFiles.map((file) => (
-                      <button
-                        className="secondary-button"
-                        key={file.format}
-                        type="button"
-                        onClick={() => void handleDownloadOutput(task, file)}
-                      >
-                        <Download size={15} />
-                        {file.label}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {task.outputPath && <small>临时结果已准备好，点击上方格式会保存到原音频所在文件夹。</small>}
-              </div>
-              <span>{task.progress}%</span>
-            </div>
-          ))}
+        <div className="panel-heading panel-heading--compact">
+          <div>
+            <p className="section-label">任务队列</p>
+            <p className="panel-hint">{exportDir ? `保存目录：${exportDir}` : "保存目录：原音频所在文件夹"}</p>
+          </div>
+          <div className="toolbar-actions">
+            <button className="secondary-button" type="button" onClick={() => void handleSelectExportDir()}>
+              <FolderOpen size={16} />
+              选择保存目录
+            </button>
+            <button className="secondary-button" type="button" disabled={!exportDir} onClick={() => setExportDir("")}>
+              使用音频目录
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={downloadableTasks.length === 0}
+              onClick={() => void handleBatchDownload()}
+            >
+              <Download size={16} />
+              批量下载
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              disabled={hasActiveTasks || tasks.length === 0}
+              title={hasActiveTasks ? "转录进行中，暂不能清空任务" : "清空任务队列"}
+              onClick={clearTasks}
+            >
+              <Trash2 size={16} />
+              清空任务
+            </button>
+          </div>
         </div>
+        {tasks.length === 0 ? (
+          <p className="empty-state">还没有任务，选择音频或把文件拖到上方即可开始。</p>
+        ) : (
+          <div className="task-list">
+            {tasks.map((task) => (
+              <div className={`task-row task-row--${task.status}`} key={task.id}>
+                <div>
+                  <strong>{task.fileName}</strong>
+                  <p>{task.message}</p>
+                  <div className="task-progress" aria-label={`${task.fileName} 进度 ${task.progress}%`}>
+                    <span style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }} />
+                  </div>
+                  <div className="task-meta">
+                    <span>
+                      <Clock size={13} />
+                      {task.finishedAt && task.elapsedMs !== undefined
+                        ? `用时 ${formatElapsed(task.elapsedMs)}`
+                        : task.startedAt
+                          ? `已用时 ${formatElapsed(now - Date.parse(task.startedAt))}`
+                          : "等待开始"}
+                    </span>
+                    {task.totalSegments !== undefined && task.totalSegments > 0 && (
+                      <span>
+                        分段 {task.completedSegments ?? 0}/{task.totalSegments}
+                      </span>
+                    )}
+                  </div>
+                  {task.outputFiles && task.outputFiles.length > 0 && (
+                    <div className="task-export-list">
+                      {task.outputFiles.map((file) => (
+                        <button
+                          className="secondary-button"
+                          key={file.format}
+                          type="button"
+                          onClick={() => void handleDownloadOutput(task, file)}
+                        >
+                          <Download size={15} />
+                          {file.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {task.outputPath && <small>临时结果已准备好，点击上方格式会保存到原音频所在文件夹。</small>}
+                </div>
+                <span>{task.progress}%</span>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
     </div>
   );

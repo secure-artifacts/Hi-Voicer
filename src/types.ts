@@ -10,6 +10,7 @@ export type AppPage = "home" | "transcription" | "hotwords" | "settings" | "diag
 
 export type PasteMode = "direct" | "clipboard";
 export type RecordingMode = "hold" | "toggle" | "audioOnly";
+export type AccelerationMode = "cpu" | "cuda";
 export type ExportFormat = "plainText" | "timelineText" | "srt";
 export type ThemeMode = "light" | "dark";
 export type TranscriptionPerformanceMode = "stable" | "balanced" | "fast";
@@ -56,6 +57,7 @@ export interface UserSettings {
   outputDir: string;
   pasteMode: PasteMode;
   recordingMode: RecordingMode;
+  accelerationMode: AccelerationMode;
   theme: ThemeMode;
   saveRecordings: boolean;
   launchAtStartup: boolean;
@@ -118,6 +120,27 @@ export interface TranscriptionProgress {
 export interface ModelValidationResult {
   valid: boolean;
   modelName: string;
+  message: string;
+}
+
+export interface AccelerationStatus {
+  selectedMode: AccelerationMode;
+  effectiveMode: AccelerationMode;
+  cudaAvailable: boolean;
+  cudaDeviceSummary?: string | null;
+  cudaDetectionError?: string | null;
+  cpuRuntimeInstalled: boolean;
+  cudaRuntimeInstalled: boolean;
+  cudaDisabledReason?: string | null;
+  message: string;
+}
+
+export interface AccelerationSmokeTestResult {
+  requestedMode: AccelerationMode;
+  usedMode: AccelerationMode;
+  fallbackUsed: boolean;
+  elapsedMs: number;
+  transcriptPreview: string;
   message: string;
 }
 

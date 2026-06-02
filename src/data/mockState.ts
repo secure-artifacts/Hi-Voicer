@@ -33,6 +33,7 @@ export const initialSettings: UserSettings = {
   outputDir: "",
   pasteMode: "clipboard",
   recordingMode: "hold",
+  accelerationMode: "cpu",
   theme: "light",
   saveRecordings: false,
   launchAtStartup: false,

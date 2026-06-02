@@ -3,6 +3,8 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import type {
+  AccelerationStatus,
+  AccelerationSmokeTestResult,
   ModelInstallProgress,
   ModelPreset,
   ModelValidationResult,
@@ -207,6 +209,58 @@ export async function validateModelDir(modelDir: string): Promise<ModelValidatio
   }
 }
 
+export async function getAccelerationStatus(accelerationMode: UserSettings["accelerationMode"]): Promise<AccelerationStatus> {
+  try {
+    return await invoke<AccelerationStatus>("get_acceleration_status", { request: { accelerationMode } });
+  } catch {
+    return {
+      selectedMode: accelerationMode,
+      effectiveMode: accelerationMode === "cuda" ? "cpu" : "cpu",
+      cudaAvailable: false,
+      cudaDeviceSummary: null,
+      cudaDetectionError: "浏览器预览模式无法运行 nvidia-smi。",
+      cpuRuntimeInstalled: false,
+      cudaRuntimeInstalled: false,
+      cudaDisabledReason: null,
+      message:
+        accelerationMode === "cuda"
+          ? "浏览器预览模式无法检测 CUDA；实际转录会在桌面端检测并自动回退 CPU。"
+          : "当前选择 CPU，兼容性最高。",
+    };
+  }
+}
+
+export async function prepareAccelerationRuntime(accelerationMode: UserSettings["accelerationMode"]): Promise<AccelerationStatus> {
+  try {
+    return await invoke<AccelerationStatus>("prepare_acceleration_runtime", { request: { accelerationMode } });
+  } catch (error) {
+    return {
+      selectedMode: accelerationMode,
+      effectiveMode: "cpu",
+      cudaAvailable: false,
+      cudaDeviceSummary: null,
+      cudaDetectionError: error instanceof Error ? error.message : "加速运行时准备失败。",
+      cpuRuntimeInstalled: false,
+      cudaRuntimeInstalled: false,
+      cudaDisabledReason: null,
+      message: error instanceof Error ? error.message : "加速运行时准备失败；转录时会回退 CPU。",
+    };
+  }
+}
+
+export async function runAccelerationSmokeTest(settings: UserSettings): Promise<AccelerationSmokeTestResult> {
+  if (!settings.modelDir) {
+    throw new Error("请先配置离线模型。");
+  }
+
+  return await invoke<AccelerationSmokeTestResult>("run_acceleration_smoke_test", {
+    request: {
+      modelDir: settings.modelDir,
+      accelerationMode: settings.accelerationMode ?? "cpu",
+    },
+  });
+}
+
 export async function transcribeFile(
   audioPath: string,
   settings: UserSettings,
@@ -224,6 +278,7 @@ export async function transcribeFile(
       saveOutput: options.saveOutput ?? true,
       taskId: options.taskId,
       performanceMode: options.performanceMode ?? "balanced",
+      accelerationMode: settings.accelerationMode ?? "cpu",
     },
   });
 }

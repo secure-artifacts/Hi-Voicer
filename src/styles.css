@@ -653,6 +653,25 @@ textarea:focus-visible {
   margin-bottom: 16px;
 }
 
+.panel-heading > div:first-child {
+  min-width: 0;
+}
+
+.panel-hint {
+  max-width: 760px;
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-subtle);
+  font-size: 13px;
+}
+
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .info-list,
 .task-list,
 .rule-list,

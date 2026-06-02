@@ -22,7 +22,7 @@ import { HomePage } from "./pages/HomePage";
 import { HotwordsPage } from "./pages/HotwordsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TranscriptionPage } from "./pages/TranscriptionPage";
-import type { AppPage, AppStatus, ModelValidationResult, TranscriptHistoryItem, UserSettings } from "./types";
+import type { AppPage, AppStatus, ModelValidationResult, TranscriptHistoryItem, TranscriptTask, UserSettings } from "./types";
 
 const HISTORY_KEY = "hi-voicer-transcript-history";
 const MAX_HISTORY_ITEMS = 20;
@@ -59,6 +59,7 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingLevel, setRecordingLevel] = useState(0);
   const [transcriptHistory, setTranscriptHistory] = useState<TranscriptHistoryItem[]>(() => loadTranscriptHistory());
+  const [transcriptionTasks, setTranscriptionTasks] = useState<TranscriptTask[]>(initialTasks);
   const miniDragRef = useRef({ x: 0, y: 0, dragging: false });
   const [modelValidation, setModelValidation] = useState<ModelValidationResult>({
     valid: false,
@@ -319,7 +320,13 @@ export default function App() {
           onClearTranscriptHistory={clearTranscriptHistory}
         />
       )}
-      {currentPage === "transcription" && <TranscriptionPage initialTasks={initialTasks} settings={settings} />}
+      {currentPage === "transcription" && (
+        <TranscriptionPage
+          tasks={transcriptionTasks}
+          onTasksChange={setTranscriptionTasks}
+          settings={settings}
+        />
+      )}
       {currentPage === "hotwords" && <HotwordsPage rules={initialHotwords} />}
       {currentPage === "settings" && (
         <SettingsPage

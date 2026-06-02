@@ -13,7 +13,7 @@ use std::{
     io::{self, Read, Write},
     net::TcpStream,
     path::{Component, Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -30,11 +30,23 @@ const SHERPA_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const DAVINCI_TIMECODE_FPS: u64 = 25;
 const LONG_AUDIO_CHUNK_SECONDS: u32 = 60;
 const LONG_AUDIO_THRESHOLD_SECONDS: f64 = 300.0;
+const SHERPA_RUNTIME_TAG: &str = "v1.13.2";
+const SHERPA_CPU_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts";
+const SHERPA_CPU_ARCHIVE_NAME: &str =
+    "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
+const SHERPA_CPU_RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
+const SHERPA_CUDA_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda";
+const SHERPA_CUDA_ARCHIVE_NAME: &str =
+    "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda.tar.bz2";
+const SHERPA_CUDA_RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda.tar.bz2";
 
 struct RuntimeState {
     settings: Mutex<UserSettings>,
     recording: Mutex<Option<RecordingSession>>,
     sherpa_daemon: Mutex<Option<SherpaDaemon>>,
+    sherpa_runtime_install: Mutex<()>,
+    cuda_disabled_reason: Mutex<Option<String>>,
+    cuda_startup_checked_runtime: Mutex<Option<String>>,
 }
 
 struct RecordingSession {
@@ -46,6 +58,7 @@ struct RecordingSession {
 struct SherpaDaemon {
     child: Child,
     model_dir: String,
+    executable: String,
 }
 
 impl Drop for SherpaDaemon {
@@ -175,6 +188,8 @@ struct TranscribeFileRequest {
     task_id: Option<String>,
     #[serde(default = "default_performance_mode")]
     performance_mode: String,
+    #[serde(default = "default_acceleration_mode")]
+    acceleration_mode: String,
     #[serde(default = "default_export_format")]
     output_format: String,
     #[serde(default = "default_save_output")]
@@ -191,6 +206,10 @@ fn default_export_format() -> String {
 
 fn default_performance_mode() -> String {
     "balanced".to_string()
+}
+
+fn default_acceleration_mode() -> String {
+    "cpu".to_string()
 }
 
 fn transcription_performance(mode: &str) -> TranscriptionPerformance {
@@ -213,10 +232,40 @@ fn transcription_performance(mode: &str) -> TranscriptionPerformance {
     }
 }
 
+fn performance_for_acceleration(
+    performance: TranscriptionPerformance,
+    acceleration_mode: &str,
+) -> TranscriptionPerformance {
+    if acceleration_mode != "cuda" {
+        return performance;
+    }
+
+    TranscriptionPerformance {
+        file_workers: 1,
+        chunk_workers: 1,
+        sherpa_threads: performance.sherpa_threads.min(2).max(1),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelValidationRequest {
     model_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccelerationStatusRequest {
+    #[serde(default = "default_acceleration_mode")]
+    acceleration_mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccelerationSmokeTestRequest {
+    model_dir: String,
+    #[serde(default = "default_acceleration_mode")]
+    acceleration_mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +273,31 @@ struct ModelValidationRequest {
 struct ModelValidationResult {
     valid: bool,
     model_name: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccelerationStatus {
+    selected_mode: String,
+    effective_mode: String,
+    cuda_available: bool,
+    cuda_device_summary: Option<String>,
+    cuda_detection_error: Option<String>,
+    cpu_runtime_installed: bool,
+    cuda_runtime_installed: bool,
+    cuda_disabled_reason: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccelerationSmokeTestResult {
+    requested_mode: String,
+    used_mode: String,
+    fallback_used: bool,
+    elapsed_ms: u128,
+    transcript_preview: String,
     message: String,
 }
 
@@ -501,7 +575,11 @@ fn apply_launch_at_startup(enabled: bool) -> Result<(), String> {
     }
     command.creation_flags(CREATE_NO_WINDOW);
 
-    let output = command.output().map_err(|error| error.to_string())?;
+    let output = run_command_with_timeout(
+        &mut command,
+        Duration::from_secs(15),
+        "Windows startup registry update",
+    )?;
     if output.status.success() || !enabled {
         return Ok(());
     }
@@ -523,6 +601,70 @@ fn suppress_command_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn suppress_command_window(_command: &mut Command) {}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    description: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "failed to capture child stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture child stderr".to_string())?;
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut stream = stdout;
+        let _ = stream.read_to_end(&mut output);
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut stream = stderr;
+        let _ = stream.read_to_end(&mut output);
+        output
+    });
+    let started_at = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child.wait().map_err(|error| error.to_string())?;
+            let stdout = stdout_reader.join().unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap_or_default();
+            let output = Output {
+                status,
+                stdout,
+                stderr,
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}\n{stderr}");
+            return Err(format!(
+                "{description} timed out after {}s: {}",
+                timeout.as_secs(),
+                combined.trim()
+            ));
+        }
+
+        thread::sleep(Duration::from_millis(100));
+    }
+}
 
 fn extract_zip(zip_path: &Path, destination: &Path) -> Result<(), String> {
     let file = fs::File::open(zip_path).map_err(|error| error.to_string())?;
@@ -617,27 +759,72 @@ fn download_file(url: &str, destination: &Path) -> Result<(), String> {
     Err(format!("download failed after 3 attempts: {last_error}"))
 }
 
-fn install_sherpa_runtime(app: &AppHandle) -> Result<PathBuf, String> {
-    const TAG: &str = "v1.13.2";
-    const RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts";
-    const ARCHIVE_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
-    const RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
-
+fn sherpa_runtime_executable_path(app: &AppHandle, runtime_name: &str) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| error.to_string())?;
-    let sherpa_root = data_dir.join("engines").join("sherpa").join(TAG);
-    let runtime_dir = sherpa_root.join(RUNTIME_NAME);
-    let executable = runtime_dir.join("bin").join("sherpa-onnx-offline.exe");
+    Ok(data_dir
+        .join("engines")
+        .join("sherpa")
+        .join(SHERPA_RUNTIME_TAG)
+        .join(runtime_name)
+        .join("bin")
+        .join("sherpa-onnx-offline.exe"))
+}
+
+fn sherpa_runtime_dir_from_executable(executable: &Path) -> Result<PathBuf, String> {
+    executable
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "invalid Sherpa-ONNX executable path: {}",
+                executable.to_string_lossy()
+            )
+        })
+}
+
+fn install_sherpa_runtime_archive(
+    app: &AppHandle,
+    runtime_name: &str,
+    archive_name: &str,
+    runtime_url: &str,
+) -> Result<PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?;
+    let sherpa_root = data_dir
+        .join("engines")
+        .join("sherpa")
+        .join(SHERPA_RUNTIME_TAG);
+    let executable = sherpa_runtime_executable_path(app, runtime_name)?;
 
     if executable.exists() {
         return Ok(executable);
     }
 
+    let state = app.try_state::<RuntimeState>();
+    let _install_guard = state
+        .as_ref()
+        .map(|state| state.sherpa_runtime_install.lock())
+        .transpose()
+        .map_err(|error| error.to_string())?;
+
+    if executable.exists() {
+        return Ok(executable);
+    }
+
+    let runtime_dir = sherpa_runtime_dir_from_executable(&executable)?;
     fs::create_dir_all(&sherpa_root).map_err(|error| error.to_string())?;
-    let archive_path = sherpa_root.join(ARCHIVE_NAME);
-    download_file(RUNTIME_URL, &archive_path)?;
+    let archive_path = sherpa_root.join(archive_name);
+    download_file(runtime_url, &archive_path)?;
+
+    if runtime_dir.exists() {
+        fs::remove_dir_all(&runtime_dir).map_err(|error| error.to_string())?;
+    }
 
     let mut command = Command::new("tar");
     command
@@ -647,13 +834,27 @@ fn install_sherpa_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         .arg(&sherpa_root);
     suppress_command_window(&mut command);
 
-    let status = command.status().map_err(|error| error.to_string())?;
+    let output = run_command_with_timeout(
+        &mut command,
+        Duration::from_secs(600),
+        "Sherpa runtime extraction",
+    )?;
 
-    if !status.success() {
-        return Err("failed to extract Sherpa-ONNX runtime".to_string());
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        let _ = fs::remove_dir_all(&runtime_dir);
+        let _ = fs::remove_file(&archive_path);
+        return Err(format!(
+            "failed to extract Sherpa-ONNX runtime: {}",
+            combined.trim()
+        ));
     }
 
     if !executable.exists() {
+        let _ = fs::remove_dir_all(&runtime_dir);
+        let _ = fs::remove_file(&archive_path);
         return Err(format!(
             "Sherpa-ONNX executable was not found after extraction: {}",
             executable.to_string_lossy()
@@ -661,6 +862,24 @@ fn install_sherpa_runtime(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     Ok(executable)
+}
+
+fn install_sherpa_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    install_sherpa_runtime_archive(
+        app,
+        SHERPA_CPU_RUNTIME_NAME,
+        SHERPA_CPU_ARCHIVE_NAME,
+        SHERPA_CPU_RUNTIME_URL,
+    )
+}
+
+fn install_sherpa_cuda_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    install_sherpa_runtime_archive(
+        app,
+        SHERPA_CUDA_RUNTIME_NAME,
+        SHERPA_CUDA_ARCHIVE_NAME,
+        SHERPA_CUDA_RUNTIME_URL,
+    )
 }
 
 fn emit_model_install_progress(
@@ -997,31 +1216,51 @@ fn split_command_args(args: &str) -> Result<Vec<String>, String> {
     Ok(parsed)
 }
 
-fn sherpa_args_with_threads(args: &str, threads: usize) -> Result<Vec<String>, String> {
-    let mut parsed = split_command_args(args)?;
+fn set_sherpa_arg_value(
+    parsed: &mut Vec<String>,
+    name: &str,
+    value: &str,
+    append_if_missing: bool,
+) {
     let mut replaced = false;
+    let prefix = format!("{name}=");
     let mut index = 0;
     while index < parsed.len() {
-        if parsed[index] == "--num-threads" {
+        if parsed[index] == name {
             if index + 1 < parsed.len() {
-                parsed[index + 1] = threads.to_string();
+                parsed[index + 1] = value.to_string();
             } else {
-                parsed.push(threads.to_string());
+                parsed.push(value.to_string());
             }
             replaced = true;
             index += 2;
             continue;
         }
 
-        if parsed[index].starts_with("--num-threads=") {
-            parsed[index] = format!("--num-threads={threads}");
+        if parsed[index].starts_with(&prefix) {
+            parsed[index] = format!("{prefix}{value}");
             replaced = true;
         }
         index += 1;
     }
 
-    if !replaced {
-        parsed.push(format!("--num-threads={threads}"));
+    if append_if_missing && !replaced {
+        parsed.push(format!("{name}={value}"));
+    }
+}
+
+fn sherpa_args_for_runtime(
+    args: &str,
+    threads: Option<usize>,
+    runtime_mode: &str,
+) -> Result<Vec<String>, String> {
+    let mut parsed = split_command_args(args)?;
+    if let Some(threads) = threads {
+        set_sherpa_arg_value(&mut parsed, "--num-threads", &threads.to_string(), true);
+    }
+
+    if runtime_mode.eq_ignore_ascii_case("cuda") {
+        set_sherpa_arg_value(&mut parsed, "--provider", "cuda", true);
     }
 
     Ok(parsed)
@@ -1215,6 +1454,484 @@ fn read_sherpa_engine(model_dir: &Path) -> Result<InstalledEngineConfig, String>
     Ok(engine)
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedSherpaRuntime {
+    executable: PathBuf,
+    mode: String,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NvidiaCudaInfo {
+    available: bool,
+    device_summary: Option<String>,
+    detection_error: Option<String>,
+}
+
+fn parse_nvidia_smi_query_output(output: &str) -> Option<String> {
+    let devices = output
+        .lines()
+        .filter_map(|line| {
+            let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+            if parts.len() < 3 {
+                return None;
+            }
+            let name = parts[0].trim();
+            let driver = parts[1].trim();
+            let memory_mb = parts[2].trim();
+            if name.is_empty() {
+                return None;
+            }
+
+            let driver_text = if driver.is_empty() {
+                "driver unknown".to_string()
+            } else {
+                format!("driver {driver}")
+            };
+            let memory_text = if memory_mb.is_empty() {
+                "VRAM unknown".to_string()
+            } else {
+                format!("VRAM {memory_mb} MB")
+            };
+            Some(format!("{name} / {driver_text} / {memory_text}"))
+        })
+        .collect::<Vec<_>>();
+
+    if devices.is_empty() {
+        None
+    } else {
+        Some(devices.join("; "))
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn nvidia_smi_candidate_paths(
+    system_root: Option<&str>,
+    windir: Option<&str>,
+    program_files: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from("nvidia-smi")];
+
+    for root in [system_root, windir].into_iter().flatten() {
+        push_unique_path(
+            &mut paths,
+            PathBuf::from(root).join("System32").join("nvidia-smi.exe"),
+        );
+    }
+
+    if let Some(program_files) = program_files {
+        push_unique_path(
+            &mut paths,
+            PathBuf::from(program_files)
+                .join("NVIDIA Corporation")
+                .join("NVSMI")
+                .join("nvidia-smi.exe"),
+        );
+    }
+
+    paths
+}
+
+fn nvidia_smi_candidates() -> Vec<PathBuf> {
+    nvidia_smi_candidate_paths(
+        std::env::var("SystemRoot").ok().as_deref(),
+        std::env::var("WINDIR").ok().as_deref(),
+        std::env::var("ProgramFiles").ok().as_deref(),
+    )
+}
+
+fn query_nvidia_cuda_info() -> NvidiaCudaInfo {
+    query_nvidia_cuda_info_from_candidates(&nvidia_smi_candidates())
+}
+
+fn nvidia_cuda_info_from_output(
+    candidate: &Path,
+    output: Output,
+) -> Result<NvidiaCudaInfo, String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+
+    if !output.status.success() {
+        return Err(format!(
+            "{} exited with {}: {}",
+            candidate.to_string_lossy(),
+            output.status,
+            combined.trim()
+        ));
+    }
+
+    let Some(device_summary) = parse_nvidia_smi_query_output(&stdout) else {
+        return Err(format!(
+            "{} returned no parseable GPU rows: {}",
+            candidate.to_string_lossy(),
+            combined.trim()
+        ));
+    };
+
+    Ok(NvidiaCudaInfo {
+        available: true,
+        device_summary: Some(device_summary),
+        detection_error: None,
+    })
+}
+
+fn query_nvidia_cuda_info_from_candidates(candidates: &[PathBuf]) -> NvidiaCudaInfo {
+    let mut errors = Vec::new();
+
+    for candidate in candidates {
+        let mut command = Command::new(candidate);
+        command.args([
+            "--query-gpu=name,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ]);
+        suppress_command_window(&mut command);
+
+        match run_command_with_timeout(
+            &mut command,
+            Duration::from_secs(5),
+            "NVIDIA CUDA detection",
+        ) {
+            Ok(output) => match nvidia_cuda_info_from_output(candidate, output) {
+                Ok(info) => return info,
+                Err(error) => errors.push(error),
+            },
+            Err(error) => errors.push(format!("{}: {error}", candidate.to_string_lossy())),
+        }
+    }
+
+    let tried = candidates
+        .iter()
+        .map(|candidate| candidate.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    NvidiaCudaInfo {
+        available: false,
+        device_summary: None,
+        detection_error: Some(format!(
+            "未找到可用的 nvidia-smi；已尝试：{tried}。{}",
+            errors.join("；")
+        )),
+    }
+}
+
+fn smoke_test_sherpa_runtime(executable: &Path) -> Result<(), String> {
+    if !executable.exists() {
+        return Err(format!(
+            "runtime executable not found: {}",
+            executable.to_string_lossy()
+        ));
+    }
+
+    let mut command = Command::new(executable);
+    command.arg("--help");
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    suppress_command_window(&mut command);
+
+    let output = run_command_with_timeout(
+        &mut command,
+        Duration::from_secs(15),
+        "Sherpa runtime startup check",
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let combined_lower = combined.to_ascii_lowercase();
+
+    if output.status.success()
+        || combined_lower.contains("usage")
+        || combined_lower.contains("sherpa-onnx")
+    {
+        return Ok(());
+    }
+
+    Err(format!("runtime startup check failed: {}", combined.trim()))
+}
+
+fn cuda_runtime_check_matches(checked_runtime: Option<&str>, executable: &Path) -> bool {
+    let executable_text = executable.to_string_lossy();
+    match checked_runtime {
+        Some(checked_runtime) => checked_runtime == executable_text.as_ref(),
+        None => false,
+    }
+}
+
+fn is_cuda_runtime_startup_checked(app: &AppHandle, executable: &Path) -> bool {
+    let Some(state) = app.try_state::<RuntimeState>() else {
+        return false;
+    };
+    state
+        .cuda_startup_checked_runtime
+        .lock()
+        .ok()
+        .map(|checked_runtime| cuda_runtime_check_matches(checked_runtime.as_deref(), executable))
+        .unwrap_or(false)
+}
+
+fn mark_cuda_runtime_startup_checked(app: &AppHandle, executable: &Path) {
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        if let Ok(mut checked_runtime) = state.cuda_startup_checked_runtime.lock() {
+            *checked_runtime = Some(executable.to_string_lossy().to_string());
+        }
+    }
+}
+
+fn clear_cuda_runtime_startup_checked(app: &AppHandle) {
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        if let Ok(mut checked_runtime) = state.cuda_startup_checked_runtime.lock() {
+            *checked_runtime = None;
+        }
+    }
+}
+
+fn cuda_circuit_reason(app: &AppHandle) -> Option<String> {
+    let state = app.try_state::<RuntimeState>()?;
+    state
+        .cuda_disabled_reason
+        .lock()
+        .ok()
+        .and_then(|reason| reason.clone())
+}
+
+fn trip_cuda_circuit(app: &AppHandle, reason: String) {
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        if let Ok(mut disabled_reason) = state.cuda_disabled_reason.lock() {
+            *disabled_reason = Some(reason);
+        }
+    }
+    clear_cuda_runtime_startup_checked(app);
+}
+
+fn clear_cuda_circuit(app: &AppHandle) {
+    if let Some(state) = app.try_state::<RuntimeState>() {
+        if let Ok(mut disabled_reason) = state.cuda_disabled_reason.lock() {
+            *disabled_reason = None;
+        }
+    }
+}
+
+fn acceleration_status_from_parts(
+    selected_mode: &str,
+    cuda_available: bool,
+    cuda_device_summary: Option<String>,
+    cuda_detection_error: Option<String>,
+    cpu_runtime_installed: bool,
+    cuda_runtime_installed: bool,
+    cuda_disabled_reason: Option<String>,
+    prepare_error: Option<String>,
+) -> AccelerationStatus {
+    let (effective_mode, message) = if selected_mode == "cuda" {
+        if let Some(reason) = cuda_disabled_reason.as_ref() {
+            (
+                "cpu",
+                format!("CUDA 本次会话已停用，转录会直接使用 CPU：{reason}"),
+            )
+        } else if let Some(error) = prepare_error {
+            (
+                "cpu",
+                format!("CUDA runtime 准备失败；转录时会回退 CPU：{error}"),
+            )
+        } else {
+            match (cuda_available, cuda_runtime_installed) {
+                (false, _) => (
+                    "cpu",
+                    "已选择 CUDA，但未检测到 NVIDIA CUDA 环境；转录时会自动回退 CPU。".to_string(),
+                ),
+                (true, false) => (
+                    "cuda",
+                    "已检测到 NVIDIA 环境；首次 CUDA 转录会下载 CUDA runtime，失败会回退 CPU。"
+                        .to_string(),
+                ),
+                (true, true) => (
+                    "cuda",
+                    "CUDA 环境和 CUDA runtime 已就绪；识别失败时仍会自动回退 CPU。".to_string(),
+                ),
+            }
+        }
+    } else if let Some(error) = prepare_error {
+        (
+            "cpu",
+            format!("CUDA runtime 准备失败；转录时会回退 CPU：{error}"),
+        )
+    } else {
+        (
+            "cpu",
+            "当前选择 CPU，兼容性最高；不会尝试加载 CUDA runtime。".to_string(),
+        )
+    };
+
+    AccelerationStatus {
+        selected_mode: selected_mode.to_string(),
+        effective_mode: effective_mode.to_string(),
+        cuda_available,
+        cuda_device_summary,
+        cuda_detection_error,
+        cpu_runtime_installed,
+        cuda_runtime_installed,
+        cuda_disabled_reason,
+        message,
+    }
+}
+
+fn acceleration_status_for_app(
+    app: &AppHandle,
+    requested_mode: &str,
+) -> Result<AccelerationStatus, String> {
+    let selected_mode = if requested_mode.trim().eq_ignore_ascii_case("cuda") {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    let cuda_info = query_nvidia_cuda_info();
+    let cpu_runtime_installed =
+        sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
+    let cuda_runtime_installed =
+        sherpa_runtime_executable_path(app, SHERPA_CUDA_RUNTIME_NAME)?.exists();
+
+    Ok(acceleration_status_from_parts(
+        selected_mode,
+        cuda_info.available,
+        cuda_info.device_summary,
+        cuda_info.detection_error,
+        cpu_runtime_installed,
+        cuda_runtime_installed,
+        cuda_circuit_reason(app),
+        None,
+    ))
+}
+
+fn prepare_acceleration_runtime_for_app(
+    app: &AppHandle,
+    requested_mode: &str,
+) -> Result<AccelerationStatus, String> {
+    let selected_mode = if requested_mode.trim().eq_ignore_ascii_case("cuda") {
+        "cuda"
+    } else {
+        "cpu"
+    };
+
+    if selected_mode == "cpu" {
+        return acceleration_status_for_app(app, requested_mode);
+    }
+
+    let cuda_info = query_nvidia_cuda_info();
+    if !cuda_info.available {
+        return acceleration_status_for_app(app, requested_mode);
+    }
+
+    let prepare_error = match install_sherpa_cuda_runtime(app) {
+        Ok(executable) => match smoke_test_sherpa_runtime(&executable) {
+            Ok(()) => {
+                mark_cuda_runtime_startup_checked(app, &executable);
+                None
+            }
+            Err(error) => {
+                clear_cuda_runtime_startup_checked(app);
+                Some(error)
+            }
+        },
+        Err(error) => Some(error),
+    };
+    if let Some(error) = prepare_error.as_ref() {
+        trip_cuda_circuit(app, error.clone());
+    } else {
+        clear_cuda_circuit(app);
+    }
+    let cpu_runtime_installed =
+        sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
+    let cuda_runtime_installed =
+        sherpa_runtime_executable_path(app, SHERPA_CUDA_RUNTIME_NAME)?.exists();
+
+    let mut status = acceleration_status_from_parts(
+        selected_mode,
+        cuda_info.available,
+        cuda_info.device_summary,
+        cuda_info.detection_error,
+        cpu_runtime_installed,
+        cuda_runtime_installed,
+        cuda_circuit_reason(app),
+        prepare_error,
+    );
+    if status.effective_mode == "cuda" {
+        status.message =
+            "CUDA runtime 已下载并通过启动检查；识别失败时仍会自动回退 CPU。".to_string();
+    }
+
+    Ok(status)
+}
+
+fn resolve_sherpa_runtime(
+    app: &AppHandle,
+    engine: &InstalledEngineConfig,
+    requested_mode: &str,
+) -> ResolvedSherpaRuntime {
+    let cpu_executable = PathBuf::from(&engine.executable);
+    let mode = requested_mode.trim().to_ascii_lowercase();
+    if mode != "cuda" {
+        return ResolvedSherpaRuntime {
+            executable: cpu_executable,
+            mode: "cpu".to_string(),
+            fallback_reason: None,
+        };
+    }
+
+    if let Some(reason) = cuda_circuit_reason(app) {
+        return ResolvedSherpaRuntime {
+            executable: cpu_executable,
+            mode: "cpu".to_string(),
+            fallback_reason: Some(format!("CUDA 本次会话已停用，已直接使用 CPU：{reason}")),
+        };
+    }
+
+    let cuda_info = query_nvidia_cuda_info();
+    if !cuda_info.available {
+        return ResolvedSherpaRuntime {
+            executable: cpu_executable,
+            mode: "cpu".to_string(),
+            fallback_reason: Some("未检测到可用的 NVIDIA CUDA 环境，已回退到 CPU。".to_string()),
+        };
+    }
+
+    match install_sherpa_cuda_runtime(app) {
+        Ok(executable) => {
+            if !is_cuda_runtime_startup_checked(app, &executable) {
+                if let Err(error) = smoke_test_sherpa_runtime(&executable) {
+                    trip_cuda_circuit(app, error.clone());
+                    return ResolvedSherpaRuntime {
+                        executable: cpu_executable,
+                        mode: "cpu".to_string(),
+                        fallback_reason: Some(format!(
+                            "CUDA runtime 启动检查失败，已回退到 CPU：{error}"
+                        )),
+                    };
+                }
+                mark_cuda_runtime_startup_checked(app, &executable);
+            }
+
+            ResolvedSherpaRuntime {
+                executable,
+                mode: "cuda".to_string(),
+                fallback_reason: None,
+            }
+        }
+        Err(error) => {
+            trip_cuda_circuit(app, error.clone());
+            ResolvedSherpaRuntime {
+                executable: cpu_executable,
+                mode: "cpu".to_string(),
+                fallback_reason: Some(format!("CUDA 运行时准备失败，已回退到 CPU：{error}")),
+            }
+        }
+    }
+}
+
 fn sherpa_websocket_server_path(executable: &Path) -> PathBuf {
     executable.with_file_name("sherpa-onnx-offline-websocket-server.exe")
 }
@@ -1222,9 +1939,10 @@ fn sherpa_websocket_server_path(executable: &Path) -> PathBuf {
 fn ensure_sherpa_daemon_running(
     app: &AppHandle,
     engine: &InstalledEngineConfig,
+    executable: &Path,
+    runtime_mode: &str,
 ) -> Result<(), String> {
-    let executable = PathBuf::from(&engine.executable);
-    let server_exe = sherpa_websocket_server_path(&executable);
+    let server_exe = sherpa_websocket_server_path(executable);
     if !server_exe.exists() {
         return Err("Sherpa WebSocket 服务程序不存在，无法启用极速模式。".to_string());
     }
@@ -1241,7 +1959,11 @@ fn ensure_sherpa_daemon_running(
             .try_wait()
             .map_err(|error| error.to_string())?
             .is_none();
-        if still_running && existing.model_dir == engine.model_dir {
+        let server_exe_text = server_exe.to_string_lossy().to_string();
+        if still_running
+            && existing.model_dir == engine.model_dir
+            && existing.executable == server_exe_text
+        {
             return Ok(());
         }
     }
@@ -1249,7 +1971,7 @@ fn ensure_sherpa_daemon_running(
     *daemon = None;
 
     let mut command = Command::new(&server_exe);
-    command.args(split_command_args(&engine.args)?);
+    command.args(sherpa_args_for_runtime(&engine.args, None, runtime_mode)?);
     command.arg(format!("--port={SHERPA_DAEMON_PORT}"));
     if let Some(parent) = server_exe.parent() {
         command.current_dir(parent);
@@ -1264,6 +1986,7 @@ fn ensure_sherpa_daemon_running(
     *daemon = Some(SherpaDaemon {
         child,
         model_dir: engine.model_dir.clone(),
+        executable: server_exe.to_string_lossy().to_string(),
     });
 
     Ok(())
@@ -1276,7 +1999,8 @@ fn warm_sherpa_daemon(app: AppHandle, model_dir: String) {
 
     let model_dir = PathBuf::from(model_dir);
     if let Ok(engine) = read_sherpa_engine(&model_dir) {
-        let _ = ensure_sherpa_daemon_running(&app, &engine);
+        let executable = PathBuf::from(&engine.executable);
+        let _ = ensure_sherpa_daemon_running(&app, &engine, &executable, "cpu");
     }
 }
 
@@ -1696,13 +2420,20 @@ fn transcribe_sherpa_wav_cli(
     engine: &InstalledEngineConfig,
     wav_path: &Path,
     sherpa_threads: usize,
+    runtime_mode: &str,
 ) -> Result<String, String> {
     let mut command = Command::new(executable);
-    command.args(sherpa_args_with_threads(&engine.args, sherpa_threads)?);
+    command.args(sherpa_args_for_runtime(
+        &engine.args,
+        Some(sherpa_threads),
+        runtime_mode,
+    )?);
     command.arg(wav_path);
     suppress_command_window(&mut command);
 
-    let output = command.output().map_err(|error| error.to_string())?;
+    let duration = wav_duration_seconds(wav_path).unwrap_or(60.0);
+    let timeout = Duration::from_secs(((duration * 4.0) as u64 + 120).clamp(120, 14_400));
+    let output = run_command_with_timeout(&mut command, timeout, "Sherpa CLI transcription")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
@@ -1721,9 +2452,10 @@ fn transcribe_sherpa_wav_once(
     wav_path: &Path,
     performance: TranscriptionPerformance,
     allow_daemon: bool,
+    runtime_mode: &str,
 ) -> Result<String, String> {
     if allow_daemon {
-        match ensure_sherpa_daemon_running(app, engine)
+        match ensure_sherpa_daemon_running(app, engine, executable, runtime_mode)
             .and_then(|_| transcribe_sherpa_wav_websocket(wav_path))
         {
             Ok(text) if !text.trim().is_empty() => return Ok(text),
@@ -1731,7 +2463,13 @@ fn transcribe_sherpa_wav_once(
         }
     }
 
-    transcribe_sherpa_wav_cli(executable, engine, wav_path, performance.sherpa_threads)
+    transcribe_sherpa_wav_cli(
+        executable,
+        engine,
+        wav_path,
+        performance.sherpa_threads,
+        runtime_mode,
+    )
 }
 
 fn transcribe_sherpa_wav(
@@ -1742,6 +2480,7 @@ fn transcribe_sherpa_wav(
     performance: TranscriptionPerformance,
     task_id: Option<&str>,
     started_at: Instant,
+    runtime_mode: &str,
 ) -> Result<String, String> {
     let duration = wav_duration_seconds(wav_path)?;
     if duration <= LONG_AUDIO_THRESHOLD_SECONDS {
@@ -1755,8 +2494,15 @@ fn transcribe_sherpa_wav(
             0,
             1,
         );
-        let text =
-            transcribe_sherpa_wav_once(app, engine, executable, wav_path, performance, true)?;
+        let text = transcribe_sherpa_wav_once(
+            app,
+            engine,
+            executable,
+            wav_path,
+            performance,
+            true,
+            runtime_mode,
+        )?;
         emit_transcription_progress(
             app,
             task_id,
@@ -1799,6 +2545,7 @@ fn transcribe_sherpa_wav(
         let sender = sender.clone();
         let engine = engine.clone();
         let executable = executable.to_path_buf();
+        let runtime_mode = runtime_mode.to_string();
         handles.push(thread::spawn(move || loop {
             let next = {
                 let Ok(mut queue) = queue.lock() else {
@@ -1809,8 +2556,13 @@ fn transcribe_sherpa_wav(
             let Some((index, chunk)) = next else {
                 return;
             };
-            let result =
-                transcribe_sherpa_wav_cli(&executable, &engine, &chunk, performance.sherpa_threads);
+            let result = transcribe_sherpa_wav_cli(
+                &executable,
+                &engine,
+                &chunk,
+                performance.sherpa_threads,
+                &runtime_mode,
+            );
             let _ = sender.send((index, result));
         }));
     }
@@ -1859,6 +2611,115 @@ fn transcribe_sherpa_wav(
     }
 
     Err("Sherpa 已运行，但长音频分段后仍未解析到转录文字。".to_string())
+}
+
+fn write_smoke_test_wav(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).map_err(|error| error.to_string())?;
+    for _ in 0..8_000 {
+        writer
+            .write_sample(0i16)
+            .map_err(|error| error.to_string())?;
+    }
+    writer.finalize().map_err(|error| error.to_string())
+}
+
+fn run_acceleration_smoke_test_inner(
+    app: AppHandle,
+    request: AccelerationSmokeTestRequest,
+) -> Result<AccelerationSmokeTestResult, String> {
+    let started_at = Instant::now();
+    let requested_mode = if request
+        .acceleration_mode
+        .trim()
+        .eq_ignore_ascii_case("cuda")
+    {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    let model_dir = PathBuf::from(&request.model_dir);
+    let engine = read_sherpa_engine(&model_dir)?;
+    let cpu_executable = PathBuf::from(&engine.executable);
+    if !cpu_executable.exists() {
+        return Err("Sherpa-ONNX 程序不存在，请重新配置模型。".to_string());
+    }
+
+    let smoke_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("gpu-smoke-tests");
+    let smoke_wav = smoke_dir.join(format!("smoke-{}.wav", unix_timestamp_millis()?));
+    write_smoke_test_wav(&smoke_wav)?;
+
+    let runtime = resolve_sherpa_runtime(&app, &engine, requested_mode);
+    let fallback_reason = runtime.fallback_reason.clone();
+    let performance = transcription_performance("stable");
+    let first_result = transcribe_sherpa_wav_once(
+        &app,
+        &engine,
+        &runtime.executable,
+        &smoke_wav,
+        performance,
+        false,
+        &runtime.mode,
+    );
+
+    let (used_mode, fallback_used, text, message) = match first_result {
+        Ok(text) => {
+            let message = if runtime.mode == "cuda" {
+                "CUDA smoke test 已完成；静音音频不要求识别出文字。".to_string()
+            } else if let Some(reason) = fallback_reason {
+                format!("CUDA 不可用，已使用 CPU 完成 smoke test：{reason}")
+            } else {
+                "CPU smoke test 已完成；静音音频不要求识别出文字。".to_string()
+            };
+            let fallback_used = requested_mode == "cuda" && runtime.mode != "cuda";
+            (runtime.mode, fallback_used, text, message)
+        }
+        Err(error) if runtime.mode != "cpu" => {
+            trip_cuda_circuit(&app, format!("CUDA smoke test 失败：{error}"));
+            let cpu_text = transcribe_sherpa_wav_once(
+                &app,
+                &engine,
+                &cpu_executable,
+                &smoke_wav,
+                performance,
+                false,
+                "cpu",
+            )?;
+            (
+                "cpu".to_string(),
+                true,
+                cpu_text,
+                format!("CUDA smoke test 失败，CPU 回退成功：{error}"),
+            )
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&smoke_wav);
+            return Err(error);
+        }
+    };
+
+    let _ = fs::remove_file(&smoke_wav);
+    Ok(AccelerationSmokeTestResult {
+        requested_mode: requested_mode.to_string(),
+        used_mode,
+        fallback_used,
+        elapsed_ms: started_at.elapsed().as_millis(),
+        transcript_preview: text.trim().chars().take(80).collect(),
+        message,
+    })
 }
 
 fn write_transcription_outputs(
@@ -1954,20 +2815,80 @@ fn transcribe_file_with_sherpa(
     let model_dir = PathBuf::from(&request.model_dir);
     let engine = read_sherpa_engine(&model_dir)?;
 
-    let executable = PathBuf::from(&engine.executable);
-    if !executable.exists() {
+    let cpu_executable = PathBuf::from(&engine.executable);
+    if !cpu_executable.exists() {
         return Err("Sherpa-ONNX 程序不存在，请重新配置模型。".to_string());
     }
 
-    let text = transcribe_sherpa_wav(
+    if request
+        .acceleration_mode
+        .trim()
+        .eq_ignore_ascii_case("cuda")
+    {
+        emit_transcription_progress(
+            &app,
+            request.task_id.as_deref(),
+            started_at,
+            "transcribing",
+            14,
+            "正在准备 CUDA 加速运行时；不可用时会自动回退到 CPU。".to_string(),
+            0,
+            0,
+        );
+    }
+
+    let runtime = resolve_sherpa_runtime(&app, &engine, &request.acceleration_mode);
+    let runtime_performance = performance_for_acceleration(performance, &runtime.mode);
+    if let Some(reason) = runtime.fallback_reason.as_ref() {
+        emit_transcription_progress(
+            &app,
+            request.task_id.as_deref(),
+            started_at,
+            "transcribing",
+            18,
+            reason.clone(),
+            0,
+            0,
+        );
+    }
+
+    let text_result = transcribe_sherpa_wav(
         &app,
         &engine,
-        &executable,
+        &runtime.executable,
         &sherpa_audio_path,
-        performance,
+        runtime_performance,
         request.task_id.as_deref(),
         started_at,
-    )?;
+        &runtime.mode,
+    );
+    let text = match text_result {
+        Ok(text) => text,
+        Err(error) if runtime.mode != "cpu" => {
+            trip_cuda_circuit(&app, format!("CUDA 识别失败：{error}"));
+            emit_transcription_progress(
+                &app,
+                request.task_id.as_deref(),
+                started_at,
+                "transcribing",
+                20,
+                format!("CUDA 识别失败，正在回退到 CPU：{error}"),
+                0,
+                0,
+            );
+            transcribe_sherpa_wav(
+                &app,
+                &engine,
+                &cpu_executable,
+                &sherpa_audio_path,
+                performance,
+                request.task_id.as_deref(),
+                started_at,
+                "cpu",
+            )?
+        }
+        Err(error) => return Err(error),
+    };
 
     if text.is_empty() {
         return Err("Sherpa 已运行，但没有解析到转录文字。".to_string());
@@ -2270,6 +3191,7 @@ fn finish_recording_with_settings(
             model_dir: settings.model_dir,
             task_id: None,
             performance_mode: "stable".to_string(),
+            acceleration_mode: settings.acceleration_mode,
             output_format: settings.export_format,
             save_output: settings.save_recordings,
         },
@@ -2580,6 +3502,36 @@ fn validate_model_dir(request: ModelValidationRequest) -> ModelValidationResult 
 }
 
 #[tauri::command]
+fn get_acceleration_status(
+    app: AppHandle,
+    request: AccelerationStatusRequest,
+) -> Result<AccelerationStatus, String> {
+    acceleration_status_for_app(&app, &request.acceleration_mode)
+}
+
+#[tauri::command]
+async fn prepare_acceleration_runtime(
+    app: AppHandle,
+    request: AccelerationStatusRequest,
+) -> Result<AccelerationStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        prepare_acceleration_runtime_for_app(&app, &request.acceleration_mode)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn run_acceleration_smoke_test(
+    app: AppHandle,
+    request: AccelerationSmokeTestRequest,
+) -> Result<AccelerationSmokeTestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_acceleration_smoke_test_inner(app, request))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 fn start_recording(app: AppHandle, state: State<'_, RuntimeState>) -> Result<String, String> {
     start_recording_from_runtime(&app, state.inner())
 }
@@ -2609,6 +3561,9 @@ pub fn run() {
             settings: Mutex::new(UserSettings::default()),
             recording: Mutex::new(None),
             sherpa_daemon: Mutex::new(None),
+            sherpa_runtime_install: Mutex::new(()),
+            cuda_disabled_reason: Mutex::new(None),
+            cuda_startup_checked_runtime: Mutex::new(None),
         })
         .setup(|app| {
             let settings = read_settings(&app.handle()).unwrap_or_else(|_| UserSettings::default());
@@ -2645,6 +3600,9 @@ pub fn run() {
             save_existing_file,
             transcribe_file,
             validate_model_dir,
+            get_acceleration_status,
+            prepare_acceleration_runtime,
+            run_acceleration_smoke_test,
             start_recording,
             stop_recording
         ])
@@ -2665,6 +3623,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test root");
         root
+    }
+
+    #[cfg(windows)]
+    fn test_exit_status(code: u32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw(code)
+    }
+
+    #[cfg(unix)]
+    fn test_exit_status(code: u32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        std::process::ExitStatus::from_raw((code as i32) << 8)
     }
 
     fn write_installed_model(models_dir: &Path, model_id: &str, executable: &Path) -> PathBuf {
@@ -2718,6 +3690,286 @@ mod tests {
             discover_installed_model_in_models_dir(&models_dir, "sensevoice-small").expect("model");
 
         assert_eq!(discovered.0, "sherpa-paraformer-zh");
+    }
+
+    #[test]
+    fn older_user_settings_default_to_cpu_acceleration() {
+        let settings: UserSettings =
+            serde_json::from_str(r#"{"shortcut":"Mouse4"}"#).expect("settings");
+
+        assert_eq!(settings.acceleration_mode, "cpu");
+    }
+
+    #[test]
+    fn transcribe_request_defaults_to_cpu_acceleration() {
+        let request: TranscribeFileRequest =
+            serde_json::from_str(r#"{"audioPath":"sample.wav","modelDir":"models/demo"}"#)
+                .expect("request");
+
+        assert_eq!(request.acceleration_mode, "cpu");
+    }
+
+    #[test]
+    fn cuda_acceleration_uses_single_worker_performance() {
+        let fast = transcription_performance("fast");
+        let cuda = performance_for_acceleration(fast, "cuda");
+        let cpu = performance_for_acceleration(fast, "cpu");
+
+        assert_eq!(cuda.file_workers, 1);
+        assert_eq!(cuda.chunk_workers, 1);
+        assert_eq!(cuda.sherpa_threads, 2);
+        assert_eq!(cpu.chunk_workers, 3);
+    }
+
+    #[test]
+    fn acceleration_status_keeps_cpu_effective_when_cuda_is_unavailable() {
+        let status =
+            acceleration_status_from_parts("cuda", false, None, None, true, false, None, None);
+
+        assert_eq!(status.selected_mode, "cuda");
+        assert_eq!(status.effective_mode, "cpu");
+        assert!(status.message.contains("回退 CPU"));
+    }
+
+    #[test]
+    fn acceleration_status_reports_cuda_ready_when_runtime_is_installed() {
+        let status = acceleration_status_from_parts(
+            "cuda",
+            true,
+            Some("RTX 4090 / driver 555.85 / VRAM 24564 MB".to_string()),
+            None,
+            true,
+            true,
+            None,
+            None,
+        );
+
+        assert_eq!(status.effective_mode, "cuda");
+        assert!(status.cuda_runtime_installed);
+        assert!(status.cuda_device_summary.is_some());
+        assert!(status.message.contains("CUDA"));
+    }
+
+    #[test]
+    fn acceleration_status_reports_prepare_failure_as_cpu_fallback() {
+        let status = acceleration_status_from_parts(
+            "cuda",
+            true,
+            None,
+            None,
+            true,
+            false,
+            None,
+            Some("network error".to_string()),
+        );
+
+        assert_eq!(status.effective_mode, "cpu");
+        assert!(status.message.contains("network error"));
+    }
+
+    #[test]
+    fn acceleration_status_reports_cuda_circuit_breaker_as_cpu_fallback() {
+        let status = acceleration_status_from_parts(
+            "cuda",
+            true,
+            None,
+            None,
+            true,
+            true,
+            Some("driver mismatch".to_string()),
+            None,
+        );
+
+        assert_eq!(status.effective_mode, "cpu");
+        assert_eq!(
+            status.cuda_disabled_reason.as_deref(),
+            Some("driver mismatch")
+        );
+        assert!(status.message.contains("本次会话已停用"));
+    }
+
+    #[test]
+    fn parses_nvidia_smi_query_output_for_diagnostics() {
+        let summary = parse_nvidia_smi_query_output(
+            "NVIDIA GeForce RTX 4070, 552.44, 12282\nNVIDIA RTX A2000, 551.86, 6144\n",
+        )
+        .expect("summary");
+
+        assert!(summary.contains("RTX 4070"));
+        assert!(summary.contains("driver 552.44"));
+        assert!(summary.contains("VRAM 12282 MB"));
+        assert!(summary.contains("RTX A2000"));
+    }
+
+    #[test]
+    fn builds_nvidia_smi_candidate_paths_for_common_windows_installs() {
+        let paths = nvidia_smi_candidate_paths(
+            Some(r"C:\Windows"),
+            Some(r"C:\Windows"),
+            Some(r"C:\Program Files"),
+        );
+
+        assert_eq!(paths[0], PathBuf::from("nvidia-smi"));
+        assert!(paths.contains(&PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")));
+        assert!(paths.contains(&PathBuf::from(
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        )));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.to_string_lossy().contains("System32"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nvidia_cuda_info_requires_parseable_successful_output() {
+        let candidate = PathBuf::from("nvidia-smi");
+        let info = nvidia_cuda_info_from_output(
+            &candidate,
+            Output {
+                status: test_exit_status(0),
+                stdout: b"NVIDIA GeForce RTX 4070, 552.44, 12282\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        )
+        .expect("cuda info");
+
+        assert!(info.available);
+        assert!(info
+            .device_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("RTX 4070"));
+
+        let error = nvidia_cuda_info_from_output(
+            &candidate,
+            Output {
+                status: test_exit_status(1),
+                stdout: Vec::new(),
+                stderr: b"driver unavailable".to_vec(),
+            },
+        )
+        .expect_err("non-zero output");
+        assert!(error.contains("driver unavailable"));
+
+        let error = nvidia_cuda_info_from_output(
+            &candidate,
+            Output {
+                status: test_exit_status(0),
+                stdout: b"not csv\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        )
+        .expect_err("unparseable output");
+        assert!(error.contains("no parseable GPU rows"));
+    }
+
+    #[test]
+    fn derives_runtime_dir_from_executable_path() {
+        let executable = PathBuf::from(
+            r"C:\HiVoicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe",
+        );
+
+        let runtime_dir = sherpa_runtime_dir_from_executable(&executable).expect("runtime dir");
+
+        assert_eq!(
+            runtime_dir,
+            PathBuf::from(
+                r"C:\HiVoicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda"
+            )
+        );
+    }
+
+    #[test]
+    fn websocket_server_path_is_derived_from_selected_runtime() {
+        let cpu_executable = PathBuf::from(
+            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts\bin\sherpa-onnx-offline.exe",
+        );
+        let cuda_executable = PathBuf::from(
+            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe",
+        );
+
+        let cpu_server = sherpa_websocket_server_path(&cpu_executable);
+        let cuda_server = sherpa_websocket_server_path(&cuda_executable);
+
+        assert_ne!(cpu_server, cuda_server);
+        assert!(cpu_server.to_string_lossy().contains("static-MT"));
+        assert!(cuda_server.to_string_lossy().contains("cuda-12.x"));
+    }
+
+    #[test]
+    fn cuda_startup_check_cache_is_bound_to_exact_runtime() {
+        let cuda_executable = PathBuf::from(
+            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe",
+        );
+        let cpu_executable = PathBuf::from(
+            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts\bin\sherpa-onnx-offline.exe",
+        );
+        let checked_runtime = cuda_executable.to_string_lossy().to_string();
+
+        assert!(cuda_runtime_check_matches(
+            Some(&checked_runtime),
+            &cuda_executable
+        ));
+        assert!(!cuda_runtime_check_matches(
+            Some(&checked_runtime),
+            &cpu_executable
+        ));
+        assert!(!cuda_runtime_check_matches(None, &cuda_executable));
+    }
+
+    #[test]
+    fn smoke_test_runtime_reports_missing_executable() {
+        let root = test_root("smoke-test-runtime-reports-missing-executable");
+        let error = smoke_test_sherpa_runtime(&root.join("missing.exe")).expect_err("missing exe");
+
+        assert!(error.contains("runtime executable not found"));
+    }
+
+    #[test]
+    fn command_timeout_kills_hung_processes() {
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 5; Write-Output done",
+        ]);
+
+        let error =
+            run_command_with_timeout(&mut command, Duration::from_millis(200), "timeout-test")
+                .expect_err("timeout");
+
+        assert!(error.contains("timeout-test timed out"));
+    }
+
+    #[test]
+    fn command_timeout_captures_large_stdout_without_blocking() {
+        let mut command = Command::new("powershell");
+        command.args(["-NoProfile", "-Command", "'x' * 200000"]);
+
+        let output =
+            run_command_with_timeout(&mut command, Duration::from_secs(10), "large-output")
+                .expect("large output");
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 100_000);
+    }
+
+    #[test]
+    fn writes_smoke_test_wav_as_16khz_mono_pcm() {
+        let root = test_root("writes-smoke-test-wav-as-16khz-mono-pcm");
+        let wav_path = root.join("smoke.wav");
+
+        write_smoke_test_wav(&wav_path).expect("write smoke wav");
+
+        let reader = hound::WavReader::open(&wav_path).expect("read smoke wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(reader.duration(), 8_000);
     }
 
     #[test]
@@ -2900,7 +4152,8 @@ Elapsed seconds: 0.16
     #[test]
     fn rewrites_sherpa_num_threads_for_concurrent_workers() {
         assert_eq!(
-            sherpa_args_with_threads("--tokens=a --num-threads=4 --model=b", 2).expect("args"),
+            sherpa_args_for_runtime("--tokens=a --num-threads=4 --model=b", Some(2), "cpu")
+                .expect("args"),
             vec![
                 "--tokens=a".to_string(),
                 "--num-threads=2".to_string(),
@@ -2908,11 +4161,52 @@ Elapsed seconds: 0.16
             ]
         );
         assert_eq!(
-            sherpa_args_with_threads("--tokens=a --num-threads 4", 1).expect("args"),
+            sherpa_args_for_runtime("--tokens=a --num-threads 4", Some(1), "cpu").expect("args"),
             vec![
                 "--tokens=a".to_string(),
                 "--num-threads".to_string(),
                 "1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cuda_runtime_args_force_cuda_provider() {
+        assert_eq!(
+            sherpa_args_for_runtime("--tokens=a --model=b", Some(2), "cuda").expect("args"),
+            vec![
+                "--tokens=a".to_string(),
+                "--model=b".to_string(),
+                "--num-threads=2".to_string(),
+                "--provider=cuda".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cuda_runtime_args_replace_existing_provider_forms() {
+        assert_eq!(
+            sherpa_args_for_runtime("--provider=cpu --tokens=a", None, "cuda").expect("args"),
+            vec!["--provider=cuda".to_string(), "--tokens=a".to_string()]
+        );
+        assert_eq!(
+            sherpa_args_for_runtime("--provider cpu --tokens=a", None, "cuda").expect("args"),
+            vec![
+                "--provider".to_string(),
+                "cuda".to_string(),
+                "--tokens=a".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn cpu_runtime_args_preserve_default_provider_behavior() {
+        assert_eq!(
+            sherpa_args_for_runtime("--tokens=a --model=b", Some(1), "cpu").expect("args"),
+            vec![
+                "--tokens=a".to_string(),
+                "--model=b".to_string(),
+                "--num-threads=1".to_string()
             ]
         );
     }
