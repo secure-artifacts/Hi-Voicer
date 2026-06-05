@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AppShell } from "./components/AppShell";
-import { initialDiagnostics, initialHotwords, initialSettings, initialStatus, initialTasks } from "./data/mockState";
+import { initialDiagnostics, initialHotwords, initialSettings, initialStatus, initialTasks, initialTermCategories } from "./data/mockState";
 import { findModelPreset } from "./data/modelPresets";
 import {
   loadSettings,
   listenMiniToggleRecording,
+  listenRecordingError,
   listenRecordingLevel,
   listenRecordingState,
   listenTranscriptionResult,
@@ -17,12 +18,24 @@ import {
   stopRecording,
   validateModelDir,
 } from "./lib/api";
+import { normalizeHotwordRules, normalizeTermCategories } from "./lib/termLibrary";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 import { HomePage } from "./pages/HomePage";
 import { HotwordsPage } from "./pages/HotwordsPage";
+import { AudioProcessingPage } from "./pages/AudioProcessingPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { SubtitleEditorPage } from "./pages/SubtitleEditorPage";
 import { TranscriptionPage } from "./pages/TranscriptionPage";
-import type { AppPage, AppStatus, ModelValidationResult, TranscriptHistoryItem, TranscriptTask, UserSettings } from "./types";
+import type {
+  AppPage,
+  AppStatus,
+  ModelValidationResult,
+  SubtitleSegment,
+  TimelineKind,
+  TranscriptHistoryItem,
+  TranscriptTask,
+  UserSettings,
+} from "./types";
 
 const HISTORY_KEY = "hi-voicer-transcript-history";
 const HOTWORDS_KEY = "hi-voicer-hotwords";
@@ -41,34 +54,14 @@ function saveTranscriptHistory(history: TranscriptHistoryItem[]) {
   window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
 }
 
-function normalizeHotwords(value: unknown) {
-  const list = Array.isArray(value)
-    ? value
-    : typeof value === "object" && value && Array.isArray((value as { rules?: unknown }).rules)
-      ? (value as { rules: unknown[] }).rules
-      : [];
-
-  return list
-    .map((item, index) => {
-      const rule = item as Partial<(typeof initialHotwords)[number]>;
-      return {
-        id: typeof rule.id === "string" ? rule.id : `hotword-${Date.now()}-${index}`,
-        source: typeof rule.source === "string" ? rule.source : "",
-        target: typeof rule.target === "string" ? rule.target : "",
-        enabled: typeof rule.enabled === "boolean" ? rule.enabled : true,
-      };
-    })
-    .filter((rule) => rule.source.trim() || rule.target.trim());
-}
-
-function loadHotwords() {
+function loadHotwords(termCategories: UserSettings["termCategories"]) {
   try {
     const raw = window.localStorage.getItem(HOTWORDS_KEY);
     if (!raw) {
       return null;
     }
 
-    const rules = normalizeHotwords(JSON.parse(raw));
+    const rules = normalizeHotwordRules(JSON.parse(raw), termCategories);
     return rules.length > 0 ? rules : null;
   } catch {
     window.localStorage.removeItem(HOTWORDS_KEY);
@@ -100,7 +93,15 @@ export default function App() {
   const [recordingLevel, setRecordingLevel] = useState(0);
   const [transcriptHistory, setTranscriptHistory] = useState<TranscriptHistoryItem[]>(() => loadTranscriptHistory());
   const [transcriptionTasks, setTranscriptionTasks] = useState<TranscriptTask[]>(initialTasks);
+  const [subtitleProject, setSubtitleProject] = useState<{
+    fileName: string;
+    sourceAudioPath: string;
+    text: string;
+    segments: SubtitleSegment[];
+    timelineKind?: TimelineKind;
+  } | null>(null);
   const miniDragRef = useRef({ x: 0, y: 0, dragging: false });
+  const settingsSaveVersionRef = useRef(0);
   const [modelValidation, setModelValidation] = useState<ModelValidationResult>({
     valid: false,
     modelName: "",
@@ -112,8 +113,14 @@ export default function App() {
       return;
     }
     void loadSettings(initialSettings).then((loadedSettings) => {
-      const hotwords = loadHotwords();
-      const nextSettings = hotwords ? { ...loadedSettings, hotwords } : loadedSettings;
+      const termCategories = normalizeTermCategories(loadedSettings.termCategories);
+      const hotwords = loadHotwords(termCategories);
+      const nextSettings = {
+        ...loadedSettings,
+        recordingSource: loadedSettings.recordingSource ?? "microphone",
+        termCategories,
+        hotwords: hotwords ?? normalizeHotwordRules(loadedSettings.hotwords ?? initialHotwords, termCategories),
+      };
       setSettings(nextSettings);
       void refreshModelValidation(nextSettings);
     });
@@ -131,17 +138,54 @@ export default function App() {
     }
   }
 
-  function handleSettingsChange(nextSettings: UserSettings) {
+  function commitSettings(nextSettings: UserSettings) {
+    const version = settingsSaveVersionRef.current + 1;
+    settingsSaveVersionRef.current = version;
     setSettings(nextSettings);
     void saveSettings(nextSettings).then((savedSettings) => {
+      if (settingsSaveVersionRef.current !== version) {
+        return;
+      }
       setSettings(savedSettings);
       void refreshModelValidation(savedSettings);
     });
   }
 
+  function handleSettingsChange(nextSettings: UserSettings) {
+    commitSettings(nextSettings);
+  }
+
+  function updateSettings(updater: (current: UserSettings) => UserSettings) {
+    setSettings((current) => {
+      const nextSettings = updater(current);
+      const version = settingsSaveVersionRef.current + 1;
+      settingsSaveVersionRef.current = version;
+      void saveSettings(nextSettings).then((savedSettings) => {
+        if (settingsSaveVersionRef.current !== version) {
+          return;
+        }
+        setSettings(savedSettings);
+        void refreshModelValidation(savedSettings);
+      });
+      return nextSettings;
+    });
+  }
+
   function handleHotwordsChange(hotwords: UserSettings["hotwords"]) {
     saveHotwords(hotwords);
-    handleSettingsChange({ ...settings, hotwords });
+    updateSettings((current) => ({ ...current, hotwords }));
+  }
+
+  function handleTermCategoriesChange(termCategories: UserSettings["termCategories"]) {
+    updateSettings((current) => ({ ...current, termCategories }));
+  }
+
+  function handleAddTermRule(rule: UserSettings["hotwords"][number]) {
+    updateSettings((current) => {
+      const hotwords = [rule, ...current.hotwords];
+      saveHotwords(hotwords);
+      return { ...current, hotwords };
+    });
   }
 
   function clearTranscriptHistory() {
@@ -218,6 +262,7 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlistenRecording = () => {};
+    let unlistenRecordingError = () => {};
     let unlistenLevel = () => {};
     let unlistenResult = () => {};
     let unlistenMiniToggle = () => {};
@@ -241,6 +286,18 @@ export default function App() {
       unlistenLevel = unlisten;
       if (disposed) {
         unlistenLevel();
+      }
+    });
+
+    void listenRecordingError((message) => {
+      if (!disposed) {
+        setIsRecording(false);
+        setLastResult(message || "录音失败。");
+      }
+    }).then((unlisten) => {
+      unlistenRecordingError = unlisten;
+      if (disposed) {
+        unlistenRecordingError();
       }
     });
 
@@ -272,6 +329,7 @@ export default function App() {
     return () => {
       disposed = true;
       unlistenRecording();
+      unlistenRecordingError();
       unlistenLevel();
       unlistenResult();
       unlistenMiniToggle();
@@ -372,9 +430,35 @@ export default function App() {
           tasks={transcriptionTasks}
           onTasksChange={setTranscriptionTasks}
           settings={settings}
+          onOpenSubtitleEditor={(task) => {
+            setSubtitleProject({
+              fileName: task.fileName,
+              sourceAudioPath: task.sourceAudioPath || task.filePath || "",
+              text: task.text || "",
+              segments: task.segments ?? [],
+              timelineKind: task.timelineKind,
+            });
+            setCurrentPage("subtitles");
+          }}
         />
       )}
-      {currentPage === "hotwords" && <HotwordsPage rules={settings.hotwords} onRulesChange={handleHotwordsChange} />}
+      {currentPage === "subtitles" && (
+        <SubtitleEditorPage
+          project={subtitleProject}
+          onProjectChange={setSubtitleProject}
+          termCategories={settings.termCategories}
+          onAddTermRule={handleAddTermRule}
+        />
+      )}
+      {currentPage === "hotwords" && (
+        <HotwordsPage
+          rules={settings.hotwords}
+          categories={settings.termCategories}
+          onRulesChange={handleHotwordsChange}
+          onCategoriesChange={handleTermCategoriesChange}
+        />
+      )}
+      {currentPage === "audio-processing" && <AudioProcessingPage />}
       {currentPage === "settings" && (
         <SettingsPage
           settings={settings}

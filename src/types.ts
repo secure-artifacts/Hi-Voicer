@@ -6,14 +6,17 @@ export type ReadinessState =
   | "microphone-unavailable"
   | "error";
 
-export type AppPage = "home" | "transcription" | "hotwords" | "settings" | "diagnostics";
+export type AppPage = "home" | "transcription" | "subtitles" | "hotwords" | "audio-processing" | "settings" | "diagnostics";
 
 export type PasteMode = "direct" | "clipboard";
 export type RecordingMode = "hold" | "toggle" | "audioOnly";
+export type RecordingSource = "microphone" | "system" | "microphoneAndSystem";
 export type AccelerationMode = "cpu" | "cuda";
 export type ExportFormat = "plainText" | "timelineText" | "srt";
 export type ThemeMode = "light" | "dark";
 export type TranscriptionPerformanceMode = "stable" | "balanced" | "fast";
+export type TimelineKind = "estimated" | "model";
+export type AudioProcessingPreset = "normalize" | "trimSilence" | "voiceBasic" | "humReduction" | "lowHighPass";
 
 export interface AppStatus {
   readiness: ReadinessState;
@@ -41,6 +44,10 @@ export interface TranscriptTask {
   elapsedMs?: number;
   completedSegments?: number;
   totalSegments?: number;
+  text?: string;
+  segments?: SubtitleSegment[];
+  timelineKind?: TimelineKind;
+  sourceAudioPath?: string;
 }
 
 export interface HotwordRule {
@@ -48,6 +55,15 @@ export interface HotwordRule {
   source: string;
   target: string;
   enabled: boolean;
+  categoryId?: string;
+  hitCount?: number;
+  lastUsedAt?: string;
+}
+
+export interface TermCategory {
+  id: string;
+  name: string;
+  order: number;
 }
 
 export interface UserSettings {
@@ -57,8 +73,10 @@ export interface UserSettings {
   outputDir: string;
   pasteMode: PasteMode;
   recordingMode: RecordingMode;
+  recordingSource: RecordingSource;
   accelerationMode: AccelerationMode;
   hotwords: HotwordRule[];
+  termCategories: TermCategory[];
   theme: ThemeMode;
   saveRecordings: boolean;
   launchAtStartup: boolean;
@@ -100,12 +118,38 @@ export interface TranscribeFileResult {
   outputPath: string;
   outputPaths: string[];
   outputFiles: TranscriptionOutputFile[];
+  segments: SubtitleSegment[];
+  timelineKind: TimelineKind;
+  sourceAudioPath: string;
 }
 
 export interface TranscriptionOutputFile {
   format: ExportFormat;
   label: string;
   path: string;
+}
+
+export interface SubtitleSegment {
+  id: string;
+  index: number;
+  start: number;
+  end: number;
+  text: string;
+  sourceAudioPath: string;
+}
+
+export interface AudioProcessingOptions {
+  preset: AudioProcessingPreset;
+  normalize: boolean;
+  trimSilence: boolean;
+  humReduction: boolean;
+  voiceFilter: boolean;
+  noiseReduction: boolean;
+}
+
+export interface AudioProcessingResult {
+  outputPath: string;
+  message: string;
 }
 
 export interface TranscriptionProgress {
@@ -142,6 +186,19 @@ export interface AccelerationSmokeTestResult {
   fallbackUsed: boolean;
   elapsedMs: number;
   transcriptPreview: string;
+  message: string;
+}
+
+export interface NativeAudioDiagnostics {
+  microphoneAvailable: boolean;
+  microphoneName?: string | null;
+  microphoneDetail?: string | null;
+  systemAudioAvailable: boolean;
+  systemAudioName?: string | null;
+  systemAudioDetail?: string | null;
+  ffmpegInstalled: boolean;
+  ffmpegPath?: string | null;
+  ffmpegDetail?: string | null;
   message: string;
 }
 

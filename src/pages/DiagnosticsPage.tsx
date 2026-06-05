@@ -1,6 +1,7 @@
 import { Download, FileAudio, FileDown, TestTube2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
+  getNativeAudioDiagnostics,
   getAccelerationStatus,
   prepareAccelerationRuntime,
   runAccelerationSmokeTest,
@@ -8,7 +9,7 @@ import {
   selectAudioFiles,
   transcribeFile,
 } from "../lib/api";
-import type { AccelerationSmokeTestResult, AccelerationStatus, DiagnosticItem, UserSettings } from "../types";
+import type { AccelerationSmokeTestResult, AccelerationStatus, DiagnosticItem, NativeAudioDiagnostics, UserSettings } from "../types";
 
 interface DiagnosticsPageProps {
   items: DiagnosticItem[];
@@ -34,9 +35,10 @@ function buildGpuDiagnosticReport(
   items: DiagnosticItem[],
   status: AccelerationStatus | null,
   smokeResult: AccelerationSmokeTestResult | null,
+  audioDiagnostics: NativeAudioDiagnostics | null,
 ) {
   const lines = [
-    "Hi-Voicer GPU 诊断报告",
+    "Hi-Voicer 诊断报告",
     `生成时间: ${new Date().toISOString()}`,
     "",
     "[设置]",
@@ -57,8 +59,8 @@ function buildGpuDiagnosticReport(
       `NVIDIA 可用: ${status.cudaAvailable ? "是" : "否"}`,
       `NVIDIA 信息: ${status.cudaDeviceSummary || "(无)"}`,
       `NVIDIA 检测错误: ${status.cudaDetectionError || "(无)"}`,
-      `CPU runtime: ${status.cpuRuntimeInstalled ? "已安装" : "未安装/按需准备"}`,
-      `CUDA runtime: ${status.cudaRuntimeInstalled ? "已安装" : "未安装/按需下载"}`,
+      `CPU runtime: ${status.cpuRuntimeInstalled ? "已安装" : "未安装/随模型准备"}`,
+      `CUDA runtime: ${status.cudaRuntimeInstalled ? "已安装" : "未安装/需手动准备"}`,
       `CUDA 本次会话停用原因: ${status.cudaDisabledReason || "(无)"}`,
       `状态消息: ${status.message}`,
     );
@@ -80,6 +82,24 @@ function buildGpuDiagnosticReport(
     lines.push("尚未运行。");
   }
 
+  lines.push("", "[本机音频环境]");
+  if (audioDiagnostics) {
+    lines.push(
+      `麦克风可用: ${audioDiagnostics.microphoneAvailable ? "是" : "否"}`,
+      `麦克风设备: ${audioDiagnostics.microphoneName || "(无)"}`,
+      `麦克风详情: ${audioDiagnostics.microphoneDetail || "(无)"}`,
+      `系统声音可用: ${audioDiagnostics.systemAudioAvailable ? "是" : "否"}`,
+      `系统输出设备: ${audioDiagnostics.systemAudioName || "(无)"}`,
+      `系统声音详情: ${audioDiagnostics.systemAudioDetail || "(无)"}`,
+      `ffmpeg 已安装: ${audioDiagnostics.ffmpegInstalled ? "是" : "否"}`,
+      `ffmpeg 路径: ${audioDiagnostics.ffmpegPath || "(无)"}`,
+      `ffmpeg 详情: ${audioDiagnostics.ffmpegDetail || "(无)"}`,
+      `音频环境消息: ${audioDiagnostics.message}`,
+    );
+  } else {
+    lines.push("尚未完成本机音频环境检测。");
+  }
+
   return `${lines.join("\n")}\n`;
 }
 
@@ -91,6 +111,8 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
   const [accelerationTestResult, setAccelerationTestResult] = useState("");
   const [accelerationSmokeResult, setAccelerationSmokeResult] = useState<AccelerationSmokeTestResult | null>(null);
   const [accelerationStatus, setAccelerationStatus] = useState<AccelerationStatus | null>(null);
+  const [nativeAudioDiagnostics, setNativeAudioDiagnostics] = useState<NativeAudioDiagnostics | null>(null);
+  const [isCheckingNativeAudio, setIsCheckingNativeAudio] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -104,6 +126,26 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
       disposed = true;
     };
   }, [settings.accelerationMode]);
+
+  useEffect(() => {
+    let disposed = false;
+    setIsCheckingNativeAudio(true);
+    void getNativeAudioDiagnostics()
+      .then((diagnostics) => {
+        if (!disposed) {
+          setNativeAudioDiagnostics(diagnostics);
+        }
+      })
+      .finally(() => {
+        if (!disposed) {
+          setIsCheckingNativeAudio(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   async function handleTestModel() {
     setIsTestingModel(true);
@@ -153,12 +195,23 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
 
   async function handleSaveGpuReport() {
     const status = accelerationStatus ?? (await getAccelerationStatus(settings.accelerationMode));
+    const audioDiagnostics = nativeAudioDiagnostics ?? (await getNativeAudioDiagnostics());
     setAccelerationStatus(status);
-    const report = buildGpuDiagnosticReport(settings, modelReady, items, status, accelerationSmokeResult);
+    setNativeAudioDiagnostics(audioDiagnostics);
+    const report = buildGpuDiagnosticReport(settings, modelReady, items, status, accelerationSmokeResult, audioDiagnostics);
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const path = await saveTextFile(`hi-voicer-gpu-diagnostics-${stamp}.txt`, report);
+    const path = await saveTextFile(`hi-voicer-diagnostics-${stamp}.txt`, report);
     if (path) {
-      setAccelerationTestResult(`GPU 诊断报告已保存：${path}`);
+      setAccelerationTestResult(`诊断报告已保存：${path}`);
+    }
+  }
+
+  async function handleRefreshNativeAudioDiagnostics() {
+    setIsCheckingNativeAudio(true);
+    try {
+      setNativeAudioDiagnostics(await getNativeAudioDiagnostics());
+    } finally {
+      setIsCheckingNativeAudio(false);
     }
   }
 
@@ -174,6 +227,40 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="panel diagnostic-tool">
+        <div>
+          <p className="section-label">本机音频环境</p>
+          <h2>录制和音频处理基础条件</h2>
+        </div>
+        <div className="diagnostic-list">
+          <div className={`diagnostic-row diagnostic-row--${nativeAudioDiagnostics?.microphoneAvailable ? "ok" : "warning"}`}>
+            <strong>麦克风</strong>
+            <p>
+              {nativeAudioDiagnostics?.microphoneName || "未检测到默认麦克风"}
+              {nativeAudioDiagnostics?.microphoneDetail ? ` / ${nativeAudioDiagnostics.microphoneDetail}` : ""}
+            </p>
+          </div>
+          <div className={`diagnostic-row diagnostic-row--${nativeAudioDiagnostics?.systemAudioAvailable ? "ok" : "warning"}`}>
+            <strong>系统声音</strong>
+            <p>
+              {nativeAudioDiagnostics?.systemAudioName || "未检测到默认系统输出设备"}
+              {nativeAudioDiagnostics?.systemAudioDetail ? ` / ${nativeAudioDiagnostics.systemAudioDetail}` : ""}
+            </p>
+          </div>
+          <div className={`diagnostic-row diagnostic-row--${nativeAudioDiagnostics?.ffmpegInstalled ? "ok" : "warning"}`}>
+            <strong>ffmpeg</strong>
+            <p>
+              {nativeAudioDiagnostics?.ffmpegPath || nativeAudioDiagnostics?.ffmpegDetail || "尚未检测"}
+            </p>
+          </div>
+        </div>
+        <button className="secondary-button" type="button" disabled={isCheckingNativeAudio} onClick={() => void handleRefreshNativeAudioDiagnostics()}>
+          <TestTube2 size={17} />
+          {isCheckingNativeAudio ? "正在检测音频环境..." : "刷新音频环境诊断"}
+        </button>
+        {nativeAudioDiagnostics?.message && <p className="diagnostic-result">{nativeAudioDiagnostics.message}</p>}
       </section>
 
       <section className="panel diagnostic-tool">
@@ -217,8 +304,8 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
             <div className="diagnostic-row diagnostic-row--ok">
               <strong>运行时</strong>
               <p>
-                CPU {accelerationStatus.cpuRuntimeInstalled ? "已安装" : "按模型安装时准备"} / CUDA{" "}
-                {accelerationStatus.cudaRuntimeInstalled ? "已安装" : "按需下载"}
+                CPU {accelerationStatus.cpuRuntimeInstalled ? "已安装" : "随模型准备"} / CUDA{" "}
+                {accelerationStatus.cudaRuntimeInstalled ? "已安装" : "需手动准备"}
               </p>
             </div>
           )}
@@ -243,7 +330,7 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
         </button>
         <button className="secondary-button" type="button" onClick={() => void handleSaveGpuReport()}>
           <FileDown size={17} />
-          保存 GPU 诊断报告
+          保存诊断报告
         </button>
         {accelerationTestResult && <p className="diagnostic-result">{accelerationTestResult}</p>}
       </section>

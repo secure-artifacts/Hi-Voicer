@@ -1,4 +1,4 @@
-import type { AppStatus, DiagnosticItem, HotwordRule, TranscriptTask, UserSettings } from "../types";
+import type { AppStatus, DiagnosticItem, HotwordRule, TermCategory, TranscriptTask, UserSettings } from "../types";
 
 export const initialStatus: AppStatus = {
   readiness: "model-required",
@@ -21,9 +21,17 @@ export const initialTasks: TranscriptTask[] = [
   },
 ];
 
+export const initialTermCategories: TermCategory[] = [
+  { id: "people", name: "人名", order: 0 },
+  { id: "organizations", name: "机构", order: 1 },
+  { id: "projects", name: "项目", order: 2 },
+  { id: "technical", name: "技术词", order: 3 },
+  { id: "replacements", name: "常用替换", order: 4 },
+];
+
 export const initialHotwords: HotwordRule[] = [
-  { id: "rule-1", source: "陶瑞", target: "Tauri", enabled: true },
-  { id: "rule-2", source: "阿萨尔", target: "ASR", enabled: true },
+  { id: "rule-1", source: "陶瑞", target: "Tauri", enabled: true, categoryId: "technical", hitCount: 0 },
+  { id: "rule-2", source: "阿萨尔", target: "ASR", enabled: true, categoryId: "technical", hitCount: 0 },
 ];
 
 export const initialSettings: UserSettings = {
@@ -33,8 +41,10 @@ export const initialSettings: UserSettings = {
   outputDir: "",
   pasteMode: "clipboard",
   recordingMode: "hold",
+  recordingSource: "microphone",
   accelerationMode: "cpu",
   hotwords: initialHotwords,
+  termCategories: initialTermCategories,
   theme: "light",
   saveRecordings: false,
   launchAtStartup: false,

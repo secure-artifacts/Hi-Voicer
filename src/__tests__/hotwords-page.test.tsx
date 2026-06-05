@@ -1,5 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { initialTermCategories } from "../data/mockState";
 import { HotwordsPage } from "../pages/HotwordsPage";
 
 vi.mock("../lib/api", () => ({
@@ -58,11 +59,82 @@ describe("HotwordsPage", () => {
     ]);
   });
 
+  it("imports legacy rule arrays without treating them as categories", async () => {
+    const onCategoriesChange = vi.fn();
+    const onRulesChange = vi.fn();
+    render(<HotwordsPage rules={[]} onRulesChange={onRulesChange} onCategoriesChange={onCategoriesChange} />);
+
+    const file = new File([JSON.stringify([{ from: "legacy_term", replacement: "Legacy Term", enabled: false }])], "legacy.json", {
+      type: "application/json",
+    });
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByDisplayValue("legacy_term")).toBeTruthy();
+    expect(await screen.findByDisplayValue("Legacy Term")).toBeTruthy();
+    expect(onCategoriesChange).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ id: initialTermCategories[0].id })]),
+    );
+    expect(onRulesChange).toHaveBeenCalledWith([
+      expect.objectContaining({
+        source: "legacy_term",
+        target: "Legacy Term",
+        categoryId: initialTermCategories[0].id,
+        enabled: false,
+      }),
+    ]);
+  });
+
   it("exports current rules as json", async () => {
     render(<HotwordsPage rules={[{ id: "rule-1", source: "tauri_term", target: "Tauri", enabled: true }]} />);
 
     fireEvent.click(screen.getAllByRole("button")[1]);
 
     expect(await screen.findByText(/C:\\exports\\hi-voicer-hotwords.json/)).toBeTruthy();
+  });
+
+  it("imports editable categories with rules", async () => {
+    const onCategoriesChange = vi.fn();
+    const onRulesChange = vi.fn();
+    render(<HotwordsPage rules={[]} onRulesChange={onRulesChange} onCategoriesChange={onCategoriesChange} />);
+
+    const file = new File(
+      [
+        JSON.stringify({
+          categories: [{ id: "clients", name: "客户", order: 0 }],
+          rules: [{ source: "acme", target: "ACME", categoryId: "clients", enabled: true }],
+        }),
+      ],
+      "terms.json",
+      { type: "application/json" },
+    );
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect((await screen.findAllByText("客户")).length).toBeGreaterThan(0);
+    expect(await screen.findByDisplayValue("acme")).toBeTruthy();
+    expect(onCategoriesChange).toHaveBeenCalledWith([expect.objectContaining({ id: "clients", name: "客户" })]);
+    expect(onRulesChange).toHaveBeenCalledWith([expect.objectContaining({ categoryId: "clients", target: "ACME" })]);
+  });
+
+  it("moves imported rules with missing categories into the first available category", async () => {
+    const onRulesChange = vi.fn();
+    render(<HotwordsPage rules={[]} onRulesChange={onRulesChange} />);
+
+    const file = new File(
+      [
+        JSON.stringify({
+          categories: [{ id: "valid", name: "Valid", order: 0 }],
+          rules: [{ source: "orphan", target: "Orphan", categoryId: "missing", enabled: true }],
+        }),
+      ],
+      "terms.json",
+      { type: "application/json" },
+    );
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByDisplayValue("orphan")).toBeTruthy();
+    expect(onRulesChange).toHaveBeenCalledWith([expect.objectContaining({ categoryId: "valid", target: "Orphan" })]);
   });
 });

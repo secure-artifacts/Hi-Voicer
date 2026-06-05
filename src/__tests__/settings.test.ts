@@ -41,12 +41,65 @@ describe("settings fallback storage", () => {
     });
   });
 
+  it("normalizes invalid saved enum and boolean settings", async () => {
+    window.localStorage.setItem(
+      "hi-voicer-settings",
+      JSON.stringify({
+        pasteMode: "bad",
+        recordingMode: "invalid",
+        recordingSource: "speakers",
+        accelerationMode: "gpu",
+        theme: "blue",
+        saveRecordings: "yes",
+        launchAtStartup: 1,
+        showMiniWindow: "true",
+      }),
+    );
+
+    await expect(loadSettings(initialSettings)).resolves.toMatchObject({
+      pasteMode: initialSettings.pasteMode,
+      recordingMode: initialSettings.recordingMode,
+      recordingSource: initialSettings.recordingSource,
+      accelerationMode: initialSettings.accelerationMode,
+      theme: initialSettings.theme,
+      saveRecordings: initialSettings.saveRecordings,
+      launchAtStartup: initialSettings.launchAtStartup,
+      showMiniWindow: initialSettings.showMiniWindow,
+    });
+  });
+
+  it("returns defaults when fallback settings json is corrupted", async () => {
+    window.localStorage.setItem("hi-voicer-settings", "{bad json");
+
+    await expect(loadSettings(initialSettings)).resolves.toEqual(initialSettings);
+  });
+
   it("saves and loads settings from localStorage outside Tauri", async () => {
     const next = { ...initialSettings, shortcut: "Mouse4", recordingMode: "toggle" as const, theme: "dark" as const };
 
     await saveSettings(next);
 
     await expect(loadSettings(initialSettings)).resolves.toMatchObject(next);
+  });
+
+  it("normalizes settings before saving to fallback storage", async () => {
+    const badSettings = {
+      ...initialSettings,
+      recordingMode: "bad",
+      recordingSource: "bad",
+      saveRecordings: "true",
+    } as unknown as typeof initialSettings;
+
+    await expect(saveSettings(badSettings)).resolves.toMatchObject({
+      recordingMode: initialSettings.recordingMode,
+      recordingSource: initialSettings.recordingSource,
+      saveRecordings: initialSettings.saveRecordings,
+    });
+    expect(JSON.parse(window.localStorage.getItem("hi-voicer-settings") ?? "{}")).toMatchObject({
+      recordingMode: initialSettings.recordingMode,
+      recordingSource: initialSettings.recordingSource,
+      saveRecordings: initialSettings.saveRecordings,
+    });
   });
 
   it("reports an empty model directory as not ready", async () => {
