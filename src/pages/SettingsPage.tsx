@@ -1,4 +1,4 @@
-import { Check, Cpu, Download, FolderOpen, Keyboard, Moon, Sun, Zap } from "lucide-react";
+import { Check, Cpu, Download, FolderOpen, Keyboard, Mic, MonitorSpeaker, Moon, Sun, Volume2, Zap } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { SettingRow } from "../components/SettingRow";
@@ -162,6 +162,35 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
           <Keyboard size={18} />
           {isCapturingShortcut ? "请按键..." : settings.shortcut}
         </button>
+      </SettingRow>
+
+      <SettingRow label="录制来源" description="麦克风适合语音输入；系统声音适合会议、网课和播放器；双来源会优先保存双轨。">
+        <div className="segmented-control segmented-control--three" role="group" aria-label="录制来源">
+          <button
+            className={settings.recordingSource === "microphone" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            onClick={() => onSettingsChange({ ...settings, recordingSource: "microphone" })}
+          >
+            <Mic size={16} />
+            麦克风
+          </button>
+          <button
+            className={settings.recordingSource === "system" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            onClick={() => onSettingsChange({ ...settings, recordingSource: "system" })}
+          >
+            <Volume2 size={16} />
+            系统声
+          </button>
+          <button
+            className={settings.recordingSource === "microphoneAndSystem" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            onClick={() => onSettingsChange({ ...settings, recordingSource: "microphoneAndSystem" })}
+          >
+            <MonitorSpeaker size={16} />
+            双来源
+          </button>
+        </div>
       </SettingRow>
 
       <SettingRow label="识别加速" description="0.2.0 正式版使用 CPU 稳定路线；GPU 后续作为实验后端单独验证。">

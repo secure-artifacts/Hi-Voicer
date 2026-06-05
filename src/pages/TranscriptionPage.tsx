@@ -1,5 +1,5 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Clock, Download, FileAudio, FolderOpen, Gauge, Trash2, Upload } from "lucide-react";
+import { Clock, Download, FileAudio, FolderOpen, Gauge, Subtitles, Trash2, Upload } from "lucide-react";
 import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useState } from "react";
 import {
@@ -20,6 +20,7 @@ interface TranscriptionPageProps {
   tasks: TranscriptTask[];
   onTasksChange: Dispatch<SetStateAction<TranscriptTask[]>>;
   settings: UserSettings;
+  onOpenSubtitleEditor?: (task: TranscriptTask) => void;
 }
 
 function fileNameFromPath(path: string) {
@@ -80,6 +81,7 @@ export function TranscriptionPage({
   tasks,
   onTasksChange,
   settings,
+  onOpenSubtitleEditor,
 }: TranscriptionPageProps) {
   const [isSelecting, setIsSelecting] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
@@ -127,6 +129,10 @@ export function TranscriptionPage({
         outputPath: result.outputPath,
         outputPaths: result.outputPaths,
         outputFiles: result.outputFiles,
+        text: result.text,
+        segments: result.segments,
+        timelineKind: result.timelineKind,
+        sourceAudioPath: result.sourceAudioPath || task.filePath,
         finishedAt,
         elapsedMs: Date.parse(finishedAt) - Date.parse(startedAt),
       });
@@ -409,6 +415,12 @@ export function TranscriptionPage({
                   </div>
                   {task.outputFiles && task.outputFiles.length > 0 && (
                     <div className="task-export-list">
+                      {task.segments && task.segments.length > 0 && (
+                        <button className="secondary-button" type="button" onClick={() => onOpenSubtitleEditor?.(task)}>
+                          <Subtitles size={15} />
+                          编辑字幕
+                        </button>
+                      )}
                       {task.outputFiles.map((file) => (
                         <button
                           className="secondary-button"

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Activity, FileAudio, Home, ListChecks, Settings, Wrench } from "lucide-react";
+import { Activity, FileAudio, Home, ListChecks, Settings, SlidersHorizontal, Subtitles, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { AppPage, AppStatus } from "../types";
 import { StatusBadge } from "./StatusBadge";
@@ -7,7 +7,9 @@ import { StatusBadge } from "./StatusBadge";
 const pages: Array<{ id: AppPage; label: string; icon: LucideIcon }> = [
   { id: "home", label: "首页", icon: Home },
   { id: "transcription", label: "转录", icon: FileAudio },
-  { id: "hotwords", label: "热词", icon: ListChecks },
+  { id: "subtitles", label: "字幕", icon: Subtitles },
+  { id: "hotwords", label: "术语", icon: ListChecks },
+  { id: "audio-processing", label: "音频", icon: SlidersHorizontal },
   { id: "settings", label: "设置", icon: Settings },
   { id: "diagnostics", label: "诊断", icon: Wrench },
 ];

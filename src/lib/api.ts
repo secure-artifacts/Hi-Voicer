@@ -5,9 +5,12 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import type {
   AccelerationStatus,
   AccelerationSmokeTestResult,
+  AudioProcessingOptions,
+  AudioProcessingResult,
   ModelInstallProgress,
   ModelPreset,
   ModelValidationResult,
+  NativeAudioDiagnostics,
   TranscriptionPerformanceMode,
   TranscriptionProgress,
   TranscribeFileResult,
@@ -15,24 +18,89 @@ import type {
 } from "../types";
 
 const STORAGE_KEY = "hi-voicer-settings";
+const pasteModes = ["direct", "clipboard"] as const;
+const recordingModes = ["hold", "toggle", "audioOnly"] as const;
+const recordingSources = ["microphone", "system", "microphoneAndSystem"] as const;
+const accelerationModes = ["cpu", "cuda"] as const;
+const themeModes = ["light", "dark"] as const;
+
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === "string" && allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value : fallback;
+}
+
+function booleanValue(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function arrayValue<T>(value: unknown, fallback: T[]): T[] {
+  return Array.isArray(value) ? (value as T[]) : fallback;
+}
+
+function normalizeSettings(defaultSettings: UserSettings, value: unknown): UserSettings {
+  const settings = value && typeof value === "object" ? (value as Partial<UserSettings>) : {};
+  return {
+    ...defaultSettings,
+    ...settings,
+    shortcut: stringValue(settings.shortcut, defaultSettings.shortcut),
+    selectedModelId: stringValue(settings.selectedModelId, defaultSettings.selectedModelId),
+    modelDir: stringValue(settings.modelDir, defaultSettings.modelDir),
+    outputDir: stringValue(settings.outputDir, defaultSettings.outputDir),
+    pasteMode: enumValue(settings.pasteMode, pasteModes, defaultSettings.pasteMode),
+    recordingMode: enumValue(settings.recordingMode, recordingModes, defaultSettings.recordingMode),
+    recordingSource: enumValue(settings.recordingSource, recordingSources, defaultSettings.recordingSource),
+    accelerationMode: enumValue(settings.accelerationMode, accelerationModes, defaultSettings.accelerationMode),
+    hotwords: arrayValue(settings.hotwords, defaultSettings.hotwords),
+    termCategories: arrayValue(settings.termCategories, defaultSettings.termCategories),
+    theme: enumValue(settings.theme, themeModes, defaultSettings.theme),
+    saveRecordings: booleanValue(settings.saveRecordings, defaultSettings.saveRecordings),
+    launchAtStartup: booleanValue(settings.launchAtStartup, defaultSettings.launchAtStartup),
+    showMiniWindow: booleanValue(settings.showMiniWindow, defaultSettings.showMiniWindow),
+  };
+}
+
+function saveFallbackSettings(settings: UserSettings): UserSettings {
+  return {
+    ...settings,
+    pasteMode: "direct",
+    recordingMode: "hold",
+    recordingSource: "microphone",
+    accelerationMode: "cpu",
+    theme: "light",
+    saveRecordings: false,
+    launchAtStartup: false,
+    showMiniWindow: true,
+  };
+}
 
 export async function loadSettings(defaultSettings: UserSettings): Promise<UserSettings> {
   try {
     const settings = await invoke<Partial<UserSettings>>("load_settings");
-    return { ...defaultSettings, ...settings };
+    return normalizeSettings(defaultSettings, settings);
   } catch {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    return raw ? { ...defaultSettings, ...JSON.parse(raw) } : defaultSettings;
+    if (!raw) {
+      return defaultSettings;
+    }
+    try {
+      return normalizeSettings(defaultSettings, JSON.parse(raw));
+    } catch {
+      return defaultSettings;
+    }
   }
 }
 
 export async function saveSettings(settings: UserSettings): Promise<UserSettings> {
+  const normalizedSettings = normalizeSettings(saveFallbackSettings(settings), settings);
   try {
-    const saved = await invoke<Partial<UserSettings>>("save_settings", { settings });
-    return { ...settings, ...saved };
+    const saved = await invoke<Partial<UserSettings>>("save_settings", { settings: normalizedSettings });
+    return normalizeSettings(normalizedSettings, saved);
   } catch {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-    return settings;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(normalizedSettings));
+    return normalizedSettings;
   }
 }
 
@@ -62,6 +130,22 @@ export async function selectAudioFiles(): Promise<string[]> {
     const typed = window.prompt("请输入音频文件路径");
     return typed?.trim() ? [typed.trim()] : [];
   }
+}
+
+export async function listAudioFilesInDirectory(directoryPath: string): Promise<string[]> {
+  return await invoke<string[]>("list_audio_files_in_directory", {
+    request: {
+      directoryPath,
+    },
+  });
+}
+
+export async function prepareAudioPreview(audioPath: string): Promise<string> {
+  return await invoke<string>("prepare_audio_preview", {
+    request: {
+      audioPath,
+    },
+  });
 }
 
 export async function openExternalUrl(url: string): Promise<void> {
@@ -148,6 +232,14 @@ export async function listenRecordingState(handler: (isRecording: boolean) => vo
 export async function listenRecordingLevel(handler: (level: number) => void): Promise<() => void> {
   try {
     return await listen<{ level: number }>("recording-level", (event) => handler(event.payload.level));
+  } catch {
+    return () => {};
+  }
+}
+
+export async function listenRecordingError(handler: (message: string) => void): Promise<() => void> {
+  try {
+    return await listen<{ message: string }>("recording-error", (event) => handler(event.payload.message));
   } catch {
     return () => {};
   }
@@ -261,6 +353,25 @@ export async function runAccelerationSmokeTest(settings: UserSettings): Promise<
   });
 }
 
+export async function getNativeAudioDiagnostics(): Promise<NativeAudioDiagnostics> {
+  try {
+    return await invoke<NativeAudioDiagnostics>("get_native_audio_diagnostics");
+  } catch {
+    return {
+      microphoneAvailable: false,
+      microphoneName: null,
+      microphoneDetail: "浏览器预览模式无法检测本机麦克风设备。",
+      systemAudioAvailable: false,
+      systemAudioName: null,
+      systemAudioDetail: "浏览器预览模式无法检测 Windows 系统声音 loopback。",
+      ffmpegInstalled: false,
+      ffmpegPath: null,
+      ffmpegDetail: "浏览器预览模式无法检测本地 ffmpeg 运行时。",
+      message: "请在桌面应用中运行本机音频环境诊断。",
+    };
+  }
+}
+
 export async function transcribeFile(
   audioPath: string,
   settings: UserSettings,
@@ -280,6 +391,37 @@ export async function transcribeFile(
       performanceMode: options.performanceMode ?? "balanced",
       accelerationMode: settings.accelerationMode ?? "cpu",
       hotwords: settings.hotwords ?? [],
+    },
+  });
+}
+
+export async function exportAudioSegment(
+  sourceAudioPath: string,
+  startSeconds: number,
+  endSeconds: number,
+  options: { destinationDir?: string; suggestedName?: string } = {},
+): Promise<string> {
+  return await invoke<string>("export_audio_segment", {
+    request: {
+      sourceAudioPath,
+      startSeconds,
+      endSeconds,
+      destinationDir: options.destinationDir,
+      suggestedName: options.suggestedName,
+    },
+  });
+}
+
+export async function processAudioFile(
+  audioPath: string,
+  options: AudioProcessingOptions,
+  output: { destinationDir?: string } = {},
+): Promise<AudioProcessingResult> {
+  return await invoke<AudioProcessingResult>("process_audio_file", {
+    request: {
+      audioPath,
+      options,
+      destinationDir: output.destinationDir,
     },
   });
 }

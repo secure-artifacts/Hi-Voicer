@@ -1,7 +1,14 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { initialDiagnostics, initialSettings } from "../data/mockState";
-import { prepareAccelerationRuntime, runAccelerationSmokeTest, saveTextFile, selectAudioFiles, transcribeFile } from "../lib/api";
+import {
+  getNativeAudioDiagnostics,
+  prepareAccelerationRuntime,
+  runAccelerationSmokeTest,
+  saveTextFile,
+  selectAudioFiles,
+  transcribeFile,
+} from "../lib/api";
 import { DiagnosticsPage } from "../pages/DiagnosticsPage";
 
 vi.mock("../lib/api", () => ({
@@ -15,6 +22,22 @@ vi.mock("../lib/api", () => ({
       cpuRuntimeInstalled: false,
       cudaRuntimeInstalled: false,
       message: "CPU selected",
+    }),
+  ),
+  getNativeAudioDiagnostics: vi.fn(() =>
+    Promise.resolve({
+      microphoneAvailable: true,
+      microphoneName: "USB Microphone",
+      microphoneDetail: "48000 Hz / 1 channel(s) / F32",
+      systemAudioAvailable: true,
+      systemAudioName: "Speakers",
+      systemAudioDetail:
+        "48000 Hz / 2 channel(s) / F32. Output device detected; system-audio recording still depends on WASAPI loopback support and will be verified when recording starts.",
+      ffmpegInstalled: false,
+      ffmpegPath: null,
+      ffmpegDetail:
+        "ffmpeg.exe was not found. Place ffmpeg.exe under one of these folders, or add ffmpeg to PATH: C:\\Users\\tester\\AppData\\Local\\com.local.hivoicer\\engines\\ffmpeg | system PATH. Hi-Voicer will not download ffmpeg automatically.",
+      message: "Native audio environment needs attention before all recording and processing modes are available.",
     }),
   ),
   prepareAccelerationRuntime: vi.fn(() =>
@@ -45,10 +68,14 @@ vi.mock("../lib/api", () => ({
 }));
 
 describe("DiagnosticsPage", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("runs a model smoke test without saving transcript output", async () => {
     render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={initialSettings} />);
 
-    fireEvent.click(screen.getAllByRole("button")[0]);
+    fireEvent.click(screen.getByRole("button", { name: /选择音频测试/ }));
 
     await waitFor(() => {
       expect(transcribeFile).toHaveBeenCalledWith("C:\\audio\\sample.wav", initialSettings, { saveOutput: false });
@@ -83,6 +110,22 @@ describe("DiagnosticsPage", () => {
     expect(screen.getByText(/RTX 4070/)).toBeTruthy();
   });
 
+  it("shows native audio diagnostics and refreshes them", async () => {
+    render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={initialSettings} />);
+
+    expect(await screen.findByText(/USB Microphone/)).toBeTruthy();
+    expect(screen.getByText(/Speakers/)).toBeTruthy();
+    expect(screen.getByText(/WASAPI loopback/)).toBeTruthy();
+    expect(screen.getByText(/ffmpeg.exe was not found/)).toBeTruthy();
+    expect(screen.getByText(/system PATH/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /刷新音频环境诊断/ }));
+
+    await waitFor(() => {
+      expect(getNativeAudioDiagnostics).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("runs acceleration smoke test with the current settings", async () => {
     const settings = { ...initialSettings, modelDir: "C:\\models\\demo", accelerationMode: "cuda" as const };
     render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={settings} />);
@@ -96,22 +139,23 @@ describe("DiagnosticsPage", () => {
     expect(screen.getByText(/实际路径：CUDA/)).toBeTruthy();
   });
 
-  it("saves a GPU diagnostic report with acceleration details", async () => {
+  it("saves a diagnostic report with acceleration and native audio details", async () => {
     const settings = { ...initialSettings, modelDir: "C:\\models\\demo", accelerationMode: "cuda" as const };
     render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={settings} />);
 
     fireEvent.click(screen.getByRole("button", { name: /运行加速 smoke test/ }));
     await screen.findByText(/CUDA smoke ok/);
 
-    fireEvent.click(screen.getByRole("button", { name: /保存 GPU 诊断报告/ }));
+    fireEvent.click(screen.getByRole("button", { name: /保存诊断报告/ }));
 
     await waitFor(() => {
       expect(saveTextFile).toHaveBeenCalledWith(
-        expect.stringMatching(/^hi-voicer-gpu-diagnostics-.+\.txt$/),
-        expect.stringContaining("Hi-Voicer GPU 诊断报告"),
+        expect.stringMatching(/^hi-voicer-diagnostics-.+\.txt$/),
+        expect.stringContaining("Hi-Voicer 诊断报告"),
       );
     });
     expect(saveTextFile).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("实际路径: cuda"));
-    expect(await screen.findByText(/GPU 诊断报告已保存/)).toBeTruthy();
+    expect(saveTextFile).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("[本机音频环境]"));
+    expect(saveTextFile).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("麦克风设备: USB Microphone"));
   });
 });

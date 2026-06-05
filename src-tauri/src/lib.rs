@@ -6,9 +6,10 @@ use config::{HotwordRule, UserSettings};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::DefaultHasher, VecDeque},
     fs,
     fs::File,
+    hash::{Hash, Hasher},
     io::BufWriter,
     io::{self, Read, Write},
     net::TcpStream,
@@ -30,6 +31,7 @@ const SHERPA_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const DAVINCI_TIMECODE_FPS: u64 = 25;
 const LONG_AUDIO_CHUNK_SECONDS: u32 = 60;
 const LONG_AUDIO_THRESHOLD_SECONDS: f64 = 300.0;
+const MIN_RECORDING_SECONDS: f64 = 0.05;
 const SHERPA_RUNTIME_TAG: &str = "v1.13.2";
 const SHERPA_CPU_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts";
 const SHERPA_CPU_ARCHIVE_NAME: &str =
@@ -50,9 +52,21 @@ struct RuntimeState {
 }
 
 struct RecordingSession {
+    source: String,
+    tracks: Vec<RecordingTrack>,
+    path: PathBuf,
+}
+
+struct RecordingTrack {
     stream: cpal::Stream,
     writer: Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>,
     path: PathBuf,
+}
+
+struct StoppedRecording {
+    source: String,
+    primary_path: PathBuf,
+    output_paths: Vec<PathBuf>,
 }
 
 struct SherpaDaemon {
@@ -111,7 +125,7 @@ fn paste_text_to_active_window(text: &str) -> Result<(), String> {
 
     let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
-        return Err("自动粘贴失败。".to_string());
+        return Err("Automatic paste failed.".to_string());
     }
 
     Ok(())
@@ -119,7 +133,7 @@ fn paste_text_to_active_window(text: &str) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn paste_text_to_active_window(_text: &str) -> Result<(), String> {
-    Err("自动上屏当前只支持 Windows。".to_string())
+    Err("Automatic paste is only supported on Windows.".to_string())
 }
 
 fn normalize_shortcut(shortcut: &str) -> String {
@@ -219,7 +233,13 @@ fn apply_hotwords(text: &str, hotwords: &[HotwordRule]) -> String {
         .iter()
         .filter(|rule| rule.enabled && !rule.source.trim().is_empty())
         .collect::<Vec<_>>();
-    rules.sort_by(|left, right| right.source.chars().count().cmp(&left.source.chars().count()));
+    rules.sort_by(|left, right| {
+        right
+            .source
+            .chars()
+            .count()
+            .cmp(&left.source.chars().count())
+    });
 
     let mut next = text.to_string();
     for rule in rules {
@@ -317,6 +337,21 @@ struct AccelerationSmokeTestResult {
     message: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAudioDiagnostics {
+    microphone_available: bool,
+    microphone_name: Option<String>,
+    microphone_detail: Option<String>,
+    system_audio_available: bool,
+    system_audio_name: Option<String>,
+    system_audio_detail: Option<String>,
+    ffmpeg_installed: bool,
+    ffmpeg_path: Option<String>,
+    ffmpeg_detail: Option<String>,
+    message: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TranscribeFileResult {
@@ -324,6 +359,9 @@ struct TranscribeFileResult {
     output_path: String,
     output_paths: Vec<String>,
     output_files: Vec<TranscriptionOutputFile>,
+    segments: Vec<TranscriptSegment>,
+    timeline_kind: String,
+    source_audio_path: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -368,6 +406,54 @@ struct SaveExistingFileRequest {
     destination_dir: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportAudioSegmentRequest {
+    source_audio_path: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    destination_dir: Option<String>,
+    suggested_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessAudioFileRequest {
+    audio_path: String,
+    options: AudioProcessingOptions,
+    destination_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAudioFilesInDirectoryRequest {
+    directory_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioPreviewRequest {
+    audio_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioProcessingOptions {
+    preset: String,
+    normalize: bool,
+    trim_silence: bool,
+    hum_reduction: bool,
+    voice_filter: bool,
+    noise_reduction: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioProcessingResult {
+    output_path: String,
+    message: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RecordingStateEvent {
@@ -379,6 +465,12 @@ struct RecordingStateEvent {
 #[serde(rename_all = "camelCase")]
 struct RecordingLevelEvent {
     level: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecordingErrorEvent {
+    message: String,
 }
 
 struct AudioLevelEmitter {
@@ -505,15 +597,16 @@ fn bind_installed_model_if_available(
 
 fn read_settings(app: &AppHandle) -> Result<UserSettings, String> {
     let path = settings_path(app)?;
-    let loaded_settings = if path.exists() {
+    let raw_settings = if path.exists() {
         let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
         serde_json::from_str(&raw).map_err(|error| error.to_string())?
     } else {
         UserSettings::default()
     };
+    let loaded_settings = raw_settings.clone().normalized();
 
     let settings = bind_installed_model_if_available(app, loaded_settings.clone())?;
-    if settings != loaded_settings {
+    if settings != raw_settings {
         write_settings(app, &settings)?;
     }
 
@@ -943,25 +1036,116 @@ fn find_file_recursive(root: &Path, file_name: &str) -> Result<Option<PathBuf>, 
     Ok(None)
 }
 
-fn install_ffmpeg_runtime(app: &AppHandle) -> Result<PathBuf, String> {
-    const FFMPEG_URL: &str = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+fn ffmpeg_runtime_search_roots(
+    data_dir: &Path,
+    resource_dir: Option<&Path>,
+    executable_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = vec![data_dir.join("engines").join("ffmpeg")];
+    if let Some(resource_dir) = resource_dir {
+        roots.push(resource_dir.join("engines").join("ffmpeg"));
+        roots.push(resource_dir.join("ffmpeg"));
+    }
+    if let Some(executable_dir) = executable_dir {
+        roots.push(executable_dir.join("engines").join("ffmpeg"));
+        roots.push(executable_dir.join("ffmpeg"));
+    }
+    roots
+}
 
+fn ffmpeg_runtime_search_roots_for_app(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| error.to_string())?;
-    let ffmpeg_root = data_dir.join("engines").join("ffmpeg");
-    if let Some(executable) = find_file_recursive(&ffmpeg_root, "ffmpeg.exe")? {
+    let resource_dir = app.path().resource_dir().ok();
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+
+    Ok(ffmpeg_runtime_search_roots(
+        &data_dir,
+        resource_dir.as_deref(),
+        executable_dir.as_deref(),
+    ))
+}
+
+fn find_ffmpeg_in_roots(roots: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    for root in roots {
+        if let Some(executable) = find_file_recursive(root, "ffmpeg.exe")? {
+            return Ok(Some(executable));
+        }
+    }
+    Ok(None)
+}
+
+fn system_ffmpeg_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("where");
+        command.arg("ffmpeg");
+        command
+    };
+
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("which");
+        command.arg("ffmpeg");
+        command
+    };
+
+    let output =
+        run_command_with_timeout(&mut command, Duration::from_secs(5), "ffmpeg lookup").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
+fn ffmpeg_missing_detail(roots: &[PathBuf]) -> String {
+    let mut locations = roots
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    locations.push("system PATH".to_string());
+
+    format!(
+        "ffmpeg.exe was not found. Place ffmpeg.exe under one of these folders, or add ffmpeg to PATH: {}. Hi-Voicer will not download ffmpeg automatically.",
+        locations.join(" | ")
+    )
+}
+
+fn ffmpeg_missing_message() -> String {
+    "ffmpeg is required for offline audio transcoding, subtitle segment export, recording mixdown, and audio processing. Install ffmpeg locally or place ffmpeg.exe under the app data engines\\ffmpeg folder or next to the application in an engines\\ffmpeg folder; Hi-Voicer will not download it automatically.".to_string()
+}
+
+fn resolve_ffmpeg_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    let roots = ffmpeg_runtime_search_roots_for_app(app)?;
+    if let Some(executable) = find_ffmpeg_in_roots(&roots)? {
         return Ok(executable);
     }
+    system_ffmpeg_path().ok_or_else(|| {
+        format!(
+            "{} {}",
+            ffmpeg_missing_message(),
+            ffmpeg_missing_detail(&roots)
+        )
+    })
+}
 
-    fs::create_dir_all(&ffmpeg_root).map_err(|error| error.to_string())?;
-    let archive_path = ffmpeg_root.join("ffmpeg-master-latest-win64-gpl.zip");
-    download_file(FFMPEG_URL, &archive_path)?;
-    extract_zip(&archive_path, &ffmpeg_root)?;
+fn installed_ffmpeg_runtime(app: &AppHandle) -> Result<Option<PathBuf>, String> {
+    let roots = ffmpeg_runtime_search_roots_for_app(app)?;
 
-    find_file_recursive(&ffmpeg_root, "ffmpeg.exe")?
-        .ok_or_else(|| "ffmpeg 下载完成，但没有找到 ffmpeg.exe。".to_string())
+    if let Some(executable) = find_ffmpeg_in_roots(&roots)? {
+        return Ok(Some(executable));
+    }
+
+    Ok(system_ffmpeg_path())
 }
 
 fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<String, String> {
@@ -973,7 +1157,7 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
     emit_model_install_progress(
         &app,
         &model.id,
-        "正在准备 Sherpa-ONNX 运行时...".to_string(),
+        "Preparing Sherpa-ONNX runtime...".to_string(),
         0,
         total_steps,
     );
@@ -981,7 +1165,7 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
     emit_model_install_progress(
         &app,
         &model.id,
-        "Sherpa-ONNX 运行时已就绪。".to_string(),
+        "Sherpa-ONNX runtime is ready.".to_string(),
         1,
         total_steps,
     );
@@ -997,7 +1181,7 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
             &app,
             &model.id,
             format!(
-                "正在下载模型文件 {}/{}：{}",
+                "Downloading model file {}/{}: {}",
                 index + 1,
                 model.model_files.len(),
                 model_file.path
@@ -1012,7 +1196,7 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
     emit_model_install_progress(
         &app,
         &model.id,
-        "正在写入本地模型配置...".to_string(),
+        "Writing local model config...".to_string(),
         total_steps - 1,
         total_steps,
     );
@@ -1043,7 +1227,7 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
     emit_model_install_progress(
         &app,
         &model.id,
-        format!("{} 已安装完成。", model.name),
+        format!("{} has been installed.", model.name),
         total_steps,
         total_steps,
     );
@@ -1073,7 +1257,11 @@ fn install_zip_model(app: AppHandle, model: ModelInstallRequest) -> Result<Strin
         .send()
         .map_err(|error| error.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("下载 {} 失败：{}", model.name, response.status()));
+        return Err(format!(
+            "Failed to download {}: {}",
+            model.name,
+            response.status()
+        ));
     }
 
     let mut archive_file = fs::File::create(&archive_path).map_err(|error| error.to_string())?;
@@ -1111,7 +1299,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         return ModelValidationResult {
             valid: false,
             model_name: String::new(),
-            message: "尚未配置离线模型。".to_string(),
+            message: "No offline model has been configured.".to_string(),
         };
     }
 
@@ -1120,7 +1308,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         return ModelValidationResult {
             valid: false,
             model_name: String::new(),
-            message: "模型目录不存在，请重新下载或重新选择模型目录。".to_string(),
+            message: "The model directory does not exist. Download it again or select another model directory.".to_string(),
         };
     }
 
@@ -1129,7 +1317,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         return ModelValidationResult {
             valid: false,
             model_name: String::new(),
-            message: "模型目录里没有 engine.json，请在设置里用“一键下载并配置”。".to_string(),
+            message: "engine.json was not found in the model directory. Use one-click download in Settings.".to_string(),
         };
     }
 
@@ -1139,7 +1327,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
             return ModelValidationResult {
                 valid: false,
                 model_name: String::new(),
-                message: format!("读取模型配置失败：{error}"),
+                message: format!("Failed to read model config: {error}"),
             }
         }
     };
@@ -1149,7 +1337,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
             return ModelValidationResult {
                 valid: false,
                 model_name: String::new(),
-                message: format!("模型配置格式不正确：{error}"),
+                message: format!("Invalid model config format: {error}"),
             }
         }
     };
@@ -1158,7 +1346,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         return ModelValidationResult {
             valid: false,
             model_name: engine.model_name,
-            message: format!("暂不支持这个引擎：{}", engine.engine),
+            message: format!("Unsupported engine: {}", engine.engine),
         };
     }
 
@@ -1166,7 +1354,9 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         return ModelValidationResult {
             valid: false,
             model_name: engine.model_name,
-            message: "Sherpa-ONNX 程序不存在，请重新下载并配置模型。".to_string(),
+            message:
+                "The Sherpa-ONNX executable does not exist. Download and configure the model again."
+                    .to_string(),
         };
     }
 
@@ -1177,7 +1367,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
                 return ModelValidationResult {
                     valid: false,
                     model_name: engine.model_name.clone(),
-                    message: format!("模型配置里的文件路径不安全：{error}"),
+                    message: format!("Unsafe file path in model config: {error}"),
                 }
             }
         };
@@ -1186,7 +1376,9 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
             return ModelValidationResult {
                 valid: false,
                 model_name: engine.model_name.clone(),
-                message: format!("模型文件缺失：{required_file}。请在设置里重新下载并配置模型。"),
+                message: format!(
+                    "Missing model file: {required_file}. Download and configure the model again."
+                ),
             };
         }
     }
@@ -1194,7 +1386,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
     ModelValidationResult {
         valid: true,
         model_name: engine.model_name,
-        message: "模型已就绪。".to_string(),
+        message: "Model is ready.".to_string(),
     }
 }
 
@@ -1222,7 +1414,7 @@ fn split_command_args(args: &str) -> Result<Vec<String>, String> {
     }
 
     if in_quotes {
-        return Err("Sherpa 参数里的引号没有闭合。".to_string());
+        return Err("Sherpa arguments contain an unclosed quote.".to_string());
     }
 
     if !current.is_empty() {
@@ -1416,7 +1608,7 @@ fn extract_transcription_text(output: &str) -> String {
 }
 
 fn media_to_sherpa_wav(app: &AppHandle, input_path: &Path) -> Result<PathBuf, String> {
-    let ffmpeg = install_ffmpeg_runtime(app)?;
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
     let data_dir = app
         .path()
         .app_local_data_dir()
@@ -1448,7 +1640,7 @@ fn media_to_sherpa_wav(app: &AppHandle, input_path: &Path) -> Result<PathBuf, St
     let output = command.output().map_err(|error| error.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg 转码失败：{}", stderr.trim()));
+        return Err(format!("ffmpeg transcode failed: {}", stderr.trim()));
     }
 
     Ok(output_path)
@@ -1457,14 +1649,14 @@ fn media_to_sherpa_wav(app: &AppHandle, input_path: &Path) -> Result<PathBuf, St
 fn read_sherpa_engine(model_dir: &Path) -> Result<InstalledEngineConfig, String> {
     let engine_path = model_dir.join("engine.json");
     if !engine_path.exists() {
-        return Err("模型目录里没有 engine.json，请先在设置里下载并配置 Sherpa 模型。".to_string());
+        return Err("engine.json was not found in the model directory. Configure a Sherpa model in Settings first.".to_string());
     }
 
     let raw_config = fs::read_to_string(engine_path).map_err(|error| error.to_string())?;
     let engine: InstalledEngineConfig =
         serde_json::from_str(&raw_config).map_err(|error| error.to_string())?;
     if engine.engine != "sherpa-onnx" {
-        return Err(format!("暂不支持这个引擎：{}", engine.engine));
+        return Err(format!("Unsupported engine: {}", engine.engine));
     }
 
     Ok(engine)
@@ -1630,8 +1822,8 @@ fn query_nvidia_cuda_info_from_candidates(candidates: &[PathBuf]) -> NvidiaCudaI
         available: false,
         device_summary: None,
         detection_error: Some(format!(
-            "未找到可用的 nvidia-smi；已尝试：{tried}。{}",
-            errors.join("；")
+            "No usable nvidia-smi was found; tried: {tried}. Errors: {}",
+            errors.join("; ")
         )),
     }
 }
@@ -1747,39 +1939,39 @@ fn acceleration_status_from_parts(
         if let Some(reason) = cuda_disabled_reason.as_ref() {
             (
                 "cpu",
-                format!("CUDA 本次会话已停用，转录会直接使用 CPU：{reason}"),
+                format!("CUDA is disabled for this session; using CPU: {reason}"),
             )
         } else if let Some(error) = prepare_error {
             (
                 "cpu",
-                format!("CUDA runtime 准备失败；转录时会回退 CPU：{error}"),
+                format!("CUDA runtime preparation failed; using CPU: {error}"),
             )
         } else {
             match (cuda_available, cuda_runtime_installed) {
                 (false, _) => (
                     "cpu",
-                    "已选择 CUDA，但未检测到 NVIDIA CUDA 环境；转录时会自动回退 CPU。".to_string(),
+                    "CUDA is selected, but no NVIDIA CUDA environment was detected; transcription will use CPU.".to_string(),
                 ),
                 (true, false) => (
-                    "cuda",
-                    "已检测到 NVIDIA 环境；首次 CUDA 转录会下载 CUDA runtime，失败会回退 CPU。"
-                        .to_string(),
+                    "cpu",
+                    "NVIDIA CUDA was detected, but the local CUDA runtime is not prepared; transcription will use CPU until CUDA is prepared explicitly.".to_string(),
                 ),
                 (true, true) => (
                     "cuda",
-                    "CUDA 环境和 CUDA runtime 已就绪；识别失败时仍会自动回退 CPU。".to_string(),
+                    "CUDA and the CUDA runtime are ready; failures will still fall back to CPU.".to_string(),
                 ),
             }
         }
     } else if let Some(error) = prepare_error {
         (
             "cpu",
-            format!("CUDA runtime 准备失败；转录时会回退 CPU：{error}"),
+            format!("CUDA runtime preparation failed; using CPU: {error}"),
         )
     } else {
         (
             "cpu",
-            "当前选择 CPU，兼容性最高；不会尝试加载 CUDA runtime。".to_string(),
+            "CPU is selected for maximum compatibility; CUDA runtime will not be loaded."
+                .to_string(),
         )
     };
 
@@ -1877,7 +2069,7 @@ fn prepare_acceleration_runtime_for_app(
     );
     if status.effective_mode == "cuda" {
         status.message =
-            "CUDA runtime 已下载并通过启动检查；识别失败时仍会自动回退 CPU。".to_string();
+            "CUDA runtime is installed and passed the startup check; failures will still fall back to CPU.".to_string();
     }
 
     Ok(status)
@@ -1902,7 +2094,9 @@ fn resolve_sherpa_runtime(
         return ResolvedSherpaRuntime {
             executable: cpu_executable,
             mode: "cpu".to_string(),
-            fallback_reason: Some(format!("CUDA 本次会话已停用，已直接使用 CPU：{reason}")),
+            fallback_reason: Some(format!(
+                "CUDA is disabled for this session; using CPU: {reason}"
+            )),
         };
     }
 
@@ -1911,40 +2105,51 @@ fn resolve_sherpa_runtime(
         return ResolvedSherpaRuntime {
             executable: cpu_executable,
             mode: "cpu".to_string(),
-            fallback_reason: Some("未检测到可用的 NVIDIA CUDA 环境，已回退到 CPU。".to_string()),
+            fallback_reason: Some(
+                "No usable NVIDIA CUDA environment was detected; using CPU.".to_string(),
+            ),
         };
     }
 
-    match install_sherpa_cuda_runtime(app) {
-        Ok(executable) => {
-            if !is_cuda_runtime_startup_checked(app, &executable) {
-                if let Err(error) = smoke_test_sherpa_runtime(&executable) {
-                    trip_cuda_circuit(app, error.clone());
-                    return ResolvedSherpaRuntime {
-                        executable: cpu_executable,
-                        mode: "cpu".to_string(),
-                        fallback_reason: Some(format!(
-                            "CUDA runtime 启动检查失败，已回退到 CPU：{error}"
-                        )),
-                    };
-                }
-                mark_cuda_runtime_startup_checked(app, &executable);
-            }
-
-            ResolvedSherpaRuntime {
-                executable,
-                mode: "cuda".to_string(),
-                fallback_reason: None,
-            }
-        }
-        Err(error) => {
-            trip_cuda_circuit(app, error.clone());
-            ResolvedSherpaRuntime {
+    let cuda_executable = match sherpa_runtime_executable_path(app, SHERPA_CUDA_RUNTIME_NAME) {
+        Ok(executable) if executable.exists() => executable,
+        Ok(_) => {
+            return ResolvedSherpaRuntime {
                 executable: cpu_executable,
                 mode: "cpu".to_string(),
-                fallback_reason: Some(format!("CUDA 运行时准备失败，已回退到 CPU：{error}")),
-            }
+                fallback_reason: Some(
+                    "Local CUDA runtime is not prepared; using CPU without downloading during transcription."
+                        .to_string(),
+                ),
+            };
         }
+        Err(error) => {
+            return ResolvedSherpaRuntime {
+                executable: cpu_executable,
+                mode: "cpu".to_string(),
+                fallback_reason: Some(format!("CUDA runtime lookup failed; using CPU: {error}")),
+            };
+        }
+    };
+
+    if !is_cuda_runtime_startup_checked(app, &cuda_executable) {
+        if let Err(error) = smoke_test_sherpa_runtime(&cuda_executable) {
+            trip_cuda_circuit(app, error.clone());
+            return ResolvedSherpaRuntime {
+                executable: cpu_executable,
+                mode: "cpu".to_string(),
+                fallback_reason: Some(format!(
+                    "CUDA runtime startup check failed; using CPU: {error}"
+                )),
+            };
+        }
+        mark_cuda_runtime_startup_checked(app, &cuda_executable);
+    }
+
+    ResolvedSherpaRuntime {
+        executable: cuda_executable,
+        mode: "cuda".to_string(),
+        fallback_reason: None,
     }
 }
 
@@ -1960,7 +2165,10 @@ fn ensure_sherpa_daemon_running(
 ) -> Result<(), String> {
     let server_exe = sherpa_websocket_server_path(executable);
     if !server_exe.exists() {
-        return Err("Sherpa WebSocket 服务程序不存在，无法启用极速模式。".to_string());
+        return Err(
+            "Sherpa WebSocket server executable does not exist; fast mode cannot be enabled."
+                .to_string(),
+        );
     }
 
     let state = app.state::<RuntimeState>();
@@ -2024,7 +2232,7 @@ fn wav_to_sherpa_websocket_payload(wav_path: &Path) -> Result<Vec<u8>, String> {
     let mut reader = hound::WavReader::open(wav_path).map_err(|error| error.to_string())?;
     let spec = reader.spec();
     if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
-        return Err("Sherpa 极速模式只支持 16-bit PCM WAV。".to_string());
+        return Err("Sherpa fast mode only supports 16-bit PCM WAV.".to_string());
     }
 
     let samples = reader
@@ -2034,7 +2242,7 @@ fn wav_to_sherpa_websocket_payload(wav_path: &Path) -> Result<Vec<u8>, String> {
     let audio_bytes = samples
         .len()
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| "音频太大，无法发送到 Sherpa 服务。".to_string())?;
+        .ok_or_else(|| "Audio is too large to send to the Sherpa service.".to_string())?;
 
     let mut payload = Vec::with_capacity(8 + audio_bytes);
     payload.extend_from_slice(&(spec.sample_rate as i32).to_le_bytes());
@@ -2115,7 +2323,7 @@ fn read_websocket_message(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
 
         match opcode {
             0x0 | 0x1 | 0x2 => message.extend_from_slice(&payload),
-            0x8 => return Err("Sherpa WebSocket 服务提前关闭连接。".to_string()),
+            0x8 => return Err("Sherpa WebSocket service closed the connection early.".to_string()),
             _ => {}
         }
 
@@ -2156,7 +2364,7 @@ fn transcribe_sherpa_wav_websocket(wav_path: &Path) -> Result<String, String> {
                         .read(&mut buffer)
                         .map_err(|error| error.to_string())?;
                     if read == 0 {
-                        return Err("Sherpa WebSocket 握手失败。".to_string());
+                        return Err("Sherpa WebSocket handshake failed.".to_string());
                     }
                     response.extend_from_slice(&buffer[..read]);
                     if response.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -2168,7 +2376,9 @@ fn transcribe_sherpa_wav_websocket(wav_path: &Path) -> Result<String, String> {
                 if !response_text.starts_with("HTTP/1.1 101")
                     && !response_text.starts_with("HTTP/1.0 101")
                 {
-                    return Err(format!("Sherpa WebSocket 握手失败：{response_text}"));
+                    return Err(format!(
+                        "Sherpa WebSocket handshake failed: {response_text}"
+                    ));
                 }
 
                 stream
@@ -2188,7 +2398,9 @@ fn transcribe_sherpa_wav_websocket(wav_path: &Path) -> Result<String, String> {
         }
     }
 
-    Err(format!("Sherpa WebSocket 服务未就绪：{last_error}"))
+    Err(format!(
+        "Sherpa WebSocket service is not ready: {last_error}"
+    ))
 }
 
 fn wav_duration_seconds(wav_path: &Path) -> Result<f64, String> {
@@ -2206,63 +2418,103 @@ fn split_wav_into_chunks_in_dir(
     wav_path: &Path,
     chunk_dir: &Path,
     chunk_seconds: u32,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<AudioChunk>, String> {
     let mut reader = hound::WavReader::open(wav_path).map_err(|error| error.to_string())?;
     let spec = reader.spec();
     if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
-        return Err("长音频分段只支持 16-bit PCM WAV。".to_string());
+        return Err("Long-audio chunking only supports 16-bit PCM WAV.".to_string());
     }
 
     fs::create_dir_all(chunk_dir).map_err(|error| error.to_string())?;
-    let samples_per_chunk = (spec.sample_rate as usize)
-        .saturating_mul(spec.channels as usize)
+    let channels = spec.channels as usize;
+    let samples_per_second = (spec.sample_rate as usize).saturating_mul(channels).max(1);
+    let target_samples = samples_per_second
         .saturating_mul(chunk_seconds.max(1) as usize)
-        .max(1);
+        .max(samples_per_second);
+    let search_radius = samples_per_second.saturating_mul(8);
+    let analysis_window = samples_per_second / 4;
     let stem = wav_path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("audio");
-    let mut chunk_paths = Vec::new();
-    let mut writer: Option<hound::WavWriter<BufWriter<File>>> = None;
-    let mut samples_in_chunk = 0usize;
-    let mut chunk_index = 0usize;
 
-    for sample in reader.samples::<i16>() {
-        if writer.is_none() {
-            let chunk_path = chunk_dir.join(format!("{stem}-part-{chunk_index:04}.wav"));
-            writer = Some(
-                hound::WavWriter::create(&chunk_path, spec).map_err(|error| error.to_string())?,
-            );
-            chunk_paths.push(chunk_path);
-            samples_in_chunk = 0;
+    let samples = reader
+        .samples::<i16>()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut boundaries = vec![0usize];
+    let mut cursor = 0usize;
+    while cursor + target_samples < samples.len() {
+        let target = cursor + target_samples;
+        let start = target
+            .saturating_sub(search_radius)
+            .max(cursor + samples_per_second * 20);
+        let end = (target + search_radius).min(samples.len().saturating_sub(analysis_window + 1));
+        let mut best_index = target.min(samples.len());
+        let mut best_score = f64::MAX;
+
+        let step = channels.max(1) * 512;
+        let mut probe = start;
+        while probe < end {
+            let window_end = (probe + analysis_window).min(samples.len());
+            let score = samples[probe..window_end]
+                .iter()
+                .map(|sample| {
+                    let value = f64::from(*sample) / f64::from(i16::MAX);
+                    value * value
+                })
+                .sum::<f64>()
+                / (window_end.saturating_sub(probe).max(1) as f64);
+            if score < best_score {
+                best_score = score;
+                best_index = probe;
+            }
+            probe = probe.saturating_add(step);
         }
 
-        if let Some(writer) = writer.as_mut() {
+        let boundary = best_index - (best_index % channels.max(1));
+        if boundary <= cursor || boundary >= samples.len() {
+            break;
+        }
+        boundaries.push(boundary);
+        cursor = boundary;
+    }
+    boundaries.push(samples.len());
+
+    let mut chunks = Vec::new();
+    for (chunk_index, pair) in boundaries.windows(2).enumerate() {
+        let start = pair[0];
+        let end = pair[1];
+        if end <= start {
+            continue;
+        }
+        let chunk_path = chunk_dir.join(format!("{stem}-part-{chunk_index:04}.wav"));
+        let mut writer =
+            hound::WavWriter::create(&chunk_path, spec).map_err(|error| error.to_string())?;
+        for sample in &samples[start..end] {
             writer
-                .write_sample(sample.map_err(|error| error.to_string())?)
+                .write_sample(*sample)
                 .map_err(|error| error.to_string())?;
         }
-        samples_in_chunk += 1;
-
-        if samples_in_chunk >= samples_per_chunk {
-            if let Some(writer) = writer.take() {
-                writer.finalize().map_err(|error| error.to_string())?;
-            }
-            chunk_index += 1;
-        }
-    }
-
-    if let Some(writer) = writer.take() {
         writer.finalize().map_err(|error| error.to_string())?;
+        chunks.push(AudioChunk {
+            path: chunk_path,
+            start: start as f64 / samples_per_second as f64,
+            end: end as f64 / samples_per_second as f64,
+        });
     }
 
-    Ok(chunk_paths)
+    Ok(chunks)
 }
 
 fn split_wav_into_chunks(
     app: &AppHandle,
     wav_path: &Path,
-) -> Result<(Vec<PathBuf>, PathBuf), String> {
+) -> Result<(Vec<AudioChunk>, PathBuf), String> {
     let chunk_dir = app
         .path()
         .app_cache_dir()
@@ -2292,26 +2544,76 @@ fn format_timeline_timestamp(seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}:{frames:02}")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TranscriptSegment {
+    id: String,
+    index: usize,
     start: f64,
     end: f64,
     text: String,
+    source_audio_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct AudioChunk {
+    path: PathBuf,
+    start: f64,
+    end: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptTextChunk {
+    text: String,
+    start: f64,
+    end: f64,
+}
+
+fn is_primary_sentence_break(character: char) -> bool {
+    matches!(character, '。' | '！' | '？' | '!' | '?' | '\n')
+}
+
+fn is_secondary_sentence_break(character: char) -> bool {
+    matches!(character, '，' | '；' | '、' | ',' | ';')
+}
+
+fn is_leading_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '。' | '！' | '？' | '，' | '、' | '；' | '.' | '!' | '?' | ';' | ','
+    )
 }
 
 fn split_text_into_chunks(text: &str) -> Vec<String> {
-    const MAX_CHARS: usize = 42;
-    let mut chunks = Vec::new();
+    const TARGET_CHARS: usize = 56;
+    const MAX_CHARS: usize = 82;
+    let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
+    let mut pending_punctuation = String::new();
 
     for character in text.chars() {
+        if current.trim().is_empty() && is_leading_punctuation(character) {
+            current.clear();
+            if let Some(last) = chunks.last_mut() {
+                last.push(character);
+            } else {
+                pending_punctuation.push(character);
+            }
+            continue;
+        }
+
+        if current.is_empty() && !pending_punctuation.is_empty() {
+            current.push_str(&pending_punctuation);
+            pending_punctuation.clear();
+        }
+
         current.push(character);
         let char_count = current.chars().count();
-        let is_break = matches!(
-            character,
-            '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';' | '\n'
-        );
-        if is_break || char_count >= MAX_CHARS {
+        let should_break = is_primary_sentence_break(character)
+            || (char_count >= TARGET_CHARS && is_secondary_sentence_break(character))
+            || char_count >= MAX_CHARS;
+
+        if should_break {
             let chunk = current.trim();
             if !chunk.is_empty() {
                 chunks.push(chunk.to_string());
@@ -2332,46 +2634,110 @@ fn split_text_into_chunks(text: &str) -> Vec<String> {
     chunks
 }
 
-fn build_transcript_segments(text: &str, duration: f64) -> Vec<TranscriptSegment> {
-    let chunks = split_text_into_chunks(text);
-    if chunks.is_empty() {
-        return Vec::new();
-    }
+fn build_transcript_segments(
+    text: &str,
+    duration: f64,
+    source_audio_path: &Path,
+) -> Vec<TranscriptSegment> {
+    const MIN_SEGMENT_SECONDS: f64 = 0.5;
+    let chunk_count = split_text_into_chunks(text).len().max(1);
+    let duration = if duration.is_finite() && duration > 0.0 {
+        duration.max(chunk_count as f64 * MIN_SEGMENT_SECONDS)
+    } else {
+        duration
+    };
+    build_transcript_segments_from_chunks(
+        &[TranscriptTextChunk {
+            text: text.to_string(),
+            start: 0.0,
+            end: duration,
+        }],
+        source_audio_path,
+    )
+}
 
-    let duration = duration.max(chunks.len() as f64 * 1.2);
-    let total_chars: usize = chunks
-        .iter()
-        .map(|chunk| {
-            chunk
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .count()
-                .max(1)
-        })
-        .sum();
-    let mut cursor = 0.0;
-    let mut segments = Vec::with_capacity(chunks.len());
+fn build_transcript_segments_from_chunks(
+    transcript_chunks: &[TranscriptTextChunk],
+    source_audio_path: &Path,
+) -> Vec<TranscriptSegment> {
+    const MIN_SEGMENT_SECONDS: f64 = 0.5;
+    let mut segments = Vec::new();
 
-    for (index, chunk) in chunks.iter().enumerate() {
-        let end = if index + 1 == chunks.len() {
-            duration
+    for transcript_chunk in transcript_chunks {
+        let text_chunks = split_text_into_chunks(&transcript_chunk.text);
+        if text_chunks.is_empty() {
+            continue;
+        }
+
+        let window_start = transcript_chunk.start.max(0.0);
+        let window_end = transcript_chunk.end.max(window_start + 0.1);
+        let window_duration = window_end - window_start;
+        let segment_floor = MIN_SEGMENT_SECONDS.min(window_duration / text_chunks.len() as f64);
+        let minimum_total_duration = text_chunks.len() as f64 * segment_floor;
+        let duration = if window_duration.is_finite() && window_duration > 0.0 {
+            window_duration
         } else {
-            let char_count = chunk
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .count()
-                .max(1);
-            (cursor + duration * char_count as f64 / total_chars as f64).min(duration)
+            (text_chunks.len() as f64 * 1.2).max(minimum_total_duration)
         };
-        segments.push(TranscriptSegment {
-            start: cursor,
-            end: end.max(cursor + 0.5),
-            text: chunk.to_string(),
-        });
-        cursor = end;
+        let char_counts = text_chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .count()
+                    .max(1)
+            })
+            .collect::<Vec<_>>();
+        let total_chars: usize = char_counts.iter().sum();
+        let flexible_duration = (duration - minimum_total_duration).max(0.0);
+        let allocated_durations = char_counts
+            .iter()
+            .map(|char_count| {
+                segment_floor + flexible_duration * *char_count as f64 / total_chars as f64
+            })
+            .collect::<Vec<_>>();
+        let allocated_total: f64 = allocated_durations.iter().sum();
+        let scale = if allocated_total > 0.0 {
+            duration / allocated_total
+        } else {
+            1.0
+        };
+        let mut cursor = window_start;
+
+        for (chunk_index, text_chunk) in text_chunks.iter().enumerate() {
+            let segment_index = segments.len() + 1;
+            let end = if chunk_index + 1 == text_chunks.len() {
+                window_start + duration
+            } else {
+                (cursor + allocated_durations[chunk_index] * scale).min(window_start + duration)
+            };
+            segments.push(TranscriptSegment {
+                id: format!(
+                    "segment-{}-{}",
+                    segment_index,
+                    unix_timestamp_millis().unwrap_or(0)
+                ),
+                index: segment_index,
+                start: cursor,
+                end,
+                text: text_chunk.to_string(),
+                source_audio_path: source_audio_path.to_string_lossy().to_string(),
+            });
+            cursor = end;
+        }
     }
 
     segments
+}
+
+fn transcript_text_from_chunks(chunks: &[TranscriptTextChunk]) -> String {
+    chunks
+        .iter()
+        .map(|chunk| chunk.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn timeline_text_from_segments(segments: &[TranscriptSegment]) -> String {
@@ -2455,7 +2821,7 @@ fn transcribe_sherpa_wav_cli(
     let combined = format!("{stdout}\n{stderr}");
 
     if !output.status.success() {
-        return Err(format!("Sherpa 转录失败：{}", combined.trim()));
+        return Err(format!("Sherpa transcription failed: {}", combined.trim()));
     }
 
     Ok(extract_transcription_text(&combined))
@@ -2497,7 +2863,7 @@ fn transcribe_sherpa_wav(
     task_id: Option<&str>,
     started_at: Instant,
     runtime_mode: &str,
-) -> Result<String, String> {
+) -> Result<Vec<TranscriptTextChunk>, String> {
     let duration = wav_duration_seconds(wav_path)?;
     if duration <= LONG_AUDIO_THRESHOLD_SECONDS {
         emit_transcription_progress(
@@ -2506,7 +2872,7 @@ fn transcribe_sherpa_wav(
             started_at,
             "transcribing",
             35,
-            "正在调用本地 Sherpa 模型".to_string(),
+            "Running local Sherpa model".to_string(),
             0,
             1,
         );
@@ -2525,11 +2891,15 @@ fn transcribe_sherpa_wav(
             started_at,
             "transcribing",
             92,
-            "转录完成，正在生成结果文件".to_string(),
+            "Transcription complete; generating result files".to_string(),
             1,
             1,
         );
-        return Ok(text);
+        return Ok(vec![TranscriptTextChunk {
+            text,
+            start: 0.0,
+            end: duration,
+        }]);
     }
 
     let (chunks, chunk_dir) = split_wav_into_chunks(app, wav_path)?;
@@ -2540,7 +2910,7 @@ fn transcribe_sherpa_wav(
         started_at,
         "splitting",
         15,
-        format!("长音频已切分为 {total_segments} 段"),
+        format!("Long audio was split into {total_segments} chunks"),
         0,
         total_segments,
     );
@@ -2551,9 +2921,9 @@ fn transcribe_sherpa_wav(
             .iter()
             .cloned()
             .enumerate()
-            .collect::<VecDeque<(usize, PathBuf)>>(),
+            .collect::<VecDeque<(usize, AudioChunk)>>(),
     ));
-    let (sender, receiver) = mpsc::channel::<(usize, Result<String, String>)>();
+    let (sender, receiver) = mpsc::channel::<(usize, Result<TranscriptTextChunk, String>)>();
 
     let mut handles = Vec::new();
     for _ in 0..worker_count {
@@ -2575,10 +2945,15 @@ fn transcribe_sherpa_wav(
             let result = transcribe_sherpa_wav_cli(
                 &executable,
                 &engine,
-                &chunk,
+                &chunk.path,
                 performance.sherpa_threads,
                 &runtime_mode,
-            );
+            )
+            .map(|text| TranscriptTextChunk {
+                text,
+                start: chunk.start,
+                end: chunk.end,
+            });
             let _ = sender.send((index, result));
         }));
     }
@@ -2597,7 +2972,7 @@ fn transcribe_sherpa_wav(
             started_at,
             "transcribing",
             progress,
-            format!("正在转录分段 {completed}/{total_segments}"),
+            format!("Transcribing chunk {completed}/{total_segments}"),
             completed,
             total_segments,
         );
@@ -2607,26 +2982,35 @@ fn transcribe_sherpa_wav(
     }
     let _ = fs::remove_dir_all(&chunk_dir);
 
-    let mut texts = Vec::new();
+    let mut transcript_chunks = Vec::new();
     let mut errors = Vec::new();
     for (index, result) in results.into_iter().enumerate() {
         match result {
-            Some(Ok(text)) if !text.trim().is_empty() => texts.push(text.trim().to_string()),
-            Some(Ok(_)) => errors.push(format!("第 {} 段：没有识别到文字", index + 1)),
-            Some(Err(error)) => errors.push(format!("第 {} 段：{error}", index + 1)),
-            None => errors.push(format!("第 {} 段：没有返回结果", index + 1)),
+            Some(Ok(chunk)) if !chunk.text.trim().is_empty() => {
+                transcript_chunks.push(TranscriptTextChunk {
+                    text: chunk.text.trim().to_string(),
+                    start: chunk.start,
+                    end: chunk.end,
+                })
+            }
+            Some(Ok(_)) => errors.push(format!("Chunk {} returned no recognized text", index + 1)),
+            Some(Err(error)) => errors.push(format!("Chunk {} failed: {error}", index + 1)),
+            None => errors.push(format!("Chunk {} returned no result", index + 1)),
         }
     }
 
-    if !texts.is_empty() {
-        return Ok(texts.join("\n"));
+    if !transcript_chunks.is_empty() {
+        return Ok(transcript_chunks);
     }
 
     if !errors.is_empty() {
-        return Err(format!("长音频分段转录失败：{}", errors.join("；")));
+        return Err(format!(
+            "Long-audio chunk transcription failed: {}",
+            errors.join("; ")
+        ));
     }
 
-    Err("Sherpa 已运行，但长音频分段后仍未解析到转录文字。".to_string())
+    Err("Sherpa ran, but no transcription text was parsed after long-audio chunking.".to_string())
 }
 
 fn write_smoke_test_wav(path: &Path) -> Result<(), String> {
@@ -2667,7 +3051,9 @@ fn run_acceleration_smoke_test_inner(
     let engine = read_sherpa_engine(&model_dir)?;
     let cpu_executable = PathBuf::from(&engine.executable);
     if !cpu_executable.exists() {
-        return Err("Sherpa-ONNX 程序不存在，请重新配置模型。".to_string());
+        return Err(
+            "Sherpa-ONNX executable does not exist. Configure the model again.".to_string(),
+        );
     }
 
     let smoke_dir = app
@@ -2694,17 +3080,17 @@ fn run_acceleration_smoke_test_inner(
     let (used_mode, fallback_used, text, message) = match first_result {
         Ok(text) => {
             let message = if runtime.mode == "cuda" {
-                "CUDA smoke test 已完成；静音音频不要求识别出文字。".to_string()
+                "CUDA smoke test completed; silent audio does not need recognized text.".to_string()
             } else if let Some(reason) = fallback_reason {
-                format!("CUDA 不可用，已使用 CPU 完成 smoke test：{reason}")
+                format!("CUDA is unavailable; CPU smoke test completed: {reason}")
             } else {
-                "CPU smoke test 已完成；静音音频不要求识别出文字。".to_string()
+                "CPU smoke test completed; silent audio does not need recognized text.".to_string()
             };
             let fallback_used = requested_mode == "cuda" && runtime.mode != "cuda";
             (runtime.mode, fallback_used, text, message)
         }
         Err(error) if runtime.mode != "cpu" => {
-            trip_cuda_circuit(&app, format!("CUDA smoke test 失败：{error}"));
+            trip_cuda_circuit(&app, format!("CUDA smoke test failed: {error}"));
             let cpu_text = transcribe_sherpa_wav_once(
                 &app,
                 &engine,
@@ -2718,7 +3104,7 @@ fn run_acceleration_smoke_test_inner(
                 "cpu".to_string(),
                 true,
                 cpu_text,
-                format!("CUDA smoke test 失败，CPU 回退成功：{error}"),
+                format!("CUDA smoke test failed; CPU fallback succeeded: {error}"),
             )
         }
         Err(error) => {
@@ -2744,6 +3130,7 @@ fn write_transcription_outputs(
     source_audio_path: &Path,
     sherpa_audio_path: &Path,
     text: &str,
+    segments: &[TranscriptSegment],
 ) -> Result<(String, Vec<String>, Vec<TranscriptionOutputFile>), String> {
     fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
 
@@ -2755,28 +3142,27 @@ fn write_transcription_outputs(
     let plain_path = output_dir.join(format!("{stem}-{suffix}.txt"));
     let timeline_path = output_dir.join(format!("{stem}-{suffix}-timeline.txt"));
     let srt_path = output_dir.join(format!("{stem}-{suffix}.srt"));
-    let duration = wav_duration_seconds(sherpa_audio_path)?.max(1.0);
-    let segments = build_transcript_segments(text, duration);
+    let _ = sherpa_audio_path;
 
     fs::write(&plain_path, text).map_err(|error| error.to_string())?;
-    fs::write(&timeline_path, timeline_text_from_segments(&segments))
+    fs::write(&timeline_path, timeline_text_from_segments(segments))
         .map_err(|error| error.to_string())?;
-    fs::write(&srt_path, srt_text_from_segments(&segments)).map_err(|error| error.to_string())?;
+    fs::write(&srt_path, srt_text_from_segments(segments)).map_err(|error| error.to_string())?;
 
     let files = vec![
         TranscriptionOutputFile {
             format: "plainText".to_string(),
-            label: "无时间码纯文字".to_string(),
+            label: "Plain text".to_string(),
             path: plain_path.to_string_lossy().to_string(),
         },
         TranscriptionOutputFile {
             format: "timelineText".to_string(),
-            label: "带时间码 TXT".to_string(),
+            label: "Timeline TXT".to_string(),
             path: timeline_path.to_string_lossy().to_string(),
         },
         TranscriptionOutputFile {
             format: "srt".to_string(),
-            label: "SRT 字幕".to_string(),
+            label: "SRT subtitles".to_string(),
             path: srt_path.to_string_lossy().to_string(),
         },
     ];
@@ -2795,6 +3181,26 @@ fn write_transcription_outputs(
     Ok((primary.to_string_lossy().to_string(), output_paths, files))
 }
 
+fn persist_review_audio(
+    app: &AppHandle,
+    source_audio_path: &Path,
+    sherpa_audio_path: &Path,
+) -> Result<PathBuf, String> {
+    let output_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("review-audio");
+    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let stem = source_audio_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    let output_path = output_dir.join(format!("{stem}-review-{}.wav", unix_timestamp_millis()?));
+    fs::copy(sherpa_audio_path, &output_path).map_err(|error| error.to_string())?;
+    Ok(output_path)
+}
+
 fn transcribe_file_with_sherpa(
     app: AppHandle,
     request: TranscribeFileRequest,
@@ -2808,13 +3214,13 @@ fn transcribe_file_with_sherpa(
         started_at,
         "transcoding",
         5,
-        "正在转为 16kHz 单声道 WAV".to_string(),
+        "Converting to 16kHz mono WAV".to_string(),
         0,
         0,
     );
     let audio_path = PathBuf::from(&request.audio_path);
     if !audio_path.exists() {
-        return Err("音频文件不存在。".to_string());
+        return Err("Audio file does not exist.".to_string());
     }
     let sherpa_audio_path = media_to_sherpa_wav(&app, &audio_path)?;
     emit_transcription_progress(
@@ -2823,7 +3229,7 @@ fn transcribe_file_with_sherpa(
         started_at,
         "transcoding",
         12,
-        "音频转码完成，正在准备识别".to_string(),
+        "Audio transcoding complete; preparing recognition".to_string(),
         0,
         0,
     );
@@ -2833,7 +3239,9 @@ fn transcribe_file_with_sherpa(
 
     let cpu_executable = PathBuf::from(&engine.executable);
     if !cpu_executable.exists() {
-        return Err("Sherpa-ONNX 程序不存在，请重新配置模型。".to_string());
+        return Err(
+            "Sherpa-ONNX executable does not exist. Configure the model again.".to_string(),
+        );
     }
 
     if request
@@ -2847,7 +3255,7 @@ fn transcribe_file_with_sherpa(
             started_at,
             "transcribing",
             14,
-            "正在准备 CUDA 加速运行时；不可用时会自动回退到 CPU。".to_string(),
+            "Checking local CUDA runtime; CPU fallback will be used if unavailable.".to_string(),
             0,
             0,
         );
@@ -2868,7 +3276,7 @@ fn transcribe_file_with_sherpa(
         );
     }
 
-    let text_result = transcribe_sherpa_wav(
+    let chunk_result = transcribe_sherpa_wav(
         &app,
         &engine,
         &runtime.executable,
@@ -2878,17 +3286,17 @@ fn transcribe_file_with_sherpa(
         started_at,
         &runtime.mode,
     );
-    let raw_text = match text_result {
-        Ok(text) => text,
+    let raw_chunks = match chunk_result {
+        Ok(chunks) => chunks,
         Err(error) if runtime.mode != "cpu" => {
-            trip_cuda_circuit(&app, format!("CUDA 识别失败：{error}"));
+            trip_cuda_circuit(&app, format!("CUDA transcription failed: {error}"));
             emit_transcription_progress(
                 &app,
                 request.task_id.as_deref(),
                 started_at,
                 "transcribing",
                 20,
-                format!("CUDA 识别失败，正在回退到 CPU：{error}"),
+                format!("CUDA transcription failed; falling back to CPU: {error}"),
                 0,
                 0,
             );
@@ -2905,11 +3313,27 @@ fn transcribe_file_with_sherpa(
         }
         Err(error) => return Err(error),
     };
-    let text = apply_hotwords(&raw_text, &request.hotwords);
+    let transcript_chunks = raw_chunks
+        .into_iter()
+        .map(|chunk| TranscriptTextChunk {
+            text: apply_hotwords(&chunk.text, &request.hotwords),
+            start: chunk.start,
+            end: chunk.end,
+        })
+        .collect::<Vec<_>>();
+    let text = transcript_text_from_chunks(&transcript_chunks);
 
     if text.is_empty() {
-        return Err("Sherpa 已运行，但没有解析到转录文字。".to_string());
+        return Err("Sherpa ran, but no transcription text was parsed.".to_string());
     }
+
+    let duration = wav_duration_seconds(&sherpa_audio_path)?.max(1.0);
+    let review_audio_path = persist_review_audio(&app, &audio_path, &sherpa_audio_path)?;
+    let segments = if transcript_chunks.is_empty() {
+        build_transcript_segments(&text, duration, &review_audio_path)
+    } else {
+        build_transcript_segments_from_chunks(&transcript_chunks, &review_audio_path)
+    };
 
     let (output_path, output_paths, output_files) = if request.save_output {
         emit_transcription_progress(
@@ -2918,7 +3342,7 @@ fn transcribe_file_with_sherpa(
             started_at,
             "exporting",
             95,
-            "正在生成三种导出文件".to_string(),
+            "Generating export files".to_string(),
             0,
             0,
         );
@@ -2933,6 +3357,7 @@ fn transcribe_file_with_sherpa(
             &audio_path,
             &sherpa_audio_path,
             &text,
+            &segments,
         )?
     } else {
         (String::new(), Vec::new(), Vec::new())
@@ -2946,7 +3371,7 @@ fn transcribe_file_with_sherpa(
         started_at,
         "done",
         100,
-        "转录完成".to_string(),
+        "杞綍瀹屾垚".to_string(),
         0,
         0,
     );
@@ -2956,6 +3381,9 @@ fn transcribe_file_with_sherpa(
         output_path,
         output_paths,
         output_files,
+        segments,
+        timeline_kind: "estimated".to_string(),
+        source_audio_path: review_audio_path.to_string_lossy().to_string(),
     })
 }
 fn write_i16_samples(
@@ -3039,19 +3467,18 @@ fn app_recordings_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(recordings_dir)
 }
 
-fn start_microphone_recording(app: &AppHandle) -> Result<RecordingSession, String> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "没有找到可用麦克风。".to_string())?;
-    let supported_config = device
-        .default_input_config()
-        .map_err(|error| error.to_string())?;
+fn build_recording_track_for_device(
+    app: &AppHandle,
+    device: cpal::Device,
+    supported_config: cpal::SupportedStreamConfig,
+    _role: &str,
+    file_prefix: &str,
+) -> Result<RecordingTrack, String> {
     let sample_format = supported_config.sample_format();
     let stream_config: cpal::StreamConfig = supported_config.into();
 
     let recordings_dir = app_recordings_dir(app)?;
-    let path = recordings_dir.join(format!("voice-{}.wav", unix_timestamp_millis()?));
+    let path = recordings_dir.join(format!("{file_prefix}-{}.wav", unix_timestamp_millis()?));
 
     let spec = hound::WavSpec {
         channels: stream_config.channels,
@@ -3098,24 +3525,174 @@ fn start_microphone_recording(app: &AppHandle) -> Result<RecordingSession, Strin
                 None,
             )
         }
-        other => return Err(format!("涓嶆敮鎸佺殑楹﹀厠椋庨噰鏍锋牸寮忥細{other:?}")),
+        other => return Err(format!("Unsupported recording sample format: {other:?}")),
     }
     .map_err(|error| error.to_string())?;
 
     stream.play().map_err(|error| error.to_string())?;
-    Ok(RecordingSession {
+    Ok(RecordingTrack {
         stream,
         writer,
         path,
     })
 }
 
-fn stop_microphone_recording(session: RecordingSession) -> Result<PathBuf, String> {
-    let RecordingSession {
+fn start_microphone_recording_track(app: &AppHandle) -> Result<RecordingTrack, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or_else(|| "No available microphone input device was found.".to_string())?;
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| error.to_string())?;
+    build_recording_track_for_device(app, device, supported_config, "microphone", "voice")
+}
+
+fn start_system_recording_track(app: &AppHandle) -> Result<RecordingTrack, String> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| "No available system output device was found.".to_string())?;
+    let supported_config = device
+        .default_output_config()
+        .map_err(|error| error.to_string())?;
+    build_recording_track_for_device(app, device, supported_config, "system", "system").map_err(
+        |error| {
+            format!(
+                "System audio loopback capture failed. Check Windows output device, exclusive-mode settings, and app audio permissions. Details: {error}"
+            )
+        },
+    )
+}
+
+fn audio_config_detail(config: &cpal::SupportedStreamConfig) -> String {
+    format!(
+        "{} Hz / {} channel(s) / {:?}",
+        config.sample_rate().0,
+        config.channels(),
+        config.sample_format()
+    )
+}
+
+fn system_audio_diagnostic_detail(config: &cpal::SupportedStreamConfig) -> String {
+    format!(
+        "{}. Output device detected; system-audio recording still depends on WASAPI loopback support and will be verified when recording starts.",
+        audio_config_detail(config)
+    )
+}
+
+fn native_audio_diagnostics(app: &AppHandle) -> NativeAudioDiagnostics {
+    let host = cpal::default_host();
+
+    let (microphone_available, microphone_name, microphone_detail) =
+        match host.default_input_device() {
+            Some(device) => {
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| "Default microphone".to_string());
+                match device.default_input_config() {
+                    Ok(config) => (true, Some(name), Some(audio_config_detail(&config))),
+                    Err(error) => (false, Some(name), Some(error.to_string())),
+                }
+            }
+            None => (
+                false,
+                None,
+                Some("No default microphone input device was found.".to_string()),
+            ),
+        };
+
+    let (system_audio_available, system_audio_name, system_audio_detail) =
+        match host.default_output_device() {
+            Some(device) => {
+                let name = device
+                    .name()
+                    .unwrap_or_else(|_| "Default speaker".to_string());
+                match device.default_output_config() {
+                    Ok(config) => (
+                        true,
+                        Some(name),
+                        Some(system_audio_diagnostic_detail(&config)),
+                    ),
+                    Err(error) => (false, Some(name), Some(error.to_string())),
+                }
+            }
+            None => (
+                false,
+                None,
+                Some("No default system output device was found.".to_string()),
+            ),
+        };
+
+    let ffmpeg_roots = ffmpeg_runtime_search_roots_for_app(app).unwrap_or_default();
+    let (ffmpeg_installed, ffmpeg_path, ffmpeg_detail) = match installed_ffmpeg_runtime(app) {
+        Ok(Some(path)) => (
+            true,
+            Some(path.to_string_lossy().to_string()),
+            Some("Local ffmpeg runtime is installed.".to_string()),
+        ),
+        Ok(None) => (false, None, Some(ffmpeg_missing_detail(&ffmpeg_roots))),
+        Err(error) => (false, None, Some(error)),
+    };
+
+    let message = if microphone_available && system_audio_available && ffmpeg_installed {
+        "Native audio environment looks ready.".to_string()
+    } else {
+        "Native audio environment needs attention before all recording and processing modes are available.".to_string()
+    };
+
+    NativeAudioDiagnostics {
+        microphone_available,
+        microphone_name,
+        microphone_detail,
+        system_audio_available,
+        system_audio_name,
+        system_audio_detail,
+        ffmpeg_installed,
+        ffmpeg_path,
+        ffmpeg_detail,
+        message,
+    }
+}
+
+fn start_microphone_and_system_recording_tracks(
+    app: &AppHandle,
+) -> Result<Vec<RecordingTrack>, String> {
+    let microphone = start_microphone_recording_track(app)?;
+    match start_system_recording_track(app) {
+        Ok(system) => Ok(vec![microphone, system]),
+        Err(error) => {
+            let microphone_path = microphone.path.clone();
+            let _ = stop_recording_track(microphone);
+            let _ = fs::remove_file(microphone_path);
+            Err(error)
+        }
+    }
+}
+fn start_recording_session(app: &AppHandle, source: &str) -> Result<RecordingSession, String> {
+    let tracks = match source {
+        "system" => vec![start_system_recording_track(app)?],
+        "microphoneAndSystem" => start_microphone_and_system_recording_tracks(app)?,
+        _ => vec![start_microphone_recording_track(app)?],
+    };
+    let path = tracks
+        .first()
+        .map(|track| track.path.clone())
+        .ok_or_else(|| "No recording tracks were started.".to_string())?;
+    Ok(RecordingSession {
+        source: source.to_string(),
+        tracks,
+        path,
+    })
+}
+
+fn stop_recording_track(track: RecordingTrack) -> Result<PathBuf, String> {
+    let RecordingTrack {
         stream,
         writer,
         path,
-    } = session;
+        ..
+    } = track;
     drop(stream);
 
     let mut guard = writer.lock().map_err(|error| error.to_string())?;
@@ -3126,13 +3703,82 @@ fn stop_microphone_recording(session: RecordingSession) -> Result<PathBuf, Strin
     Ok(path)
 }
 
+fn validate_recording_output_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err(format!(
+            "recording file was not created: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    let duration = wav_duration_seconds(path)
+        .map_err(|error| format!("recording file is not readable: {error}"))?;
+    if duration < MIN_RECORDING_SECONDS {
+        return Err(format!(
+            "recording is too short or empty ({duration:.3}s): {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_recording_output_files(paths: &[PathBuf]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for path in paths {
+        if let Err(error) = validate_recording_output_file(path) {
+            errors.push(error);
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Recording did not contain usable audio. Try again and keep recording for a little longer. Details: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn stop_recording_session(session: RecordingSession) -> Result<StoppedRecording, String> {
+    let RecordingSession {
+        source,
+        tracks,
+        path,
+    } = session;
+    let mut output_paths = Vec::new();
+
+    for track in tracks {
+        output_paths.push(stop_recording_track(track)?);
+    }
+
+    if let Err(error) = validate_recording_output_files(&output_paths) {
+        for path in &output_paths {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+
+    let primary_path = output_paths.first().cloned().unwrap_or(path);
+    Ok(StoppedRecording {
+        source,
+        primary_path,
+        output_paths,
+    })
+}
+
 fn start_recording_from_runtime(app: &AppHandle, state: &RuntimeState) -> Result<String, String> {
     let mut recording = state.recording.lock().map_err(|error| error.to_string())?;
     if recording.is_some() {
-        return Err("录音已经在进行中。".to_string());
+        return Err("Recording is already in progress.".to_string());
     }
+    let recording_source = {
+        let settings = state.settings.lock().map_err(|error| error.to_string())?;
+        settings.recording_source.clone()
+    };
 
-    let session = start_microphone_recording(app)?;
+    let session = start_recording_session(app, &recording_source)?;
     let path = session.path.to_string_lossy().to_string();
     *recording = Some(session);
     emit_recording_state(app, true, Some(path.clone()));
@@ -3144,6 +3790,15 @@ fn emit_recording_state(app: &AppHandle, is_recording: bool, path: Option<String
     let _ = app.emit(
         "recording-state",
         RecordingStateEvent { is_recording, path },
+    );
+}
+
+fn emit_recording_error(app: &AppHandle, message: impl Into<String>) {
+    let _ = app.emit(
+        "recording-error",
+        RecordingErrorEvent {
+            message: message.into(),
+        },
     );
 }
 
@@ -3170,7 +3825,7 @@ fn take_recording_and_settings(
         let mut recording = state.recording.lock().map_err(|error| error.to_string())?;
         recording
             .take()
-            .ok_or_else(|| "当前没有正在进行的录音。".to_string())?
+            .ok_or_else(|| "There is no active recording.".to_string())?
     };
     let settings = {
         let settings = state.settings.lock().map_err(|error| error.to_string())?;
@@ -3180,25 +3835,98 @@ fn take_recording_and_settings(
     Ok((session, settings))
 }
 
+fn recording_mix_filter(input_count: usize) -> String {
+    format!("amix=inputs={input_count}:duration=longest:dropout_transition=0")
+}
+
+fn mix_recording_tracks(app: &AppHandle, paths: &[PathBuf]) -> Result<PathBuf, String> {
+    if paths.len() < 2 {
+        return paths
+            .first()
+            .cloned()
+            .ok_or_else(|| "No recording tracks were available to mix.".to_string());
+    }
+
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
+    let recordings_dir = app_recordings_dir(app)?;
+    let output_path = recordings_dir.join(format!("mixed-{}.wav", unix_timestamp_millis()?));
+
+    let mut command = Command::new(ffmpeg);
+    command.arg("-y");
+    for path in paths {
+        command.arg("-i").arg(path);
+    }
+    command
+        .arg("-filter_complex")
+        .arg(recording_mix_filter(paths.len()))
+        .arg("-vn")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ar")
+        .arg("48000")
+        .arg("-ac")
+        .arg("1")
+        .arg(&output_path);
+    suppress_command_window(&mut command);
+
+    let output = run_command_with_timeout(
+        &mut command,
+        Duration::from_secs(900),
+        "recording track mix",
+    )?;
+    if output.status.success() {
+        return Ok(output_path);
+    }
+
+    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+}
+
+fn prepare_recording_audio(
+    app: &AppHandle,
+    stopped: &mut StoppedRecording,
+) -> Result<PathBuf, String> {
+    if stopped.source == "microphoneAndSystem" && stopped.output_paths.len() >= 2 {
+        let mixed_path = mix_recording_tracks(app, &stopped.output_paths)?;
+        stopped.primary_path = mixed_path.clone();
+        stopped.output_paths.push(mixed_path.clone());
+        return Ok(mixed_path);
+    }
+
+    Ok(stopped.primary_path.clone())
+}
+
 fn finish_recording_with_settings(
     app: AppHandle,
     session: RecordingSession,
     settings: UserSettings,
     paste: bool,
 ) -> Result<TranscribeFileResult, String> {
-    let audio_path = stop_microphone_recording(session)?;
+    let mut stopped = stop_recording_session(session)?;
+    let audio_path = if settings.recording_mode == "audioOnly" {
+        stopped.primary_path.clone()
+    } else {
+        prepare_recording_audio(&app, &mut stopped)?
+    };
     if settings.recording_mode == "audioOnly" {
         let audio_path_text = audio_path.to_string_lossy().to_string();
+        let output_paths = stopped
+            .output_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
         return Ok(TranscribeFileResult {
-            text: format!("录音已保存：{audio_path_text}"),
+            text: format!("Recording saved: {audio_path_text}"),
             output_path: audio_path_text.clone(),
-            output_paths: vec![audio_path_text],
+            output_paths,
             output_files: Vec::new(),
+            segments: Vec::new(),
+            timeline_kind: "estimated".to_string(),
+            source_audio_path: audio_path_text,
         });
     }
 
     if settings.model_dir.trim().is_empty() {
-        return Err("请先在设置里下载并配置离线模型。".to_string());
+        return Err("Download and configure an offline model in Settings first.".to_string());
     }
 
     let result = transcribe_file_with_sherpa(
@@ -3220,7 +3948,9 @@ fn finish_recording_with_settings(
     }
 
     if !settings.save_recordings {
-        let _ = fs::remove_file(audio_path);
+        for path in stopped.output_paths {
+            let _ = fs::remove_file(path);
+        }
     }
 
     Ok(result)
@@ -3237,8 +3967,15 @@ fn finish_recording_async(app: AppHandle, session: RecordingSession, settings: U
             Ok(Ok(result)) => {
                 let _ = app.emit("transcription-result", result);
             }
-            Ok(Err(error)) => eprintln!("global shortcut stop failed: {error}"),
-            Err(error) => eprintln!("global shortcut stop task failed: {error}"),
+            Ok(Err(error)) => {
+                eprintln!("global shortcut stop failed: {error}");
+                emit_recording_error(&app, error);
+            }
+            Err(error) => {
+                let message = format!("Recording stop task failed: {error}");
+                eprintln!("{message}");
+                emit_recording_error(&app, message);
+            }
         }
     });
 }
@@ -3255,6 +3992,7 @@ fn handle_global_shortcut_event(app: &AppHandle, event: ShortcutEvent) {
         ("hold", ShortcutState::Pressed) => {
             if let Err(error) = start_recording_from_runtime(app, state.inner()) {
                 eprintln!("global shortcut start failed: {error}");
+                emit_recording_error(app, error);
             }
         }
         ("hold", ShortcutState::Released) => {
@@ -3272,6 +4010,7 @@ fn handle_global_shortcut_event(app: &AppHandle, event: ShortcutEvent) {
             Err(_) => {
                 if let Err(error) = start_recording_from_runtime(app, state.inner()) {
                     eprintln!("global shortcut toggle start failed: {error}");
+                    emit_recording_error(app, error);
                 }
             }
         },
@@ -3301,8 +4040,8 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "打开 Hi-Voicer", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "鎵撳紑 Hi-Voicer", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
     let Some(icon) = app.default_window_icon() else {
         return Ok(());
@@ -3367,6 +4106,7 @@ fn save_settings(
     app: AppHandle,
     state: State<'_, RuntimeState>,
 ) -> Result<UserSettings, String> {
+    let settings = settings.normalized();
     apply_launch_at_startup(settings.launch_at_startup)?;
     apply_mini_window_visibility(&app, settings.show_mini_window);
     write_settings(&app, &settings)?;
@@ -3477,7 +4217,7 @@ async fn save_existing_file(request: SaveExistingFileRequest) -> Result<Option<S
     tauri::async_runtime::spawn_blocking(move || {
         let source_path = PathBuf::from(&request.source_path);
         if !source_path.exists() {
-            return Err("要导出的文件不存在。".to_string());
+            return Err("The file to export does not exist.".to_string());
         }
 
         if let Some(destination_dir) = request.destination_dir.as_deref() {
@@ -3499,6 +4239,341 @@ async fn save_existing_file(request: SaveExistingFileRequest) -> Result<Option<S
 
         fs::copy(&source_path, &path).map_err(|error| error.to_string())?;
         Ok(Some(path.to_string_lossy().to_string()))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn run_ffmpeg_audio_command(
+    app: &AppHandle,
+    input_path: &Path,
+    output_path: &Path,
+    pre_input_args: &[String],
+    post_input_args: &[String],
+    description: &str,
+) -> Result<(), String> {
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let mut command = Command::new(ffmpeg);
+    command.arg("-y");
+    command.args(pre_input_args.iter().map(String::as_str));
+    command.arg("-i").arg(input_path);
+    command.args(post_input_args.iter().map(String::as_str));
+    command
+        .arg("-vn")
+        .arg("-acodec")
+        .arg("pcm_s16le")
+        .arg("-ar")
+        .arg("48000")
+        .arg("-ac")
+        .arg("1")
+        .arg(output_path);
+    suppress_command_window(&mut command);
+
+    let output = match run_command_with_timeout(&mut command, Duration::from_secs(900), description)
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(output_path);
+            return Err(error);
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(output_path);
+    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+}
+
+fn audio_segment_ffmpeg_args(start_seconds: f64, end_seconds: f64) -> (Vec<String>, Vec<String>) {
+    let start = (start_seconds - 0.15).max(0.0);
+    let end = (end_seconds + 0.15).max(start + 0.1);
+    let duration = (end - start).max(0.1);
+    (
+        vec!["-ss".to_string(), format!("{start:.3}")],
+        vec!["-t".to_string(), format!("{duration:.3}")],
+    )
+}
+
+fn clean_optional_path(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn output_dir_near_source(
+    source_path: &Path,
+    destination_dir: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(destination_dir) = clean_optional_path(destination_dir) {
+        return Ok(PathBuf::from(destination_dir));
+    }
+
+    if let Some(parent) = source_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    std::env::current_dir().map_err(|error| error.to_string())
+}
+
+fn safe_output_file_name(suggested_name: Option<&str>, fallback: String) -> String {
+    clean_optional_path(suggested_name)
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or(fallback)
+}
+
+fn audio_segment_output_path(
+    source_path: &Path,
+    destination_dir: Option<&str>,
+    suggested_name: Option<&str>,
+    timestamp: u128,
+) -> Result<PathBuf, String> {
+    let stem = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("segment");
+    let file_name =
+        safe_output_file_name(suggested_name, format!("{stem}-segment-{timestamp}.wav"));
+    Ok(output_dir_near_source(source_path, destination_dir)?.join(file_name))
+}
+
+fn processed_audio_output_path(
+    input_path: &Path,
+    preset_slug: &str,
+    destination_dir: Option<&str>,
+    timestamp: u128,
+) -> Result<PathBuf, String> {
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    Ok(output_dir_near_source(input_path, destination_dir)?
+        .join(format!("{stem}-{preset_slug}-{timestamp}.wav")))
+}
+
+fn is_supported_audio_input(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .as_deref(),
+        Some("wav")
+            | Some("mp3")
+            | Some("m4a")
+            | Some("aac")
+            | Some("flac")
+            | Some("ogg")
+            | Some("opus")
+            | Some("wma")
+            | Some("mp4")
+            | Some("mov")
+            | Some("mkv")
+            | Some("webm")
+            | Some("avi")
+    )
+}
+
+fn collect_supported_audio_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    if !directory.is_dir() {
+        return Err("Selected path is not a folder.".to_string());
+    }
+
+    let mut files = Vec::new();
+    let mut child_dirs = Vec::new();
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            child_dirs.push(path);
+        } else if path.is_file() && is_supported_audio_input(&path) {
+            files.push(path);
+        }
+    }
+
+    for child_dir in child_dirs {
+        files.extend(collect_supported_audio_files(&child_dir)?);
+    }
+
+    Ok(files)
+}
+
+fn audio_preview_file_name(source_path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    source_path.to_string_lossy().hash(&mut hasher);
+    let hash = hasher.finish();
+    let file_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("audio-preview.wav");
+    format!("{hash:016x}-{file_name}")
+}
+
+fn prepare_audio_preview_in_dir(source_path: &Path, cache_root: &Path) -> Result<PathBuf, String> {
+    if !source_path.is_file() {
+        return Err("Preview audio file does not exist.".to_string());
+    }
+    if !is_supported_audio_input(source_path) {
+        return Err("Preview file is not a supported audio or video format.".to_string());
+    }
+
+    let preview_dir = cache_root.join("audio-previews");
+    fs::create_dir_all(&preview_dir).map_err(|error| error.to_string())?;
+    let preview_path = preview_dir.join(audio_preview_file_name(source_path));
+    fs::copy(source_path, &preview_path).map_err(|error| error.to_string())?;
+    Ok(preview_path)
+}
+
+#[tauri::command]
+async fn prepare_audio_preview(
+    app: AppHandle,
+    request: AudioPreviewRequest,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+        prepare_audio_preview_in_dir(&PathBuf::from(request.audio_path), &cache_root)
+            .map(|path| path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn export_audio_segment(
+    app: AppHandle,
+    request: ExportAudioSegmentRequest,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_path = PathBuf::from(&request.source_audio_path);
+        if !source_path.exists() {
+            return Err("Source audio file does not exist.".to_string());
+        }
+
+        let output_path = audio_segment_output_path(
+            &source_path,
+            request.destination_dir.as_deref(),
+            request.suggested_name.as_deref(),
+            unix_timestamp_millis()?,
+        )?;
+        let (pre_input_args, post_input_args) =
+            audio_segment_ffmpeg_args(request.start_seconds, request.end_seconds);
+
+        run_ffmpeg_audio_command(
+            &app,
+            &source_path,
+            &output_path,
+            &pre_input_args,
+            &post_input_args,
+            "audio segment export",
+        )?;
+        Ok(output_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_audio_files_in_directory(
+    request: ListAudioFilesInDirectoryRequest,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        collect_supported_audio_files(&PathBuf::from(request.directory_path)).map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().to_string())
+                .collect()
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn audio_filter_chain(options: &AudioProcessingOptions) -> String {
+    let mut filters = Vec::new();
+
+    if options.trim_silence {
+        filters.push("silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.2:stop_periods=1:stop_threshold=-45dB:stop_silence=0.3");
+    }
+    if options.voice_filter {
+        filters.push("highpass=f=80");
+        filters.push("lowpass=f=7800");
+    }
+    if options.hum_reduction {
+        filters.push("equalizer=f=50:t=q:w=1:g=-18");
+        filters.push("equalizer=f=60:t=q:w=1:g=-18");
+        filters.push("equalizer=f=100:t=q:w=1:g=-10");
+        filters.push("equalizer=f=120:t=q:w=1:g=-10");
+    }
+    if options.noise_reduction {
+        filters.push("afftdn=nf=-25");
+    }
+    if options.normalize {
+        filters.push("loudnorm=I=-16:TP=-1.5:LRA=11");
+    }
+
+    if filters.is_empty() {
+        "anull".to_string()
+    } else {
+        filters.join(",")
+    }
+}
+
+fn audio_processing_preset_slug(preset: &str) -> Result<&'static str, String> {
+    match preset {
+        "normalize" => Ok("normalize"),
+        "trimSilence" => Ok("trim-silence"),
+        "voiceBasic" => Ok("voice-basic"),
+        "humReduction" => Ok("hum-reduction"),
+        "lowHighPass" => Ok("low-high-pass"),
+        other => Err(format!("Unsupported audio processing preset: {other}")),
+    }
+}
+
+#[tauri::command]
+async fn process_audio_file(
+    app: AppHandle,
+    request: ProcessAudioFileRequest,
+) -> Result<AudioProcessingResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let input_path = PathBuf::from(&request.audio_path);
+        if !input_path.exists() {
+            return Err("Audio file does not exist.".to_string());
+        }
+
+        let preset_slug = audio_processing_preset_slug(&request.options.preset)?;
+        let output_path = processed_audio_output_path(
+            &input_path,
+            preset_slug,
+            request.destination_dir.as_deref(),
+            unix_timestamp_millis()?,
+        )?;
+        let filter = audio_filter_chain(&request.options);
+        let args = vec!["-af".to_string(), filter];
+
+        run_ffmpeg_audio_command(
+            &app,
+            &input_path,
+            &output_path,
+            &[],
+            &args,
+            "audio processing",
+        )?;
+        Ok(AudioProcessingResult {
+            output_path: output_path.to_string_lossy().to_string(),
+            message: "Audio processing complete".to_string(),
+        })
     })
     .await
     .map_err(|error| error.to_string())?
@@ -3547,6 +4622,11 @@ async fn run_acceleration_smoke_test(
     tauri::async_runtime::spawn_blocking(move || run_acceleration_smoke_test_inner(app, request))
         .await
         .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn get_native_audio_diagnostics(app: AppHandle) -> NativeAudioDiagnostics {
+    native_audio_diagnostics(&app)
 }
 
 #[tauri::command]
@@ -3616,11 +4696,16 @@ pub fn run() {
             open_recordings_dir,
             save_text_file,
             save_existing_file,
+            prepare_audio_preview,
+            export_audio_segment,
+            list_audio_files_in_directory,
+            process_audio_file,
             transcribe_file,
             validate_model_dir,
             get_acceleration_status,
             prepare_acceleration_runtime,
             run_acceleration_smoke_test,
+            get_native_audio_diagnostics,
             start_recording,
             stop_recording
         ])
@@ -3720,31 +4805,61 @@ mod tests {
     }
 
     #[test]
+    fn user_settings_normalization_rejects_invalid_runtime_modes() {
+        let settings = UserSettings {
+            shortcut: String::new(),
+            selected_model_id: String::new(),
+            paste_mode: "bad".to_string(),
+            recording_mode: "bad".to_string(),
+            recording_source: "speakers".to_string(),
+            acceleration_mode: "gpu".to_string(),
+            export_format: "xml".to_string(),
+            theme: "blue".to_string(),
+            term_categories: Vec::new(),
+            ..UserSettings::default()
+        }
+        .normalized();
+
+        assert_eq!(settings.shortcut, "CapsLock");
+        assert_eq!(settings.selected_model_id, "sensevoice-small");
+        assert_eq!(settings.paste_mode, "clipboard");
+        assert_eq!(settings.recording_mode, "hold");
+        assert_eq!(settings.recording_source, "microphone");
+        assert_eq!(settings.acceleration_mode, "cpu");
+        assert_eq!(settings.export_format, "plainText");
+        assert_eq!(settings.theme, "light");
+        assert!(!settings.term_categories.is_empty());
+    }
+
+    #[test]
     fn applies_enabled_hotword_replacements_longest_first() {
         let rules = vec![
             HotwordRule {
                 id: "short".to_string(),
-                source: "陶瑞".to_string(),
+                source: "tao".to_string(),
                 target: "Tauri".to_string(),
                 enabled: true,
+                ..Default::default()
             },
             HotwordRule {
                 id: "long".to_string(),
-                source: "陶瑞应用".to_string(),
-                target: "Tauri 应用".to_string(),
+                source: "tao app".to_string(),
+                target: "Tauri app".to_string(),
                 enabled: true,
+                ..Default::default()
             },
             HotwordRule {
                 id: "disabled".to_string(),
-                source: "不会替换".to_string(),
+                source: "disabled term".to_string(),
                 target: "SHOULD_NOT_APPEAR".to_string(),
                 enabled: false,
+                ..Default::default()
             },
         ];
 
         assert_eq!(
-            apply_hotwords("陶瑞应用，不会替换。", &rules),
-            "Tauri 应用，不会替换。"
+            apply_hotwords("tao app, disabled term", &rules),
+            "Tauri app, disabled term"
         );
     }
 
@@ -3777,7 +4892,7 @@ mod tests {
 
         assert_eq!(status.selected_mode, "cuda");
         assert_eq!(status.effective_mode, "cpu");
-        assert!(status.message.contains("回退 CPU"));
+        assert!(status.message.contains("CPU"));
     }
 
     #[test]
@@ -3797,6 +4912,25 @@ mod tests {
         assert!(status.cuda_runtime_installed);
         assert!(status.cuda_device_summary.is_some());
         assert!(status.message.contains("CUDA"));
+    }
+
+    #[test]
+    fn acceleration_status_uses_cpu_when_cuda_runtime_is_not_prepared() {
+        let status = acceleration_status_from_parts(
+            "cuda",
+            true,
+            Some("RTX 4090 / driver 555.85 / VRAM 24564 MB".to_string()),
+            None,
+            true,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(status.selected_mode, "cuda");
+        assert_eq!(status.effective_mode, "cpu");
+        assert!(!status.cuda_runtime_installed);
+        assert!(status.message.contains("not prepared"));
     }
 
     #[test]
@@ -3834,7 +4968,7 @@ mod tests {
             status.cuda_disabled_reason.as_deref(),
             Some("driver mismatch")
         );
-        assert!(status.message.contains("本次会话已停用"));
+        assert!(status.message.contains("disabled for this session"));
     }
 
     #[test]
@@ -4023,9 +5157,9 @@ mod tests {
 
     #[test]
     fn extracts_text_from_sherpa_json_output() {
-        let output = r#"{"lang":"<|zh|>","text":"你好，测试成功。"}"#;
+        let output = r#"{"lang":"<|zh|>","text":"hello, test passed"}"#;
 
-        assert_eq!(extract_transcription_text(output), "你好，测试成功。");
+        assert_eq!(extract_transcription_text(output), "hello, test passed");
     }
 
     #[test]
@@ -4062,13 +5196,13 @@ Elapsed seconds: 0.16
 Started
 {
   "language": "zh",
-  "text": "这是音频里的文字",
-  "tokens": ["这是", "音频", "里", "的", "文字"]
+  "text": "text from audio",
+  "tokens": ["text", "from", "audio"]
 }
 Elapsed seconds: 0.16
 "#;
 
-        assert_eq!(extract_transcription_text(output), "这是音频里的文字");
+        assert_eq!(extract_transcription_text(output), "text from audio");
     }
 
     #[test]
@@ -4146,10 +5280,17 @@ Elapsed seconds: 0.16
         let sherpa_audio = root.join("sample-16k.wav");
         fs::write(&source_audio, b"source").expect("write source");
         write_test_wav(&sherpa_audio);
+        let segments = build_transcript_segments("hello", 1.0, &source_audio);
 
-        let (primary, outputs, files) =
-            write_transcription_outputs(&root, "plainText", &source_audio, &sherpa_audio, "hello")
-                .expect("outputs");
+        let (primary, outputs, files) = write_transcription_outputs(
+            &root,
+            "plainText",
+            &source_audio,
+            &sherpa_audio,
+            "hello",
+            &segments,
+        )
+        .expect("outputs");
 
         assert_eq!(outputs.len(), 3);
         assert_eq!(files.len(), 3);
@@ -4165,6 +5306,7 @@ Elapsed seconds: 0.16
         let sherpa_audio = root.join("sample-16k.wav");
         fs::write(&source_audio, b"source").expect("write source");
         write_test_wav(&sherpa_audio);
+        let segments = build_transcript_segments("hello", 1.0, &source_audio);
 
         let (primary, outputs, files) = write_transcription_outputs(
             &root,
@@ -4172,6 +5314,7 @@ Elapsed seconds: 0.16
             &source_audio,
             &sherpa_audio,
             "hello",
+            &segments,
         )
         .expect("outputs");
 
@@ -4196,6 +5339,273 @@ Elapsed seconds: 0.16
     #[test]
     fn formats_timeline_timestamp_as_davinci_timecode() {
         assert_eq!(format_timeline_timestamp(80.5), "00:01:20:12");
+    }
+
+    #[test]
+    fn audio_segment_args_keep_seek_before_input_and_duration_after_input() {
+        let (pre_input_args, post_input_args) = audio_segment_ffmpeg_args(1.0, 2.0);
+
+        assert_eq!(pre_input_args, vec!["-ss".to_string(), "0.850".to_string()]);
+        assert_eq!(post_input_args, vec!["-t".to_string(), "1.300".to_string()]);
+
+        let (pre_input_args, post_input_args) = audio_segment_ffmpeg_args(0.05, 0.1);
+        assert_eq!(pre_input_args, vec!["-ss".to_string(), "0.000".to_string()]);
+        assert_eq!(post_input_args, vec!["-t".to_string(), "0.250".to_string()]);
+    }
+
+    #[test]
+    fn audio_segment_output_defaults_next_to_source_audio() {
+        let source = PathBuf::from(r"C:\Recordings\demo.wav");
+        let output = audio_segment_output_path(&source, None, Some("demo-segment-001.wav"), 1234)
+            .expect("output path");
+
+        assert_eq!(output, PathBuf::from(r"C:\Recordings\demo-segment-001.wav"));
+    }
+
+    #[test]
+    fn processed_audio_output_uses_custom_directory_when_provided() {
+        let input = PathBuf::from(r"C:\Recordings\voice.wav");
+        let output =
+            processed_audio_output_path(&input, "voice-basic", Some(r"D:\Processed"), 1234)
+                .expect("output path");
+
+        assert_eq!(
+            output,
+            PathBuf::from(r"D:\Processed\voice-voice-basic-1234.wav")
+        );
+    }
+
+    #[test]
+    fn collects_supported_audio_files_from_directory_recursively() {
+        let root = test_root("collects-supported-audio-files-from-directory-recursively");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        fs::write(root.join("voice.wav"), b"wav").expect("write wav");
+        fs::write(nested.join("meeting.mp3"), b"mp3").expect("write mp3");
+        fs::write(root.join("notes.txt"), b"text").expect("write text");
+
+        let files = collect_supported_audio_files(&root).expect("collect files");
+
+        assert_eq!(
+            files,
+            vec![root.join("voice.wav"), nested.join("meeting.mp3")]
+        );
+    }
+
+    #[test]
+    fn prepare_audio_preview_copies_file_into_cache_dir() {
+        let root = test_root("prepare-audio-preview-copies-file-into-cache-dir");
+        let source = root.join("source").join("voice.wav");
+        let cache = root.join("cache");
+        fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
+        fs::write(&source, b"wav bytes").expect("write source wav");
+
+        let preview = prepare_audio_preview_in_dir(&source, &cache).expect("prepare preview");
+
+        assert!(preview.starts_with(cache.join("audio-previews")));
+        assert!(preview
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("preview file name")
+            .ends_with("-voice.wav"));
+        assert_eq!(fs::read(&preview).expect("read preview"), b"wav bytes");
+    }
+
+    #[test]
+    fn prepare_audio_preview_rejects_missing_file() {
+        let root = test_root("prepare-audio-preview-rejects-missing-file");
+        let error = prepare_audio_preview_in_dir(&root.join("missing.wav"), &root.join("cache"))
+            .expect_err("missing source should fail");
+
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn recording_mix_filter_does_not_amplify_tracks() {
+        let filter = recording_mix_filter(2);
+
+        assert_eq!(
+            filter,
+            "amix=inputs=2:duration=longest:dropout_transition=0"
+        );
+        assert!(!filter.contains("volume="));
+    }
+
+    #[test]
+    fn audio_config_detail_includes_sample_rate_channels_and_format() {
+        let config = cpal::SupportedStreamConfig::new(
+            1,
+            cpal::SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::F32,
+        );
+
+        let detail = audio_config_detail(&config);
+
+        assert!(detail.contains("48000 Hz"));
+        assert!(detail.contains("1 channel"));
+        assert!(detail.contains("F32"));
+    }
+
+    #[test]
+    fn system_audio_diagnostic_detail_marks_loopback_as_runtime_verified() {
+        let config = cpal::SupportedStreamConfig::new(
+            2,
+            cpal::SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            cpal::SampleFormat::F32,
+        );
+
+        let detail = system_audio_diagnostic_detail(&config);
+
+        assert!(detail.contains("48000 Hz"));
+        assert!(detail.contains("WASAPI loopback"));
+        assert!(detail.contains("verified when recording starts"));
+    }
+
+    #[test]
+    fn ffmpeg_search_roots_include_offline_locations() {
+        let data_dir = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");
+        let resource_dir = PathBuf::from(r"C:\Program Files\Hi-Voicer");
+        let executable_dir = PathBuf::from(r"C:\Portable\Hi-Voicer");
+
+        let roots =
+            ffmpeg_runtime_search_roots(&data_dir, Some(&resource_dir), Some(&executable_dir));
+
+        assert!(roots.contains(&PathBuf::from(
+            r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\ffmpeg"
+        )));
+        assert!(roots.contains(&PathBuf::from(r"C:\Program Files\Hi-Voicer\engines\ffmpeg")));
+        assert!(roots.contains(&PathBuf::from(r"C:\Program Files\Hi-Voicer\ffmpeg")));
+        assert!(roots.contains(&PathBuf::from(r"C:\Portable\Hi-Voicer\engines\ffmpeg")));
+    }
+
+    #[test]
+    fn finds_ffmpeg_recursively_without_installing() {
+        let root = test_root("finds-ffmpeg-recursively-without-installing");
+        let ffmpeg_dir = root.join("engines").join("ffmpeg").join("bin");
+        fs::create_dir_all(&ffmpeg_dir).expect("create ffmpeg dir");
+        let ffmpeg_path = ffmpeg_dir.join("ffmpeg.exe");
+        fs::write(&ffmpeg_path, b"exe").expect("write ffmpeg");
+
+        let found = find_ffmpeg_in_roots(&[root.join("engines").join("ffmpeg")])
+            .expect("lookup")
+            .expect("ffmpeg");
+
+        assert_eq!(found, ffmpeg_path);
+    }
+
+    #[test]
+    fn missing_ffmpeg_message_is_offline_first() {
+        let message = ffmpeg_missing_message();
+
+        assert!(message.contains("offline audio"));
+        assert!(message.contains("will not download"));
+        assert!(message.contains("ffmpeg.exe"));
+    }
+
+    #[test]
+    fn missing_ffmpeg_detail_includes_actionable_search_locations() {
+        let roots = vec![
+            PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\ffmpeg"),
+            PathBuf::from(r"C:\Program Files\Hi-Voicer\engines\ffmpeg"),
+        ];
+
+        let detail = ffmpeg_missing_detail(&roots);
+
+        assert!(detail.contains("ffmpeg.exe was not found"));
+        assert!(detail.contains(r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\ffmpeg"));
+        assert!(detail.contains(r"C:\Program Files\Hi-Voicer\engines\ffmpeg"));
+        assert!(detail.contains("PATH"));
+        assert!(detail.contains("will not download"));
+    }
+
+    #[test]
+    fn audio_processing_preset_slug_only_accepts_known_presets() {
+        assert_eq!(
+            audio_processing_preset_slug("voiceBasic").expect("preset"),
+            "voice-basic"
+        );
+        assert_eq!(
+            audio_processing_preset_slug("trimSilence").expect("preset"),
+            "trim-silence"
+        );
+        assert!(audio_processing_preset_slug("../bad").is_err());
+    }
+
+    #[test]
+    fn transcript_chunks_keep_leading_punctuation_with_previous_line() {
+        let chunks = split_text_into_chunks("第一句话。，第二句话继续说完。");
+
+        assert_eq!(chunks, vec!["第一句话。，", "第二句话继续说完。"]);
+        assert!(!chunks.iter().any(|chunk| chunk.starts_with('，')));
+    }
+
+    #[test]
+    fn transcript_chunks_prefer_sentence_breaks_before_hard_limits() {
+        let text = "这是第一句完整的话。这是一个比较长的句子，里面有逗号，可以在需要的时候拆开，但不应该把标点放到下一行开头。";
+        let chunks = split_text_into_chunks(text);
+
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks[0], "这是第一句完整的话。");
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.starts_with('，') || chunk.starts_with('。') || chunk.starts_with('、')
+        }));
+    }
+
+    #[test]
+    fn transcript_segments_have_monotonic_non_overlapping_estimated_times() {
+        let source_audio = PathBuf::from("source.wav");
+        let segments = build_transcript_segments(
+            "a? this is a much longer subtitle segment with many words? z?",
+            1.0,
+            &source_audio,
+        );
+
+        assert!(segments.len() >= 3);
+        for pair in segments.windows(2) {
+            assert!(pair[0].end <= pair[1].start);
+            assert!(pair[0].end > pair[0].start);
+        }
+        assert_eq!(segments.first().expect("first").start, 0.0);
+        assert!(segments.last().expect("last").end >= 1.5);
+    }
+
+    #[test]
+    fn transcript_segments_handle_non_finite_estimated_duration() {
+        let source_audio = PathBuf::from("source.wav");
+        let segments = build_transcript_segments("hello? world?", f64::NAN, &source_audio);
+
+        assert_eq!(segments.len(), 2);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.start.is_finite() && segment.end.is_finite()));
+        assert_eq!(segments[0].start, 0.0);
+        assert!(segments[0].end <= segments[1].start);
+    }
+
+    #[test]
+    fn transcript_segments_preserve_transcription_chunk_boundaries() {
+        let source_audio = PathBuf::from("source.wav");
+        let transcript_chunks = vec![
+            TranscriptTextChunk {
+                text: "short.".to_string(),
+                start: 0.0,
+                end: 60.0,
+            },
+            TranscriptTextChunk {
+                text: "this chunk has much more spoken text and should still start at one minute."
+                    .to_string(),
+                start: 60.0,
+                end: 120.0,
+            },
+        ];
+
+        let segments = build_transcript_segments_from_chunks(&transcript_chunks, &source_audio);
+
+        assert_eq!(segments[0].start, 0.0);
+        assert!(segments.iter().any(|segment| (segment.start - 60.0).abs() < 0.001));
+        assert_eq!(segments.last().expect("last").end, 120.0);
     }
 
     #[test]
@@ -4271,9 +5681,30 @@ Elapsed seconds: 0.16
 
         assert_eq!(chunks.len(), 3);
         for chunk in chunks {
-            let duration = wav_duration_seconds(&chunk).expect("duration");
+            let duration = wav_duration_seconds(&chunk.path).expect("duration");
             assert!((duration - 1.0).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn recording_output_validation_accepts_usable_wav() {
+        let root = test_root("recording-output-validation-accepts-usable-wav");
+        let wav_path = root.join("voice.wav");
+        write_test_wav_seconds(&wav_path, 1);
+
+        validate_recording_output_file(&wav_path).expect("valid recording");
+    }
+
+    #[test]
+    fn recording_output_validation_rejects_empty_wav() {
+        let root = test_root("recording-output-validation-rejects-empty-wav");
+        let wav_path = root.join("empty.wav");
+        write_test_wav_seconds(&wav_path, 0);
+
+        let error = validate_recording_output_files(&[wav_path]).expect_err("empty recording");
+
+        assert!(error.contains("Recording did not contain usable audio"));
+        assert!(error.contains("too short or empty"));
     }
 
     fn write_test_wav(path: &Path) {
