@@ -2,7 +2,7 @@
 
 Hi-Voicer 是一个本地离线中文语音输入和文件转录桌面软件。当前版本参考 CapsWriter-Offline / ime_audio 的本地 ASR 思路，优先走 Sherpa-ONNX CPU 稳定路线：软件负责录音、转码、调用本地模型、把结果粘贴上屏或保存为文本文件。
 
-<img width="1919" height="976" alt="屏幕截图 2026-06-01 181536" src="https://github.com/user-attachments/assets/de738e7b-8eea-48ee-afd5-83bfb2bdffbf" /><img width="1919" height="986" alt="屏幕截图 2026-06-01 181705" src="https://github.com/user-attachments/assets/dac9f8ca-6187-451a-90af-d1f4dbc42e32" />
+<img width="1919" height="976" alt="屏幕截图 2026-06-01 181536" src="https://github.com/user-attachments/assets/de738e7b-8eea-48ee-afd5-83bfb2bdffbf" />
 
 ## 普通用户怎么用
 
