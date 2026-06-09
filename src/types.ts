@@ -17,6 +17,8 @@ export type ThemeMode = "light" | "dark";
 export type TranscriptionPerformanceMode = "stable" | "balanced" | "fast";
 export type TimelineKind = "estimated" | "model";
 export type AudioProcessingPreset = "normalize" | "trimSilence" | "voiceBasic" | "humReduction" | "lowHighPass";
+export type AudioOutputFormat = "wav" | "mp3" | "m4a" | "aac" | "flac" | "ogg" | "opus";
+export type AudioMergeMode = "copy" | "reencode";
 
 export interface AppStatus {
   readiness: ReadinessState;
@@ -149,6 +151,18 @@ export interface AudioProcessingOptions {
 
 export interface AudioProcessingResult {
   outputPath: string;
+  message: string;
+}
+
+export interface ProbeMediaFrameRateResult {
+  fps: number;
+  source: "video" | "fallback";
+  message: string;
+}
+
+export interface AudioWaveformResult {
+  waveformPath: string;
+  durationSeconds: number;
   message: string;
 }
 

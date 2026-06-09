@@ -5,12 +5,16 @@ import { open as openUrl } from "@tauri-apps/plugin-shell";
 import type {
   AccelerationStatus,
   AccelerationSmokeTestResult,
+  AudioMergeMode,
+  AudioOutputFormat,
   AudioProcessingOptions,
   AudioProcessingResult,
+  AudioWaveformResult,
   ModelInstallProgress,
   ModelPreset,
   ModelValidationResult,
   NativeAudioDiagnostics,
+  ProbeMediaFrameRateResult,
   TranscriptionPerformanceMode,
   TranscriptionProgress,
   TranscribeFileResult,
@@ -158,6 +162,14 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 export async function openRecordingsFolder(): Promise<string> {
   return await invoke<string>("open_recordings_dir");
+}
+
+export async function openOutputFolder(path: string): Promise<string> {
+  return await invoke<string>("open_path_dir", {
+    request: {
+      path,
+    },
+  });
 }
 
 export async function saveTextFile(suggestedName: string, contents: string): Promise<string | null> {
@@ -406,6 +418,108 @@ export async function exportAudioSegment(
       sourceAudioPath,
       startSeconds,
       endSeconds,
+      destinationDir: options.destinationDir,
+      suggestedName: options.suggestedName,
+    },
+  });
+}
+
+export async function probeMediaFrameRate(mediaPath: string): Promise<ProbeMediaFrameRateResult> {
+  return await invoke<ProbeMediaFrameRateResult>("probe_media_frame_rate", {
+    request: {
+      mediaPath,
+    },
+  });
+}
+
+export async function prepareAudioWaveform(mediaPath: string, options: { width?: number; height?: number } = {}): Promise<AudioWaveformResult> {
+  return await invoke<AudioWaveformResult>("prepare_audio_waveform", {
+    request: {
+      mediaPath,
+      width: options.width,
+      height: options.height,
+    },
+  });
+}
+
+export async function convertAudioFile(
+  audioPath: string,
+  outputFormat: AudioOutputFormat,
+  options: { destinationDir?: string } = {},
+): Promise<AudioProcessingResult> {
+  return await invoke<AudioProcessingResult>("convert_audio_file", {
+    request: {
+      audioPath,
+      outputFormat,
+      destinationDir: options.destinationDir,
+    },
+  });
+}
+
+export async function clipAudioSegment(
+  sourceAudioPath: string,
+  startSeconds: number,
+  endSeconds: number,
+  outputFormat: AudioOutputFormat,
+  options: { destinationDir?: string; suggestedName?: string } = {},
+): Promise<string> {
+  return await invoke<string>("clip_audio_segment", {
+    request: {
+      sourceAudioPath,
+      startSeconds,
+      endSeconds,
+      outputFormat,
+      destinationDir: options.destinationDir,
+      suggestedName: options.suggestedName,
+    },
+  });
+}
+
+export async function clipAudioSegments(
+  sourceAudioPath: string,
+  segments: Array<{ startSeconds: number; endSeconds: number; suggestedName?: string }>,
+  outputFormat: AudioOutputFormat,
+  options: { destinationDir?: string; mergeSegments?: boolean; suggestedName?: string } = {},
+): Promise<string[]> {
+  return await invoke<string[]>("clip_audio_segments", {
+    request: {
+      sourceAudioPath,
+      segments,
+      outputFormat,
+      destinationDir: options.destinationDir,
+      mergeSegments: options.mergeSegments ?? false,
+      suggestedName: options.suggestedName,
+    },
+  });
+}
+
+export async function splitAudioFile(
+  sourceAudioPath: string,
+  segmentSeconds: number,
+  outputFormat: AudioOutputFormat,
+  options: { destinationDir?: string } = {},
+): Promise<string[]> {
+  return await invoke<string[]>("split_audio_file", {
+    request: {
+      sourceAudioPath,
+      segmentSeconds,
+      outputFormat,
+      destinationDir: options.destinationDir,
+    },
+  });
+}
+
+export async function mergeAudioFiles(
+  audioPaths: string[],
+  mode: AudioMergeMode,
+  outputFormat: AudioOutputFormat,
+  options: { destinationDir?: string; suggestedName?: string } = {},
+): Promise<string> {
+  return await invoke<string>("merge_audio_files", {
+    request: {
+      audioPaths,
+      mode,
+      outputFormat,
       destinationDir: options.destinationDir,
       suggestedName: options.suggestedName,
     },

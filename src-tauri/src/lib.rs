@@ -438,6 +438,99 @@ struct AudioPreviewRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct OpenPathDirRequest {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeMediaFrameRateRequest {
+    media_path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProbeMediaFrameRateResult {
+    fps: f64,
+    source: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWaveformRequest {
+    media_path: String,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioWaveformResult {
+    waveform_path: String,
+    duration_seconds: f64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConvertAudioFileRequest {
+    audio_path: String,
+    output_format: String,
+    destination_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipAudioSegmentRequest {
+    source_audio_path: String,
+    start_seconds: f64,
+    end_seconds: f64,
+    output_format: String,
+    destination_dir: Option<String>,
+    suggested_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipAudioSegmentSpec {
+    start_seconds: f64,
+    end_seconds: f64,
+    suggested_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipAudioSegmentsRequest {
+    source_audio_path: String,
+    segments: Vec<ClipAudioSegmentSpec>,
+    output_format: String,
+    destination_dir: Option<String>,
+    merge_segments: bool,
+    suggested_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SplitAudioFileRequest {
+    source_audio_path: String,
+    segment_seconds: f64,
+    output_format: String,
+    destination_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeAudioFilesRequest {
+    audio_paths: Vec<String>,
+    mode: String,
+    output_format: String,
+    destination_dir: Option<String>,
+    suggested_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AudioProcessingOptions {
     preset: String,
     normalize: bool,
@@ -1146,6 +1239,52 @@ fn installed_ffmpeg_runtime(app: &AppHandle) -> Result<Option<PathBuf>, String> 
     }
 
     Ok(system_ffmpeg_path())
+}
+
+fn system_ffprobe_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("where");
+        command.arg("ffprobe");
+        command
+    };
+
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("which");
+        command.arg("ffprobe");
+        command
+    };
+
+    let output =
+        run_command_with_timeout(&mut command, Duration::from_secs(5), "ffprobe lookup").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
+fn resolve_ffprobe_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
+    if let Some(parent) = ffmpeg.parent() {
+        let adjacent = parent.join(if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        if adjacent.exists() {
+            return Ok(adjacent);
+        }
+    }
+
+    system_ffprobe_path().ok_or_else(|| {
+        "ffprobe was not found. Frame-rate detection will fall back to 25fps unless ffprobe is installed next to ffmpeg or on PATH.".to_string()
+    })
 }
 
 fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<String, String> {
@@ -4040,8 +4179,14 @@ fn show_main_window(app: &AppHandle) {
 }
 
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
-    let show_item = MenuItem::with_id(app, "show", "鎵撳紑 Hi-Voicer", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(
+        app,
+        "show",
+        "\u{6253}\u{5f00} Hi-Voicer",
+        true,
+        None::<&str>,
+    )?;
+    let quit_item = MenuItem::with_id(app, "quit", "\u{9000}\u{51fa}", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
     let Some(icon) = app.default_window_icon() else {
         return Ok(());
@@ -4150,7 +4295,8 @@ async fn select_audio_files() -> Result<Vec<String>, String> {
             .add_filter(
                 "Audio and Video",
                 &[
-                    "wav", "mp3", "m4a", "aac", "flac", "ogg", "mp4", "mkv", "mov", "webm",
+                    "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "mp4", "mkv",
+                    "mov", "webm", "avi",
                 ],
             )
             .pick_files()
@@ -4193,6 +4339,55 @@ fn open_recordings_dir(app: AppHandle) -> Result<String, String> {
     }
 
     Ok(dir_text)
+}
+
+#[tauri::command]
+fn open_path_dir(request: OpenPathDirRequest) -> Result<String, String> {
+    let requested_path = PathBuf::from(request.path.trim());
+    if request.path.trim().is_empty() {
+        return Err("Output path is empty.".to_string());
+    }
+
+    let dir = if requested_path.is_dir() {
+        requested_path.clone()
+    } else {
+        requested_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| requested_path.clone())
+    };
+    if !dir.exists() {
+        return Err(format!("Output directory does not exist: {}", dir.display()));
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("explorer");
+        if requested_path.is_file() {
+            command.arg(format!("/select,{}", requested_path.display()));
+        } else {
+            command.arg(&dir);
+        }
+        command.spawn().map_err(|error| error.to_string())?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|error| error.to_string())?;
+    }
+
+    Ok(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -4358,6 +4553,114 @@ fn processed_audio_output_path(
         .join(format!("{stem}-{preset_slug}-{timestamp}.wav")))
 }
 
+fn audio_output_extension(format: &str) -> Result<&'static str, String> {
+    match format {
+        "wav" => Ok("wav"),
+        "mp3" => Ok("mp3"),
+        "m4a" => Ok("m4a"),
+        "aac" => Ok("aac"),
+        "flac" => Ok("flac"),
+        "ogg" => Ok("ogg"),
+        "opus" => Ok("opus"),
+        other => Err(format!("Unsupported output format: {other}")),
+    }
+}
+
+fn audio_output_codec_args(format: &str, stream_copy: bool) -> Result<Vec<String>, String> {
+    if stream_copy {
+        return Ok(vec!["-vn".to_string(), "-c:a".to_string(), "copy".to_string()]);
+    }
+
+    let args = match audio_output_extension(format)? {
+        "wav" => vec![
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "1",
+        ],
+        "mp3" => vec!["-vn", "-acodec", "libmp3lame", "-b:a", "192k"],
+        "m4a" | "aac" => vec!["-vn", "-acodec", "aac", "-b:a", "192k"],
+        "flac" => vec!["-vn", "-acodec", "flac"],
+        "ogg" => vec!["-vn", "-acodec", "libvorbis", "-q:a", "5"],
+        "opus" => vec!["-vn", "-acodec", "libopus", "-b:a", "128k"],
+        _ => unreachable!(),
+    };
+
+    Ok(args.into_iter().map(ToOwned::to_owned).collect())
+}
+
+fn audio_tool_output_path(
+    input_path: &Path,
+    suffix: &str,
+    output_format: &str,
+    destination_dir: Option<&str>,
+    timestamp: u128,
+    suggested_name: Option<&str>,
+) -> Result<PathBuf, String> {
+    let extension = audio_output_extension(output_format)?;
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    let fallback = format!("{stem}-{suffix}-{timestamp}.{extension}");
+    let mut file_name = safe_output_file_name(suggested_name, fallback);
+    if Path::new(&file_name).extension().is_some() {
+        file_name = Path::new(&file_name)
+            .with_extension(extension)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&file_name)
+            .to_string();
+    } else {
+        file_name.push('.');
+        file_name.push_str(extension);
+    }
+    Ok(output_dir_near_source(input_path, destination_dir)?.join(file_name))
+}
+
+fn run_ffmpeg_general_command(
+    app: &AppHandle,
+    input_path: &Path,
+    output_path: &Path,
+    pre_input_args: &[String],
+    post_input_args: &[String],
+    output_format: &str,
+    stream_copy: bool,
+    description: &str,
+) -> Result<(), String> {
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let mut command = Command::new(ffmpeg);
+    command.arg("-y");
+    command.args(pre_input_args.iter().map(String::as_str));
+    command.arg("-i").arg(input_path);
+    command.args(post_input_args.iter().map(String::as_str));
+    command.args(audio_output_codec_args(output_format, stream_copy)?);
+    command.arg(output_path);
+    suppress_command_window(&mut command);
+
+    let output = match run_command_with_timeout(&mut command, Duration::from_secs(900), description)
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(output_path);
+            return Err(error);
+        }
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let _ = fs::remove_file(output_path);
+    Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+}
+
 fn is_supported_audio_input(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -4445,6 +4748,561 @@ async fn prepare_audio_preview(
         let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
         prepare_audio_preview_in_dir(&PathBuf::from(request.audio_path), &cache_root)
             .map(|path| path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn parse_ffprobe_fps(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "0/0" || trimmed.eq_ignore_ascii_case("N/A") {
+        return None;
+    }
+    if let Some((left, right)) = trimmed.split_once('/') {
+        let numerator = left.trim().parse::<f64>().ok()?;
+        let denominator = right.trim().parse::<f64>().ok()?;
+        if denominator <= 0.0 {
+            return None;
+        }
+        let fps = numerator / denominator;
+        return fps.is_finite().then_some(fps).filter(|fps| *fps > 0.0);
+    }
+    let fps = trimmed.parse::<f64>().ok()?;
+    fps.is_finite().then_some(fps).filter(|fps| *fps > 0.0)
+}
+
+fn probe_media_duration_seconds(app: &AppHandle, media_path: &Path) -> Option<f64> {
+    let ffprobe = resolve_ffprobe_runtime(app).ok()?;
+    let mut command = Command::new(ffprobe);
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(media_path);
+    suppress_command_window(&mut command);
+
+    let output =
+        run_command_with_timeout(&mut command, Duration::from_secs(20), "duration probe").ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let duration = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
+    duration.is_finite().then_some(duration).filter(|value| *value > 0.0)
+}
+
+fn probe_media_frame_rate_inner(
+    app: &AppHandle,
+    media_path: &Path,
+) -> ProbeMediaFrameRateResult {
+    if !media_path.exists() {
+        return ProbeMediaFrameRateResult {
+            fps: 25.0,
+            source: "fallback".to_string(),
+            message: "Source file does not exist. Using 25fps fallback.".to_string(),
+        };
+    }
+
+    let Ok(ffprobe) = resolve_ffprobe_runtime(app) else {
+        return ProbeMediaFrameRateResult {
+            fps: 25.0,
+            source: "fallback".to_string(),
+            message: "ffprobe was not found. Using 25fps fallback.".to_string(),
+        };
+    };
+
+    let mut command = Command::new(ffprobe);
+    command
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v:0")
+        .arg("-show_entries")
+        .arg("stream=avg_frame_rate,r_frame_rate")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(media_path);
+    suppress_command_window(&mut command);
+
+    let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(20), "frame-rate probe") else {
+        return ProbeMediaFrameRateResult {
+            fps: 25.0,
+            source: "fallback".to_string(),
+            message: "Frame-rate detection failed. Using 25fps fallback.".to_string(),
+        };
+    };
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(fps) = parse_ffprobe_fps(line) {
+                return ProbeMediaFrameRateResult {
+                    fps,
+                    source: "video".to_string(),
+                    message: format!("Detected video frame rate: {fps:.3}fps."),
+                };
+            }
+        }
+    }
+
+    ProbeMediaFrameRateResult {
+        fps: 25.0,
+        source: "fallback".to_string(),
+        message: "No video frame rate was detected. Using 25fps fallback.".to_string(),
+    }
+}
+
+#[tauri::command]
+async fn probe_media_frame_rate(
+    app: AppHandle,
+    request: ProbeMediaFrameRateRequest,
+) -> Result<ProbeMediaFrameRateResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(probe_media_frame_rate_inner(
+            &app,
+            &PathBuf::from(request.media_path),
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn prepare_audio_waveform(
+    app: AppHandle,
+    request: AudioWaveformRequest,
+) -> Result<AudioWaveformResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_path = PathBuf::from(&request.media_path);
+        if !source_path.exists() {
+            return Err("Source audio file does not exist.".to_string());
+        }
+        if !is_supported_audio_input(&source_path) {
+            return Err("Source file is not a supported audio or video format.".to_string());
+        }
+
+        let width = request.width.unwrap_or(1600).clamp(320, 3200);
+        let height = request.height.unwrap_or(220).clamp(80, 600);
+        let mut hasher = DefaultHasher::new();
+        source_path.to_string_lossy().hash(&mut hasher);
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        let hash = hasher.finish();
+        let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+        let waveform_dir = cache_root.join("audio-waveforms");
+        fs::create_dir_all(&waveform_dir).map_err(|error| error.to_string())?;
+        let waveform_path = waveform_dir.join(format!("{hash:016x}-{width}x{height}.png"));
+        let duration_seconds = probe_media_duration_seconds(&app, &source_path).unwrap_or(0.0);
+
+        if waveform_path.exists() {
+            return Ok(AudioWaveformResult {
+                waveform_path: waveform_path.to_string_lossy().to_string(),
+                duration_seconds,
+                message: "Waveform loaded from cache".to_string(),
+            });
+        }
+
+        let ffmpeg = resolve_ffmpeg_runtime(&app)?;
+        let mut command = Command::new(ffmpeg);
+        command
+            .arg("-y")
+            .arg("-i")
+            .arg(&source_path)
+            .arg("-filter_complex")
+            .arg(format!(
+                "showwavespic=s={}x{}:colors=0xeff6ff,format=rgba",
+                width, height
+            ))
+            .arg("-frames:v")
+            .arg("1")
+            .arg(&waveform_path);
+        suppress_command_window(&mut command);
+
+        let output = run_command_with_timeout(&mut command, Duration::from_secs(900), "audio waveform")?;
+        if !output.status.success() {
+            let _ = fs::remove_file(&waveform_path);
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+
+        Ok(AudioWaveformResult {
+            waveform_path: waveform_path.to_string_lossy().to_string(),
+            duration_seconds,
+            message: "Waveform generated".to_string(),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn convert_audio_file(
+    app: AppHandle,
+    request: ConvertAudioFileRequest,
+) -> Result<AudioProcessingResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let input_path = PathBuf::from(&request.audio_path);
+        if !input_path.exists() {
+            return Err("Audio or video file does not exist.".to_string());
+        }
+        if !is_supported_audio_input(&input_path) {
+            return Err("Input file is not a supported audio or video format.".to_string());
+        }
+
+        let output_path = audio_tool_output_path(
+            &input_path,
+            "converted",
+            &request.output_format,
+            request.destination_dir.as_deref(),
+            unix_timestamp_millis()?,
+            None,
+        )?;
+        run_ffmpeg_general_command(
+            &app,
+            &input_path,
+            &output_path,
+            &[],
+            &[],
+            &request.output_format,
+            false,
+            "audio conversion",
+        )?;
+        Ok(AudioProcessingResult {
+            output_path: output_path.to_string_lossy().to_string(),
+            message: "Audio conversion complete".to_string(),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn clip_audio_segment(
+    app: AppHandle,
+    request: ClipAudioSegmentRequest,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_path = PathBuf::from(&request.source_audio_path);
+        if !source_path.exists() {
+            return Err("Source audio file does not exist.".to_string());
+        }
+        if request.end_seconds <= request.start_seconds {
+            return Err("Clip end time must be after start time.".to_string());
+        }
+
+        let output_path = audio_tool_output_path(
+            &source_path,
+            "clip",
+            &request.output_format,
+            request.destination_dir.as_deref(),
+            unix_timestamp_millis()?,
+            request.suggested_name.as_deref(),
+        )?;
+        let pre_input_args = vec!["-ss".to_string(), format!("{:.3}", request.start_seconds.max(0.0))];
+        let post_input_args = vec![
+            "-t".to_string(),
+            format!("{:.3}", (request.end_seconds - request.start_seconds).max(0.001)),
+        ];
+        run_ffmpeg_general_command(
+            &app,
+            &source_path,
+            &output_path,
+            &pre_input_args,
+            &post_input_args,
+            &request.output_format,
+            false,
+            "audio clip export",
+        )?;
+        Ok(output_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn clip_audio_segments(
+    app: AppHandle,
+    request: ClipAudioSegmentsRequest,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_path = PathBuf::from(&request.source_audio_path);
+        if !source_path.exists() {
+            return Err("Source audio file does not exist.".to_string());
+        }
+        if request.segments.is_empty() {
+            return Err("At least one clip segment is required.".to_string());
+        }
+        for segment in &request.segments {
+            if segment.end_seconds <= segment.start_seconds {
+                return Err("Every clip segment end time must be after start time.".to_string());
+            }
+        }
+
+        let timestamp = unix_timestamp_millis()?;
+        if request.merge_segments {
+            let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+            let temp_dir = cache_root
+                .join("audio-clips")
+                .join(format!("segments-{timestamp}"));
+            fs::create_dir_all(&temp_dir).map_err(|error| error.to_string())?;
+            let mut temp_paths = Vec::new();
+            let result = (|| {
+                for (index, segment) in request.segments.iter().enumerate() {
+                    let temp_output = temp_dir.join(format!("clip-{:03}.wav", index + 1));
+                    let pre_input_args =
+                        vec!["-ss".to_string(), format!("{:.3}", segment.start_seconds.max(0.0))];
+                    let post_input_args = vec![
+                        "-t".to_string(),
+                        format!("{:.3}", (segment.end_seconds - segment.start_seconds).max(0.001)),
+                    ];
+                    run_ffmpeg_general_command(
+                        &app,
+                        &source_path,
+                        &temp_output,
+                        &pre_input_args,
+                        &post_input_args,
+                        "wav",
+                        false,
+                        "audio multi-clip temp export",
+                    )?;
+                    temp_paths.push(temp_output);
+                }
+
+                merge_audio_paths(
+                    &app,
+                    &temp_paths,
+                    "reencode",
+                    &request.output_format,
+                    request.destination_dir.as_deref(),
+                    request.suggested_name.as_deref(),
+                    unix_timestamp_millis()?,
+                )
+            })();
+            let _ = fs::remove_dir_all(&temp_dir);
+            let merged = result?;
+            return Ok(vec![merged.to_string_lossy().to_string()]);
+        }
+
+        let mut output_paths = Vec::new();
+        for (index, segment) in request.segments.iter().enumerate() {
+            let suggested_name = segment.suggested_name.as_deref();
+            let output_path = audio_tool_output_path(
+                &source_path,
+                &format!("clip-{:03}", index + 1),
+                &request.output_format,
+                request.destination_dir.as_deref(),
+                unix_timestamp_millis()?,
+                suggested_name,
+            )?;
+            let pre_input_args =
+                vec!["-ss".to_string(), format!("{:.3}", segment.start_seconds.max(0.0))];
+            let post_input_args = vec![
+                "-t".to_string(),
+                format!("{:.3}", (segment.end_seconds - segment.start_seconds).max(0.001)),
+            ];
+            run_ffmpeg_general_command(
+                &app,
+                &source_path,
+                &output_path,
+                &pre_input_args,
+                &post_input_args,
+                &request.output_format,
+                false,
+                "audio multi-clip export",
+            )?;
+            output_paths.push(output_path.to_string_lossy().to_string());
+        }
+        Ok(output_paths)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn split_audio_file(
+    app: AppHandle,
+    request: SplitAudioFileRequest,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source_path = PathBuf::from(&request.source_audio_path);
+        if !source_path.exists() {
+            return Err("Source audio file does not exist.".to_string());
+        }
+        if request.segment_seconds <= 0.0 || !request.segment_seconds.is_finite() {
+            return Err("Split length must be greater than 0 seconds.".to_string());
+        }
+
+        let extension = audio_output_extension(&request.output_format)?;
+        let timestamp = unix_timestamp_millis()?;
+        let stem = source_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("audio");
+        let output_dir = output_dir_near_source(&source_path, request.destination_dir.as_deref())?;
+        fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+        let output_pattern = output_dir.join(format!("{stem}-split-{timestamp}-%03d.{extension}"));
+
+        let ffmpeg = resolve_ffmpeg_runtime(&app)?;
+        let mut command = Command::new(ffmpeg);
+        command
+            .arg("-y")
+            .arg("-i")
+            .arg(&source_path)
+            .args(audio_output_codec_args(&request.output_format, false)?)
+            .arg("-f")
+            .arg("segment")
+            .arg("-segment_time")
+            .arg(format!("{:.3}", request.segment_seconds))
+            .arg("-reset_timestamps")
+            .arg("1")
+            .arg(&output_pattern);
+        suppress_command_window(&mut command);
+
+        let output = run_command_with_timeout(&mut command, Duration::from_secs(900), "audio split")?;
+        if !output.status.success() {
+            let prefix = format!("{stem}-split-{timestamp}-");
+            if let Ok(entries) = fs::read_dir(&output_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(extension))
+                    {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+
+        let prefix = format!("{stem}-split-{timestamp}-");
+        let mut outputs = fs::read_dir(&output_dir)
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(extension))
+            })
+            .collect::<Vec<_>>();
+        outputs.sort();
+        Ok(outputs
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn ffmpeg_concat_line(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
+    format!("file '{normalized}'")
+}
+
+fn merge_audio_paths(
+    app: &AppHandle,
+    audio_paths: &[PathBuf],
+    mode: &str,
+    output_format: &str,
+    destination_dir: Option<&str>,
+    suggested_name: Option<&str>,
+    timestamp: u128,
+) -> Result<PathBuf, String> {
+    if audio_paths.len() < 2 {
+        return Err("At least two audio files are required for merge.".to_string());
+    }
+    for path in audio_paths {
+        if !path.exists() {
+            return Err(format!("Merge source does not exist: {}", path.to_string_lossy()));
+        }
+    }
+
+    let first_path = audio_paths.first().expect("len checked");
+    let output_path = audio_tool_output_path(
+        first_path,
+        "merged",
+        output_format,
+        destination_dir,
+        timestamp,
+        suggested_name,
+    )?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+    let concat_dir = cache_root.join("audio-concat");
+    fs::create_dir_all(&concat_dir).map_err(|error| error.to_string())?;
+    let concat_path = concat_dir.join(format!("concat-{timestamp}.txt"));
+    let concat_text = audio_paths
+        .iter()
+        .map(|path| ffmpeg_concat_line(path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&concat_path, concat_text).map_err(|error| error.to_string())?;
+
+    let ffmpeg = resolve_ffmpeg_runtime(app)?;
+    let stream_copy = mode == "copy";
+    let mut command = Command::new(ffmpeg);
+    command
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&concat_path)
+        .args(audio_output_codec_args(output_format, stream_copy)?)
+        .arg(&output_path);
+    suppress_command_window(&mut command);
+
+    let output = run_command_with_timeout(&mut command, Duration::from_secs(900), "audio merge");
+    let _ = fs::remove_file(&concat_path);
+    match output {
+        Ok(output) if output.status.success() => Ok(output_path),
+        Ok(output) => {
+            let _ = fs::remove_file(&output_path);
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&output_path);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn merge_audio_files(
+    app: AppHandle,
+    request: MergeAudioFilesRequest,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mode = match request.mode.as_str() {
+            "copy" | "reencode" => request.mode.as_str(),
+            other => return Err(format!("Unsupported merge mode: {other}")),
+        };
+        let paths = request
+            .audio_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let output_path = merge_audio_paths(
+            &app,
+            &paths,
+            mode,
+            &request.output_format,
+            request.destination_dir.as_deref(),
+            request.suggested_name.as_deref(),
+            unix_timestamp_millis()?,
+        )?;
+        Ok(output_path.to_string_lossy().to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -4694,10 +5552,18 @@ pub fn run() {
             select_directory,
             select_audio_files,
             open_recordings_dir,
+            open_path_dir,
             save_text_file,
             save_existing_file,
             prepare_audio_preview,
+            probe_media_frame_rate,
+            prepare_audio_waveform,
             export_audio_segment,
+            convert_audio_file,
+            clip_audio_segment,
+            clip_audio_segments,
+            split_audio_file,
+            merge_audio_files,
             list_audio_files_in_directory,
             process_audio_file,
             transcribe_file,
@@ -5373,6 +6239,76 @@ Elapsed seconds: 0.16
             output,
             PathBuf::from(r"D:\Processed\voice-voice-basic-1234.wav")
         );
+    }
+
+    #[test]
+    fn audio_output_format_only_accepts_supported_formats() {
+        assert_eq!(audio_output_extension("mp3").expect("mp3"), "mp3");
+        assert_eq!(audio_output_extension("opus").expect("opus"), "opus");
+        assert!(audio_output_extension("../bad").is_err());
+    }
+
+    #[test]
+    fn audio_output_codec_args_support_copy_and_reencode_modes() {
+        assert_eq!(
+            audio_output_codec_args("wav", false).expect("wav"),
+            vec![
+                "-vn".to_string(),
+                "-acodec".to_string(),
+                "pcm_s16le".to_string(),
+                "-ar".to_string(),
+                "48000".to_string(),
+                "-ac".to_string(),
+                "1".to_string()
+            ]
+        );
+        assert_eq!(
+            audio_output_codec_args("mp3", true).expect("copy"),
+            vec!["-vn".to_string(), "-c:a".to_string(), "copy".to_string()]
+        );
+    }
+
+    #[test]
+    fn audio_tool_output_path_uses_requested_format_and_custom_name() {
+        let input = PathBuf::from(r"C:\Recordings\voice.wav");
+        let output = audio_tool_output_path(
+            &input,
+            "clip",
+            "mp3",
+            Some(r"D:\Processed"),
+            1234,
+            Some("take-one"),
+        )
+        .expect("output path");
+
+        assert_eq!(output, PathBuf::from(r"D:\Processed\take-one.mp3"));
+
+        let output = audio_tool_output_path(
+            &input,
+            "clip",
+            "flac",
+            Some(r"D:\Processed"),
+            1234,
+            Some("take-one.mp3"),
+        )
+        .expect("output path");
+
+        assert_eq!(output, PathBuf::from(r"D:\Processed\take-one.flac"));
+    }
+
+    #[test]
+    fn parses_ffprobe_fractional_frame_rates() {
+        assert_eq!(parse_ffprobe_fps("25/1").expect("25fps"), 25.0);
+        assert!((parse_ffprobe_fps("30000/1001").expect("ntsc") - 29.970).abs() < 0.01);
+        assert!(parse_ffprobe_fps("0/0").is_none());
+        assert!(parse_ffprobe_fps("N/A").is_none());
+    }
+
+    #[test]
+    fn concat_lines_normalize_windows_paths() {
+        let line = ffmpeg_concat_line(&PathBuf::from(r"C:\Audio Files\voice.wav"));
+
+        assert_eq!(line, "file 'C:/Audio Files/voice.wav'");
     }
 
     #[test]

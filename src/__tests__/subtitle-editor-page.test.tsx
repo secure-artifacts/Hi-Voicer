@@ -236,6 +236,40 @@ describe("SubtitleEditorPage", () => {
     );
   });
 
+  it("exports all subtitle clips without requiring manual selection", async () => {
+    render(
+      <SubtitleEditorPage
+        project={{
+          fileName: "demo.wav",
+          sourceAudioPath: "C:\\HiVoicer\\review.wav",
+          text: "陶瑞应用\n第二句字幕",
+          segments,
+        }}
+        termCategories={categories}
+        onAddTermRule={vi.fn()}
+        onProjectChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "导出全部片段" }));
+
+    expect(await screen.findByText(/已导出全部 2 段音频/)).toBeTruthy();
+    expect(exportAudioSegment).toHaveBeenNthCalledWith(
+      1,
+      "C:\\HiVoicer\\review.wav",
+      0,
+      2,
+      expect.objectContaining({ suggestedName: "demo-segment-001.wav" }),
+    );
+    expect(exportAudioSegment).toHaveBeenNthCalledWith(
+      2,
+      "C:\\HiVoicer\\review.wav",
+      2,
+      4,
+      expect.objectContaining({ suggestedName: "demo-segment-002.wav" }),
+    );
+  });
+
   it("shows text export failures instead of leaving the action silent", async () => {
     vi.mocked(saveTextFile).mockRejectedValueOnce(new Error("disk full"));
     render(

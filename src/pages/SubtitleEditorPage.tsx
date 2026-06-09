@@ -353,6 +353,32 @@ export function SubtitleEditorPage({ project, onProjectChange, termCategories, o
     }
   }
 
+  async function handleExportAllAudio() {
+    if (segments.length === 0) {
+      return;
+    }
+    if (!project?.sourceAudioPath) {
+      setMessage("当前项目没有原始音频路径，无法导出音频片段。");
+      return;
+    }
+
+    try {
+      const paths = [];
+      for (const segment of segments) {
+        const bounds = audioBoundsForSegment(segment, project.timelineKind);
+        paths.push(
+          await exportAudioSegment(project.sourceAudioPath, bounds.start, bounds.end, {
+            destinationDir: clipExportDir || undefined,
+            suggestedName: segmentSuggestedName(project.fileName, segment),
+          }),
+        );
+      }
+      setMessage(`已导出全部 ${paths.length} 段音频：${paths.join("；")}`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "导出全部音频片段失败。");
+    }
+  }
+
   function handleAddSuggestion() {
     if (!suggestion) {
       return;
@@ -412,6 +438,15 @@ export function SubtitleEditorPage({ project, onProjectChange, termCategories, o
           >
             <FileAudio size={16} />
             导出选中片段
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            disabled={segments.length === 0 || !project.sourceAudioPath}
+            onClick={() => void handleExportAllAudio()}
+          >
+            <FileAudio size={16} />
+            导出全部片段
           </button>
           <button className="secondary-button" type="button" onClick={() => void handleSelectClipExportDir()}>
             <FolderOpen size={16} />
