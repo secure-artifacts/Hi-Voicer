@@ -1,117 +1,138 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
-  <title id="title">Hi-Voicer 1.0.0 product overview</title>
-  <desc id="desc">A product overview image showing Hi-Voicer voice input, transcription, subtitle editing, audio processing, and local model workflow.</desc>
+  <title id="title">Hi-Voicer 1.0.1 current interface overview</title>
+  <desc id="desc">A dark Hi-Voicer desktop interface overview showing audio processing tabs, waveform clipping, multi-segment selections, queue history, and local transcription tools.</desc>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0f172a"/>
-      <stop offset="0.55" stop-color="#12233b"/>
-      <stop offset="1" stop-color="#172033"/>
+    <linearGradient id="app-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1b22"/>
+      <stop offset="1" stop-color="#102a33"/>
     </linearGradient>
-    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#4ade80"/>
+    <linearGradient id="primary" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2dd4bf"/>
       <stop offset="1" stop-color="#38bdf8"/>
     </linearGradient>
-    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f8fafc"/>
-      <stop offset="1" stop-color="#e2e8f0"/>
-    </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#020617" flood-opacity="0.28"/>
+    <filter id="shadow" x="-18%" y="-18%" width="136%" height="136%">
+      <feDropShadow dx="0" dy="20" stdDeviation="26" flood-color="#020617" flood-opacity="0.35"/>
     </filter>
+    <clipPath id="wave-clip">
+      <rect x="0" y="0" width="760" height="170" rx="8"/>
+    </clipPath>
   </defs>
 
-  <rect width="1440" height="820" fill="url(#bg)"/>
-  <circle cx="1230" cy="110" r="170" fill="#38bdf8" opacity="0.11"/>
-  <circle cx="140" cy="700" r="220" fill="#4ade80" opacity="0.08"/>
+  <rect width="1440" height="820" fill="#07161c"/>
+  <g transform="translate(70 52)" filter="url(#shadow)">
+    <rect width="1300" height="716" rx="18" fill="url(#app-bg)" stroke="#254653"/>
 
-  <g transform="translate(92 76)">
-    <rect x="0" y="0" width="1256" height="668" rx="24" fill="#ffffff" opacity="0.96" filter="url(#shadow)"/>
-    <rect x="0" y="0" width="1256" height="74" rx="24" fill="#101827"/>
-    <rect x="0" y="50" width="1256" height="24" fill="#101827"/>
-    <circle cx="32" cy="36" r="8" fill="#ef4444"/>
-    <circle cx="58" cy="36" r="8" fill="#f59e0b"/>
-    <circle cx="84" cy="36" r="8" fill="#22c55e"/>
-    <text x="118" y="44" fill="#f8fafc" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif" font-size="22" font-weight="700">Hi-Voicer</text>
-    <text x="268" y="44" fill="#94a3b8" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif" font-size="15">本地离线语音工作台</text>
-
-    <g transform="translate(0 74)">
-      <rect width="214" height="594" fill="#111827"/>
-      <g font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif" font-size="16" font-weight="600">
-        <rect x="20" y="28" width="174" height="44" rx="10" fill="#1f2937"/>
-        <text x="58" y="56" fill="#f8fafc">首页</text>
-        <text x="58" y="112" fill="#cbd5e1">转录</text>
-        <text x="58" y="168" fill="#cbd5e1">字幕</text>
-        <text x="58" y="224" fill="#cbd5e1">术语</text>
-        <text x="58" y="280" fill="#cbd5e1">音频</text>
-        <text x="58" y="336" fill="#cbd5e1">诊断</text>
-      </g>
-      <g fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round">
-        <path d="M34 50h10m-5-5v10"/>
-        <path d="M34 106h10m-10 6h10"/>
-        <path d="M34 160h12m-12 8h12"/>
-        <path d="M34 216h12m-12 8h8"/>
-        <path d="M34 274c4-8 8 8 12 0"/>
-        <path d="M34 330h12m-6-6v12"/>
-      </g>
+    <g>
+      <rect width="1300" height="62" rx="18" fill="#0e242c"/>
+      <rect y="44" width="1300" height="18" fill="#0e242c"/>
+      <circle cx="28" cy="31" r="7" fill="#ef4444"/>
+      <circle cx="52" cy="31" r="7" fill="#f59e0b"/>
+      <circle cx="76" cy="31" r="7" fill="#22c55e"/>
+      <text x="108" y="39" fill="#ecfeff" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif" font-size="21" font-weight="800">Hi-Voicer</text>
+      <text x="230" y="38" fill="#9fd6e5" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif" font-size="14">本地离线语音工作台</text>
     </g>
 
-    <g transform="translate(248 112)" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif">
-      <text x="0" y="0" fill="#0f172a" font-size="36" font-weight="800">中文语音输入与文件转录</text>
-      <text x="0" y="34" fill="#475569" font-size="18">录音、转写、字幕、术语和音频处理都在本机完成</text>
-
-      <g transform="translate(0 78)">
-        <rect width="510" height="218" rx="18" fill="url(#panel)" stroke="#cbd5e1"/>
-        <text x="28" y="42" fill="#0f172a" font-size="24" font-weight="800">按住说话，自动上屏</text>
-        <text x="28" y="75" fill="#475569" font-size="16">在任意输入框按快捷键录音，识别后自动粘贴。</text>
-        <rect x="28" y="112" width="182" height="48" rx="12" fill="url(#accent)"/>
-        <text x="62" y="143" fill="#052e16" font-size="17" font-weight="800">开始录音</text>
-        <g transform="translate(248 112)" fill="#38bdf8">
-          <rect x="0" y="26" width="10" height="32" rx="5"/>
-          <rect x="22" y="12" width="10" height="60" rx="5"/>
-          <rect x="44" y="0" width="10" height="84" rx="5"/>
-          <rect x="66" y="18" width="10" height="48" rx="5"/>
-          <rect x="88" y="34" width="10" height="24" rx="5"/>
+    <g transform="translate(24 88)" font-family="Segoe UI, Microsoft YaHei, Arial, sans-serif">
+      <g>
+        <rect width="238" height="566" rx="12" fill="#0b1d24" stroke="#24434f"/>
+        <text x="24" y="38" fill="#e0f2fe" font-size="16" font-weight="800">工作区</text>
+        <g font-size="14" font-weight="700">
+          <rect x="16" y="62" width="206" height="42" rx="8" fill="#14303a"/>
+          <text x="52" y="88" fill="#e0f2fe">语音输入</text>
+          <text x="52" y="138" fill="#9fd6e5">文件转录</text>
+          <text x="52" y="188" fill="#9fd6e5">字幕校对</text>
+          <rect x="16" y="214" width="206" height="42" rx="8" fill="#083c3a" stroke="#20d6c7"/>
+          <text x="52" y="240" fill="#ecfeff">音频处理</text>
+          <text x="52" y="290" fill="#9fd6e5">术语替换</text>
+          <text x="52" y="340" fill="#9fd6e5">诊断</text>
         </g>
-        <text x="28" y="188" fill="#64748b" font-size="14">支持按住说话、连续识别、纯录音三种模式</text>
-      </g>
-
-      <g transform="translate(546 78)">
-        <rect width="360" height="218" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
-        <text x="24" y="42" fill="#0f172a" font-size="22" font-weight="800">本地模型</text>
-        <text x="24" y="74" fill="#475569" font-size="15">Sherpa-ONNX / SenseVoice</text>
-        <text x="24" y="102" fill="#475569" font-size="15">无需把录音上传到云端</text>
-        <g transform="translate(24 132)">
-          <rect width="312" height="12" rx="6" fill="#dbeafe"/>
-          <rect width="230" height="12" rx="6" fill="#38bdf8"/>
-          <text x="0" y="48" fill="#64748b" font-size="14">模型、缓存、录音都保存在本机数据目录</text>
+        <g fill="none" stroke="#6ee7d8" stroke-width="2" stroke-linecap="round">
+          <path d="M30 83h12m-6-6v12"/>
+          <path d="M30 233c4-10 8 10 12 0s8 10 12 0"/>
         </g>
+        <rect x="16" y="442" width="206" height="92" rx="10" fill="#102a33" stroke="#315868"/>
+        <text x="30" y="472" fill="#e0f2fe" font-size="14" font-weight="800">本地模型</text>
+        <text x="30" y="500" fill="#9fd6e5" font-size="13">Sherpa-ONNX CPU 默认稳定</text>
       </g>
 
-      <g transform="translate(0 330)">
-        <rect width="286" height="166" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
-        <text x="22" y="40" fill="#0f172a" font-size="21" font-weight="800">批量转录</text>
-        <text x="22" y="72" fill="#475569" font-size="15">音频/视频文件转文字</text>
-        <text x="22" y="100" fill="#64748b" font-size="14">TXT / 时间线 TXT / SRT</text>
-        <rect x="22" y="124" width="130" height="12" rx="6" fill="#22c55e"/>
-      </g>
-      <g transform="translate(310 330)">
-        <rect width="286" height="166" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
-        <text x="22" y="40" fill="#0f172a" font-size="21" font-weight="800">字幕编辑</text>
-        <text x="22" y="72" fill="#475569" font-size="15">校正文本、拆分合并</text>
-        <text x="22" y="100" fill="#64748b" font-size="14">导出选中片段音频</text>
-        <rect x="22" y="124" width="168" height="12" rx="6" fill="#38bdf8"/>
-      </g>
-      <g transform="translate(620 330)">
-        <rect width="286" height="166" rx="18" fill="#f8fafc" stroke="#cbd5e1"/>
-        <text x="22" y="40" fill="#0f172a" font-size="21" font-weight="800">音频处理</text>
-        <text x="22" y="72" fill="#475569" font-size="15">标准化、裁静音、滤波</text>
-        <text x="22" y="100" fill="#64748b" font-size="14">为转写和归档做准备</text>
-        <rect x="22" y="124" width="146" height="12" rx="6" fill="#a78bfa"/>
-      </g>
+      <g transform="translate(270 0)">
+        <text x="0" y="34" fill="#ecfeff" font-size="30" font-weight="850">音频处理与波形剪辑</text>
+        <text x="0" y="62" fill="#9fd6e5" font-size="15">转换、剪辑、合并和字幕片段导出集中在一个离线桌面应用中完成</text>
 
-      <g transform="translate(0 532)">
-        <rect width="906" height="54" rx="14" fill="#ecfeff" stroke="#bae6fd"/>
-        <text x="24" y="35" fill="#075985" font-size="17" font-weight="700">1.0.0：新增音频转换、波形剪辑、多段导出、音频合并和字幕片段导出</text>
+        <g transform="translate(0 88)">
+          <rect width="236" height="72" rx="8" fill="#354146"/>
+          <text x="18" y="31" fill="#f8fafc" font-size="16" font-weight="800">降噪/增强</text>
+          <text x="18" y="55" fill="#b6d7df" font-size="13">标准化、滤波、降噪</text>
+          <rect x="252" width="236" height="72" rx="8" fill="#354146"/>
+          <text x="270" y="31" fill="#f8fafc" font-size="16" font-weight="800">格式转换</text>
+          <text x="270" y="55" fill="#b6d7df" font-size="13">音频互转，视频提取音频</text>
+          <rect x="504" width="236" height="72" rx="8" fill="#073f3c" stroke="#20d6c7" stroke-width="2"/>
+          <text x="522" y="31" fill="#ecfeff" font-size="16" font-weight="850">音频剪辑</text>
+          <text x="522" y="55" fill="#a7f3d0" font-size="13">波形预览，多段自由选择</text>
+          <rect x="756" width="236" height="72" rx="8" fill="#354146"/>
+          <text x="774" y="31" fill="#f8fafc" font-size="16" font-weight="800">音频合并</text>
+          <text x="774" y="55" fill="#b6d7df" font-size="13">无重编码或重编码合并</text>
+        </g>
+
+        <g transform="translate(0 186)">
+          <rect width="996" height="392" rx="12" fill="#102a33" stroke="#315868"/>
+          <text x="22" y="34" fill="#bfdbfe" font-size="14" font-weight="800">帧率：25.000fps。未检测到视频帧率时回退 25fps。</text>
+
+          <g transform="translate(22 56)">
+            <rect width="760" height="170" rx="8" fill="#1f2727" stroke="#42626d"/>
+            <g clip-path="url(#wave-clip)" fill="#f8fafc" opacity="0.94">
+              <path d="M0 86 C10 38 18 132 28 77 C37 18 47 154 56 83 C68 30 76 139 90 76 C104 20 112 158 126 88 C140 42 148 124 160 82 C174 22 184 150 196 78 C208 48 218 116 232 88 C246 36 258 140 270 82 C286 18 300 160 314 78 C328 44 340 126 354 84 C370 28 384 148 398 82 C412 52 426 112 440 86 C454 38 468 132 482 78 C496 26 510 150 524 83 C538 42 552 118 566 86 C580 24 594 154 610 80 C626 40 640 124 656 84 C672 18 688 158 704 82 C720 46 738 122 760 86 L760 170 L0 170 Z"/>
+              <path d="M0 86 C12 120 22 54 34 91 C48 142 60 36 72 88 C88 132 100 50 114 92 C130 140 144 32 158 86 C174 126 190 56 206 90 C222 136 238 38 254 88 C270 130 288 52 304 92 C320 142 338 30 354 86 C370 128 388 60 404 90 C420 132 438 48 454 88 C470 138 488 34 506 90 C522 128 540 58 558 88 C574 134 592 40 610 90 C626 124 646 54 664 88 C682 138 702 36 720 90 C736 120 748 62 760 86 L760 0 L0 0 Z"/>
+            </g>
+            <rect x="168" y="0" width="132" height="170" fill="#2dd4bf" opacity="0.34" stroke="#2dd4bf"/>
+            <circle cx="176" cy="22" r="13" fill="#2dd4bf"/>
+            <text x="172" y="27" fill="#08333a" font-size="13" font-weight="900">1</text>
+            <rect x="354" y="0" width="196" height="170" fill="#8b5cf6" opacity="0.32" stroke="#8b5cf6"/>
+            <circle cx="455" cy="22" r="13" fill="#8b5cf6"/>
+            <text x="451" y="27" fill="#f5f3ff" font-size="13" font-weight="900">2</text>
+            <rect x="590" y="0" width="150" height="170" fill="#f472b6" opacity="0.34" stroke="#f472b6"/>
+            <circle cx="666" cy="22" r="13" fill="#f472b6"/>
+            <text x="662" y="27" fill="#fff7ed" font-size="13" font-weight="900">3</text>
+            <line x1="316" y1="0" x2="316" y2="170" stroke="#fb923c" stroke-width="3"/>
+          </g>
+
+          <g transform="translate(804 56)">
+            <rect width="168" height="256" rx="8" fill="#0c1d24" stroke="#315868"/>
+            <text x="14" y="28" fill="#e0f2fe" font-size="14" font-weight="850">片段列表</text>
+            <g font-size="12">
+              <rect x="12" y="48" width="144" height="46" rx="6" fill="#14303a" stroke="#2dd4bf"/>
+              <text x="24" y="67" fill="#ecfeff" font-weight="800">1  00:12 - 00:36</text>
+              <text x="24" y="86" fill="#9fd6e5">独立文件 / 合并导出</text>
+              <rect x="12" y="106" width="144" height="46" rx="6" fill="#14303a"/>
+              <text x="24" y="125" fill="#ecfeff" font-weight="800">2  01:08 - 01:42</text>
+              <text x="24" y="144" fill="#9fd6e5">可调整顺序</text>
+              <rect x="12" y="164" width="144" height="46" rx="6" fill="#14303a"/>
+              <text x="24" y="183" fill="#ecfeff" font-weight="800">3  02:10 - 02:40</text>
+              <text x="24" y="202" fill="#9fd6e5">Ctrl 拖动新增</text>
+            </g>
+          </g>
+
+          <g transform="translate(22 250)">
+            <rect width="122" height="40" rx="8" fill="url(#primary)"/>
+            <text x="36" y="26" fill="#052e2b" font-size="14" font-weight="900">开始剪辑</text>
+            <rect x="138" width="120" height="40" rx="8" fill="#122e38" stroke="#42626d"/>
+            <text x="168" y="26" fill="#e0f2fe" font-size="14" font-weight="800">新增选区</text>
+            <rect x="274" width="120" height="40" rx="8" fill="#122e38" stroke="#42626d"/>
+            <text x="304" y="26" fill="#e0f2fe" font-size="14" font-weight="800">播放选区</text>
+          </g>
+
+          <g transform="translate(22 316)" font-size="13" font-weight="800">
+            <rect width="952" height="54" rx="8" fill="#0d222b" stroke="#315868"/>
+            <text x="16" y="34" fill="#9fd6e5">输出格式：WAV / MP3 / M4A / FLAC / OGG</text>
+            <text x="342" y="34" fill="#9fd6e5">输出路径：源文件目录或自定义目录</text>
+            <text x="704" y="34" fill="#9fd6e5">处理完成后一键打开目录</text>
+          </g>
+        </g>
+
+        <g transform="translate(0 602)">
+          <rect width="996" height="56" rx="10" fill="#0b3a38" stroke="#20d6c7"/>
+          <text x="20" y="35" fill="#ecfeff" font-size="17" font-weight="850">1.0.1：说明图已同步当前界面；保留波形预览、多段自由选择、时间线缩放和云端自动发布流程</text>
+        </g>
       </g>
     </g>
   </g>

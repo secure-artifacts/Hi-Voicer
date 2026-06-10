@@ -6,15 +6,23 @@ import {
   FileAudio,
   FolderOpen,
   ListPlus,
+  Maximize2,
   Merge,
   Play,
   Scissors,
   SlidersHorizontal,
   Trash2,
   Upload,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CSSProperties, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import type {
+  CSSProperties,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+  SyntheticEvent,
+} from "react";
 import {
   clipAudioSegments,
   convertAudioFile,
@@ -111,6 +119,7 @@ interface ClipSegment {
 
 const clipSegmentColors = ["#2dd4bf", "#f59e0b", "#8b5cf6", "#38bdf8", "#f472b6", "#84cc16"];
 const AUDIO_PROCESSING_HISTORY_KEY = "hi-voicer-audio-processing-history";
+const MIN_TIMELINE_WINDOW_SECONDS = 2;
 
 function fileNameFromPath(path: string) {
   return path.split(/[\\/]/).pop() || path;
@@ -282,16 +291,25 @@ export function AudioProcessingPage() {
   const [waveformSrc, setWaveformSrc] = useState("");
   const [clipDuration, setClipDuration] = useState(0);
   const [clipCurrentTime, setClipCurrentTime] = useState(0);
+  const [timelineZoom, setTimelineZoom] = useState(1);
+  const [timelineWindowStart, setTimelineWindowStart] = useState(0);
   const [clipPreviewMessage, setClipPreviewMessage] = useState("");
   const clipMediaRef = useRef<HTMLMediaElement | null>(null);
+  const timelineViewportRef = useRef<HTMLDivElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
+  const selectionPlaybackEndRef = useRef<number | null>(null);
   const previewAudioRefs = useRef<Record<string, HTMLAudioElement | null>>({});
   const preparingPreviewIds = useRef<Set<string>>(new Set());
   const selectedPreset = presets.find((preset) => preset.id === selectedPresetId) ?? presets[2];
   const activeClipSegment = clipSegments.find((segment) => segment.id === activeClipSegmentId) ?? clipSegments[0];
-  const visibleClipSegments = clipSegments;
   const clipSourcePath = queue[0]?.filePath ?? "";
   const timelineDuration = Math.max(clipDuration, activeClipSegment?.endSeconds ?? 10, 1);
+  const timelineMaxZoom = Math.max(1, Math.min(120, Math.ceil(timelineDuration / MIN_TIMELINE_WINDOW_SECONDS)));
+  const activeTimelineZoom = Math.min(Math.max(1, timelineZoom), timelineMaxZoom);
+  const timelineWindowDuration = Math.max(MIN_TIMELINE_WINDOW_SECONDS, Math.min(timelineDuration, timelineDuration / activeTimelineZoom));
+  const safeTimelineWindowStart = Math.min(Math.max(0, timelineWindowStart), Math.max(0, timelineDuration - timelineWindowDuration));
+  const timelineWindowEnd = Math.min(timelineDuration, safeTimelineWindowStart + timelineWindowDuration);
+  const visibleClipSegments = clipSegments.map((segment, index) => ({ segment, index }));
 
   const addFilesToQueue = useCallback((paths: string[]) => {
     if (isProcessing) {
@@ -416,6 +434,16 @@ export function AudioProcessingPage() {
     } as CSSProperties;
   }
 
+  function timelinePositionPercent(seconds: number) {
+    return (clampSeconds(seconds, timelineDuration) / timelineDuration) * 100;
+  }
+
+  function waveformImageStyle(): CSSProperties {
+    return {
+      "--timeline-width": `${activeTimelineZoom * 100}%`,
+    } as CSSProperties;
+  }
+
   function secondsFromTimelineEvent(event: ReactPointerEvent<HTMLElement> | ReactMouseEvent<HTMLElement>) {
     return secondsFromTimelineClientX(event.clientX);
   }
@@ -439,7 +467,7 @@ export function AudioProcessingPage() {
   }
 
   function handleTimelinePointerDown(target: TimelineDragTarget, event: ReactPointerEvent<HTMLElement>) {
-    if (target === "playhead" && clipMode !== "split" && (event.ctrlKey || event.altKey)) {
+    if (target === "playhead" && clipMode !== "split" && event.ctrlKey) {
       handleCreateSelectionPointerDown(event);
       return;
     }
@@ -523,10 +551,26 @@ export function AudioProcessingPage() {
       return;
     }
     clipMediaRef.current.currentTime = activeClipSegment.startSeconds;
+    selectionPlaybackEndRef.current = activeClipSegment.endSeconds;
     setClipCurrentTime(activeClipSegment.startSeconds);
     void clipMediaRef.current.play().catch(() => {
+      selectionPlaybackEndRef.current = null;
       setClipPreviewMessage("如果没有自动播放，可用播放器控件手动播放。");
     });
+  }
+
+  function handleClipMediaTimeUpdate(event: SyntheticEvent<HTMLMediaElement>) {
+    const current = event.currentTarget.currentTime;
+    setClipCurrentTime(current);
+    const selectionEnd = selectionPlaybackEndRef.current;
+    if (selectionEnd !== null && current >= selectionEnd) {
+      selectionPlaybackEndRef.current = null;
+      event.currentTarget.pause();
+    }
+  }
+
+  function clearSelectionPlaybackLimit() {
+    selectionPlaybackEndRef.current = null;
   }
 
   function addClipSegment() {
@@ -547,6 +591,66 @@ export function AudioProcessingPage() {
     const nextSegment = createClipSegment(safeStart, Math.max(safeStart + 0.001, end));
     setClipSegments((current) => [...current, nextSegment]);
     setActiveClipSegmentId(nextSegment.id);
+  }
+
+  function setTimelineZoomAroundAnchor(nextZoom: number, anchorSeconds: number, anchorRatio: number) {
+    const clampedZoom = Math.min(Math.max(1, nextZoom), timelineMaxZoom);
+    const nextWindowDuration = Math.max(
+      MIN_TIMELINE_WINDOW_SECONDS,
+      Math.min(timelineDuration, timelineDuration / clampedZoom),
+    );
+    const anchor = clampSeconds(anchorSeconds, timelineDuration);
+    const ratio = Math.min(1, Math.max(0, Number.isFinite(anchorRatio) ? anchorRatio : 0.5));
+    const maxStart = Math.max(0, timelineDuration - nextWindowDuration);
+    const nextStart = Math.min(maxStart, Math.max(0, anchor - nextWindowDuration * ratio));
+    setTimelineZoom(clampedZoom);
+    setTimelineWindowStart(nextStart);
+    requestAnimationFrame(() => scrollTimelineViewportToStart(nextStart, nextWindowDuration));
+  }
+
+  function setTimelineZoomAroundPlayhead(nextZoom: number) {
+    const anchor = clampSeconds(clipMediaRef.current?.currentTime ?? clipCurrentTime, timelineDuration);
+    const currentRatio =
+      timelineWindowDuration > 0 ? Math.min(1, Math.max(0, (anchor - safeTimelineWindowStart) / timelineWindowDuration)) : 0.5;
+    setTimelineZoomAroundAnchor(nextZoom, anchor, currentRatio);
+  }
+
+  function showFullTimeline() {
+    setTimelineZoom(1);
+    setTimelineWindowStart(0);
+    requestAnimationFrame(() => scrollTimelineViewportToStart(0, timelineDuration));
+  }
+
+  function centerTimelineOnPlayhead() {
+    const anchor = clampSeconds(clipMediaRef.current?.currentTime ?? clipCurrentTime, timelineDuration);
+    scrollTimelineToStart(Math.max(0, anchor - timelineWindowDuration / 2));
+  }
+
+  function scrollTimelineViewportToStart(startSeconds: number, windowDuration = timelineWindowDuration) {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    const maxScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+    const maxStart = Math.max(0, timelineDuration - windowDuration);
+    viewport.scrollLeft = maxStart > 0 ? (Math.min(Math.max(0, startSeconds), maxStart) / maxStart) * maxScroll : 0;
+  }
+
+  function scrollTimelineToStart(startSeconds: number) {
+    const nextStart = Math.min(Math.max(0, startSeconds), Math.max(0, timelineDuration - timelineWindowDuration));
+    setTimelineWindowStart(nextStart);
+    scrollTimelineViewportToStart(nextStart);
+  }
+
+  function handleTimelineViewportScroll() {
+    const viewport = timelineViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    const maxScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+    const maxStart = Math.max(0, timelineDuration - timelineWindowDuration);
+    const nextStart = maxScroll > 0 ? (viewport.scrollLeft / maxScroll) * maxStart : 0;
+    setTimelineWindowStart(nextStart);
   }
 
   function removeClipSegment(id: string) {
@@ -723,6 +827,8 @@ export function AudioProcessingPage() {
     setWaveformSrc("");
     setClipDuration(0);
     setClipCurrentTime(0);
+    setTimelineZoom(1);
+    setTimelineWindowStart(0);
     setClipPreviewMessage("");
     previewAudioRefs.current = {};
     preparingPreviewIds.current.clear();
@@ -781,6 +887,45 @@ export function AudioProcessingPage() {
   }, [activeClipSegmentId, clipSegments]);
 
   useEffect(() => {
+    setTimelineZoom((current) => Math.min(Math.max(1, current), timelineMaxZoom));
+    setTimelineWindowStart((current) => Math.min(Math.max(0, current), Math.max(0, timelineDuration - timelineWindowDuration)));
+  }, [timelineDuration, timelineMaxZoom, timelineWindowDuration]);
+
+  useEffect(() => {
+    const viewport = timelineViewportRef.current;
+    if (activeTool !== "clip" || !viewport) {
+      return;
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      if (!event.altKey) {
+        if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+          const pageScroller = document.scrollingElement;
+          if (pageScroller) {
+            event.preventDefault();
+            pageScroller.scrollBy({ top: event.deltaY, behavior: "auto" });
+          }
+        }
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      if (timelineMaxZoom <= 1) {
+        return;
+      }
+
+      const rect = viewport.getBoundingClientRect();
+      const anchorRatio = rect.width > 0 ? (event.clientX - rect.left) / rect.width : 0.5;
+      const anchorSeconds = secondsFromTimelineClientX(event.clientX);
+      const zoomFactor = event.deltaY < 0 ? 1.2 : 1 / 1.2;
+      setTimelineZoomAroundAnchor(activeTimelineZoom * zoomFactor, anchorSeconds, anchorRatio);
+    };
+
+    viewport.addEventListener("wheel", handleWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", handleWheel);
+  }, [activeTool, activeTimelineZoom, timelineMaxZoom, timelineDuration, timelineWindowDuration, safeTimelineWindowStart]);
+
+  useEffect(() => {
     if (activeTool !== "clip" || !queue[0]?.filePath) {
       return;
     }
@@ -813,6 +958,8 @@ export function AudioProcessingPage() {
       setWaveformSrc("");
       setClipDuration(0);
       setClipCurrentTime(0);
+      setTimelineZoom(1);
+      setTimelineWindowStart(0);
       setClipPreviewMessage("");
       return;
     }
@@ -820,6 +967,8 @@ export function AudioProcessingPage() {
     let cancelled = false;
     setClipPreviewMessage("正在准备预览和波形...");
     setWaveformSrc("");
+    setTimelineZoom(1);
+    setTimelineWindowStart(0);
     void Promise.all([
       prepareAudioPreview(clipSourcePath),
       prepareAudioWaveform(clipSourcePath, { width: 1800, height: 220 }),
@@ -842,7 +991,7 @@ export function AudioProcessingPage() {
         }
         setClipPreviewMessage(
           waveform.durationSeconds > 0
-            ? "Ctrl/Alt 拖动波形可直接拉出新选区；拖动入点/出点可微调当前选区。"
+            ? "Ctrl 拖动波形可直接拉出新选区；Alt + 滚轮可缩放时间线；拖动入点/出点可微调当前选区。"
             : "波形已准备，时长会在媒体加载后校准。",
         );
       })
@@ -1029,13 +1178,8 @@ export function AudioProcessingPage() {
                           setClipDuration(duration);
                         }
                       }}
-                      onTimeUpdate={(event) => {
-                        const current = event.currentTarget.currentTime;
-                        setClipCurrentTime(current);
-                        if (clipMode !== "split" && activeClipSegment && current >= activeClipSegment.endSeconds) {
-                          event.currentTarget.pause();
-                        }
-                      }}
+                      onPause={clearSelectionPlaybackLimit}
+                      onTimeUpdate={handleClipMediaTimeUpdate}
                     />
                   ) : (
                     <audio
@@ -1051,13 +1195,8 @@ export function AudioProcessingPage() {
                           setClipDuration(duration);
                         }
                       }}
-                      onTimeUpdate={(event) => {
-                        const current = event.currentTarget.currentTime;
-                        setClipCurrentTime(current);
-                        if (clipMode !== "split" && activeClipSegment && current >= activeClipSegment.endSeconds) {
-                          event.currentTarget.pause();
-                        }
-                      }}
+                      onPause={clearSelectionPlaybackLimit}
+                      onTimeUpdate={handleClipMediaTimeUpdate}
                     />
                   )
                 ) : (
@@ -1083,73 +1222,129 @@ export function AudioProcessingPage() {
                 </div>
               </div>
               <div className="clip-timeline-wrap">
-                <div
-                  className="clip-waveform"
-                  ref={timelineRef}
-                  onClick={(event) => seekClipPreview(secondsFromTimelineEvent(event))}
-                  onPointerDown={(event) => handleTimelinePointerDown("playhead", event)}
-                >
-                  {waveformSrc ? <img alt="音频波形" src={waveformSrc} /> : <div className="clip-waveform-loading">{clipPreviewMessage || "波形准备中..."}</div>}
-                  {clipMode !== "split" &&
-                    visibleClipSegments.map((segment, index) => (
-                      <button
-                        className={activeClipSegment?.id === segment.id ? "clip-selection clip-selection--active" : "clip-selection"}
-                        key={segment.id}
-                        style={clipSegmentStyle(segment, index)}
-                        type="button"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setActiveClipSegmentId(segment.id);
-                          seekClipPreview(segment.startSeconds);
-                        }}
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                          setActiveClipSegmentId(segment.id);
-                        }}
-                      >
-                        <span>{index + 1}</span>
-                      </button>
-                    ))}
-                  {clipMode !== "split" && activeClipSegment && (
-                    <>
-                      <button
-                        aria-label="拖动入点"
-                        className="clip-handle clip-handle--start"
-                        style={{ left: `${(activeClipSegment.startSeconds / timelineDuration) * 100}%` }}
-                        type="button"
-                        onClick={(event) => event.stopPropagation()}
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                          handleTimelinePointerDown("start", event);
-                        }}
-                      >
-                        入
-                      </button>
-                      <button
-                        aria-label="拖动出点"
-                        className="clip-handle clip-handle--end"
-                        style={{ left: `${(activeClipSegment.endSeconds / timelineDuration) * 100}%` }}
-                        type="button"
-                        onClick={(event) => event.stopPropagation()}
-                        onPointerDown={(event) => {
-                          event.stopPropagation();
-                          handleTimelinePointerDown("end", event);
-                        }}
-                      >
-                        出
-                      </button>
-                    </>
-                  )}
-                  <span className="clip-playhead" style={{ left: `${(clipCurrentTime / timelineDuration) * 100}%` }} />
+                <div className="clip-timeline-controls">
+                  <div className="clip-timeline-buttons">
+                    <button
+                      className="icon-button"
+                      title="缩小时间线"
+                      type="button"
+                      disabled={activeTimelineZoom <= 1}
+                      onClick={() => setTimelineZoomAroundPlayhead(activeTimelineZoom / 1.8)}
+                    >
+                      <ZoomOut size={16} />
+                    </button>
+                    <button
+                      className="icon-button"
+                      title="放大时间线"
+                      type="button"
+                      disabled={activeTimelineZoom >= timelineMaxZoom}
+                      onClick={() => setTimelineZoomAroundPlayhead(activeTimelineZoom * 1.8)}
+                    >
+                      <ZoomIn size={16} />
+                    </button>
+                    <button className="icon-button" title="显示完整时间线" type="button" onClick={showFullTimeline}>
+                      <Maximize2 size={16} />
+                    </button>
+                  </div>
+                  <label className="clip-zoom-control">
+                    <span>缩放 {activeTimelineZoom.toFixed(1)}x</span>
+                    <input
+                      aria-label="时间线缩放"
+                      max={timelineMaxZoom}
+                      min="1"
+                      step="0.1"
+                      type="range"
+                      value={activeTimelineZoom}
+                      onChange={(event) => setTimelineZoomAroundPlayhead(Number(event.target.value))}
+                    />
+                  </label>
+                  <button className="secondary-button" type="button" disabled={!clipPreviewSrc} onClick={centerTimelineOnPlayhead}>
+                    定位播放头
+                  </button>
                 </div>
+                <div className="clip-waveform-viewport" ref={timelineViewportRef} onScroll={handleTimelineViewportScroll}>
+                  <div
+                    className="clip-waveform"
+                    style={waveformImageStyle()}
+                    ref={timelineRef}
+                    onClick={(event) => seekClipPreview(secondsFromTimelineEvent(event))}
+                    onPointerDown={(event) => handleTimelinePointerDown("playhead", event)}
+                  >
+                    {waveformSrc ? <img alt="音频波形" src={waveformSrc} /> : <div className="clip-waveform-loading">{clipPreviewMessage || "波形准备中..."}</div>}
+                    {clipMode !== "split" &&
+                      visibleClipSegments.map(({ segment, index }) => (
+                        <button
+                          className={activeClipSegment?.id === segment.id ? "clip-selection clip-selection--active" : "clip-selection"}
+                          key={segment.id}
+                          style={clipSegmentStyle(segment, index)}
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setActiveClipSegmentId(segment.id);
+                            seekClipPreview(segment.startSeconds);
+                          }}
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                            setActiveClipSegmentId(segment.id);
+                          }}
+                        >
+                          <span>{index + 1}</span>
+                        </button>
+                      ))}
+                    {clipMode !== "split" && activeClipSegment && (
+                      <>
+                        <button
+                          aria-label="拖动入点"
+                          className="clip-handle clip-handle--start"
+                          style={{ left: `${timelinePositionPercent(activeClipSegment.startSeconds)}%` }}
+                          type="button"
+                          onClick={(event) => event.stopPropagation()}
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                            handleTimelinePointerDown("start", event);
+                          }}
+                        >
+                          入
+                        </button>
+                        <button
+                          aria-label="拖动出点"
+                          className="clip-handle clip-handle--end"
+                          style={{ left: `${timelinePositionPercent(activeClipSegment.endSeconds)}%` }}
+                          type="button"
+                          onClick={(event) => event.stopPropagation()}
+                          onPointerDown={(event) => {
+                            event.stopPropagation();
+                            handleTimelinePointerDown("end", event);
+                          }}
+                        >
+                          出
+                        </button>
+                      </>
+                    )}
+                    <span className="clip-playhead" style={{ left: `${timelinePositionPercent(clipCurrentTime)}%` }} />
+                  </div>
+                </div>
+                <label className="clip-pan-control">
+                  <span>{formatTimecode(safeTimelineWindowStart, frameRate.fps)}</span>
+                  <input
+                    aria-label="时间线位置"
+                    max={Math.max(0, timelineDuration - timelineWindowDuration)}
+                    min="0"
+                    step="0.001"
+                    type="range"
+                    value={safeTimelineWindowStart}
+                    onChange={(event) => scrollTimelineToStart(Number(event.target.value))}
+                  />
+                  <span>{formatTimecode(timelineWindowEnd, frameRate.fps)}</span>
+                </label>
                 <div className="clip-timeline-meta">
-                  <span>{formatTimecode(0, frameRate.fps)}</span>
+                  <span>{formatTimecode(safeTimelineWindowStart, frameRate.fps)}</span>
                   <strong>
                     {activeClipSegment && clipMode !== "split"
                       ? `${formatSeconds(activeClipSegment.startSeconds)}s - ${formatSeconds(activeClipSegment.endSeconds)}s`
                       : `总时长 ${formatSeconds(timelineDuration)}s`}
                   </strong>
-                  <span>{formatTimecode(timelineDuration, frameRate.fps)}</span>
+                  <span>{formatTimecode(timelineWindowEnd, frameRate.fps)}</span>
                 </div>
                 {clipPreviewMessage && <p className="panel-hint">{clipPreviewMessage}</p>}
               </div>

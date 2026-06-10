@@ -59,6 +59,8 @@ function installLocalStorageMock() {
 
 describe("AudioProcessingPage", () => {
   let playMock: ReturnType<typeof vi.fn>;
+  let pauseMock: ReturnType<typeof vi.fn>;
+  let scrollByMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -68,6 +70,20 @@ describe("AudioProcessingPage", () => {
     Object.defineProperty(HTMLMediaElement.prototype, "play", {
       configurable: true,
       value: playMock,
+    });
+    pauseMock = vi.fn();
+    Object.defineProperty(HTMLMediaElement.prototype, "pause", {
+      configurable: true,
+      value: pauseMock,
+    });
+    scrollByMock = vi.fn();
+    Object.defineProperty(document.documentElement, "scrollBy", {
+      configurable: true,
+      value: scrollByMock,
+    });
+    Object.defineProperty(document, "scrollingElement", {
+      configurable: true,
+      value: document.documentElement,
     });
     onDragDropEvent.mockImplementation(() => Promise.resolve(() => {}));
   });
@@ -275,6 +291,151 @@ describe("AudioProcessingPage", () => {
     fireEvent.pointerUp(window, { clientX: 50 });
 
     expect(await screen.findByText("片段 2")).toBeTruthy();
+  });
+
+  it("uses alt wheel for timeline zoom without creating a clip selection", async () => {
+    render(<AudioProcessingPage />);
+
+    fireEvent.click(document.querySelectorAll(".audio-tool-tab")[2] as HTMLButtonElement);
+    fireEvent.click(document.querySelector(".audio-drop-panel .secondary-button") as HTMLButtonElement);
+    await screen.findByText("C:\\recordings\\voice.wav");
+    await waitFor(() => expect(prepareAudioWaveform).toHaveBeenCalled());
+
+    const waveform = document.querySelector(".clip-waveform") as HTMLDivElement;
+    const viewport = document.querySelector(".clip-waveform-viewport") as HTMLDivElement;
+    Object.defineProperty(waveform, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ left: 0, right: 100, top: 0, bottom: 100, width: 100, height: 100, x: 0, y: 0, toJSON: () => {} }),
+    });
+    Object.defineProperty(viewport, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ left: 0, right: 100, top: 0, bottom: 100, width: 100, height: 100, x: 0, y: 0, toJSON: () => {} }),
+    });
+
+    const pointerDown = createEvent.pointerDown(waveform, { clientX: 25 });
+    Object.defineProperty(pointerDown, "altKey", { value: true });
+    Object.defineProperty(pointerDown, "clientX", { value: 25 });
+    fireEvent(waveform, pointerDown);
+    const pointerMove = createEvent.pointerMove(window, { clientX: 50 });
+    Object.defineProperty(pointerMove, "clientX", { value: 50 });
+    fireEvent(window, pointerMove);
+    const pointerUp = createEvent.pointerUp(window, { clientX: 50 });
+    Object.defineProperty(pointerUp, "clientX", { value: 50 });
+    fireEvent(window, pointerUp);
+
+    expect(document.querySelectorAll(".audio-segment-row")).toHaveLength(1);
+
+    const zoomInWheel = new WheelEvent("wheel", {
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+      clientX: 50,
+      deltaY: -120,
+    });
+    await act(async () => {
+      viewport.dispatchEvent(zoomInWheel);
+    });
+
+    expect(zoomInWheel.defaultPrevented).toBe(true);
+    await waitFor(() => expect(waveform.style.getPropertyValue("--timeline-width")).toBe("120%"));
+
+    const zoomOutWheel = new WheelEvent("wheel", {
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+      clientX: 50,
+      deltaY: 120,
+    });
+    await act(async () => {
+      viewport.dispatchEvent(zoomOutWheel);
+    });
+
+    expect(zoomOutWheel.defaultPrevented).toBe(true);
+    await waitFor(() => expect(waveform.style.getPropertyValue("--timeline-width")).toBe("100%"));
+
+    const pageWheel = new WheelEvent("wheel", {
+      altKey: false,
+      bubbles: true,
+      cancelable: true,
+      clientX: 50,
+      deltaY: 140,
+    });
+    await act(async () => {
+      viewport.dispatchEvent(pageWheel);
+    });
+
+    expect(pageWheel.defaultPrevented).toBe(true);
+    expect(scrollByMock).toHaveBeenCalledWith({ top: 140, behavior: "auto" });
+    expect(waveform.style.getPropertyValue("--timeline-width")).toBe("100%");
+  });
+
+  it("maps waveform dragging to the zoomed timeline window", async () => {
+    render(<AudioProcessingPage />);
+
+    fireEvent.click(document.querySelectorAll(".audio-tool-tab")[2] as HTMLButtonElement);
+    fireEvent.click(document.querySelector(".audio-drop-panel .secondary-button") as HTMLButtonElement);
+    await screen.findByText("C:\\recordings\\voice.wav");
+    await waitFor(() => expect(prepareAudioWaveform).toHaveBeenCalled());
+
+    const zoomInput = document.querySelector('input[aria-label="时间线缩放"]') as HTMLInputElement;
+    const panInput = document.querySelector('input[aria-label="时间线位置"]') as HTMLInputElement;
+    fireEvent.change(zoomInput, { target: { value: "10" } });
+    await waitFor(() => expect(Number(panInput.max)).toBeGreaterThan(0));
+    fireEvent.change(panInput, { target: { value: "60" } });
+    await waitFor(() => expect(Number(panInput.value)).toBeCloseTo(60));
+
+    const waveform = document.querySelector(".clip-waveform") as HTMLDivElement;
+    await waitFor(() => expect(waveform.style.getPropertyValue("--timeline-width")).toBe("1000%"));
+    Object.defineProperty(waveform, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ left: -500, right: 500, top: 0, bottom: 100, width: 1000, height: 100, x: -500, y: 0, toJSON: () => {} }),
+    });
+
+    const pointerDown = createEvent.pointerDown(waveform, { clientX: 25 });
+    Object.defineProperty(pointerDown, "ctrlKey", { value: true });
+    Object.defineProperty(pointerDown, "clientX", { value: 25 });
+    fireEvent(waveform, pointerDown);
+    const pointerMove = createEvent.pointerMove(window, { clientX: 50 });
+    Object.defineProperty(pointerMove, "clientX", { value: 50 });
+    fireEvent(window, pointerMove);
+    const pointerUp = createEvent.pointerUp(window, { clientX: 50 });
+    Object.defineProperty(pointerUp, "clientX", { value: 50 });
+    fireEvent(window, pointerUp);
+
+    fireEvent.click(document.querySelector(".audio-process-button") as HTMLButtonElement);
+
+    await waitFor(() => expect(clipAudioSegments).toHaveBeenCalled());
+    const exportedSegments = vi.mocked(clipAudioSegments).mock.calls[0][1];
+    expect(exportedSegments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          startSeconds: expect.closeTo(63, 3),
+          endSeconds: expect.closeTo(66, 3),
+        }),
+      ]),
+    );
+  });
+
+  it("does not stop normal media playback at the active clip boundary", async () => {
+    render(<AudioProcessingPage />);
+
+    fireEvent.click(document.querySelectorAll(".audio-tool-tab")[2] as HTMLButtonElement);
+    fireEvent.click(document.querySelector(".audio-drop-panel .secondary-button") as HTMLButtonElement);
+    await screen.findByText("C:\\recordings\\voice.wav");
+    await waitFor(() => expect(prepareAudioWaveform).toHaveBeenCalled());
+
+    const player = document.querySelector(".clip-media-preview audio") as HTMLAudioElement;
+    Object.defineProperty(player, "currentTime", { configurable: true, writable: true, value: 11 });
+    fireEvent.timeUpdate(player);
+
+    expect(pauseMock).not.toHaveBeenCalled();
+
+    const playSelectionButton = document.querySelectorAll(".clip-preview-actions .secondary-button")[3] as HTMLButtonElement;
+    fireEvent.click(playSelectionButton);
+    player.currentTime = 11;
+    fireEvent.timeUpdate(player);
+
+    expect(pauseMock).toHaveBeenCalledTimes(1);
   });
 
   it("clears clip selections when queue history is cleared", async () => {
