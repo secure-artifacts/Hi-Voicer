@@ -55,6 +55,7 @@ struct RecordingSession {
     source: String,
     tracks: Vec<RecordingTrack>,
     path: PathBuf,
+    paste_target_window: Option<PasteTargetWindow>,
 }
 
 struct RecordingTrack {
@@ -87,7 +88,53 @@ impl Drop for SherpaDaemon {
 unsafe impl Send for RecordingSession {}
 
 #[cfg(windows)]
-fn paste_text_to_active_window(text: &str) -> Result<(), String> {
+type PasteTargetWindow = isize;
+
+#[cfg(not(windows))]
+type PasteTargetWindow = ();
+
+fn clipboard_settle_delay(text: &str) -> Duration {
+    let extra = (text.chars().count() as u64 / 400).saturating_mul(40);
+    Duration::from_millis(80 + extra.min(900))
+}
+
+#[cfg(windows)]
+fn capture_paste_target_window() -> Option<PasteTargetWindow> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0 == 0 {
+        None
+    } else {
+        Some(hwnd.0)
+    }
+}
+
+#[cfg(not(windows))]
+fn capture_paste_target_window() -> Option<PasteTargetWindow> {
+    None
+}
+
+#[cfg(windows)]
+fn focus_paste_target_window(target_window: Option<PasteTargetWindow>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
+
+    let Some(raw_hwnd) = target_window else {
+        return;
+    };
+    let hwnd = HWND(raw_hwnd);
+    if unsafe { IsWindow(hwnd).as_bool() } {
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        thread::sleep(Duration::from_millis(140));
+    }
+}
+
+#[cfg(windows)]
+fn paste_text_to_target_window(
+    text: &str,
+    target_window: Option<PasteTargetWindow>,
+) -> Result<(), String> {
     use std::mem::size_of;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -99,7 +146,8 @@ fn paste_text_to_active_window(text: &str) -> Result<(), String> {
         .set_text(text.to_string())
         .map_err(|error| error.to_string())?;
     drop(clipboard);
-    thread::sleep(Duration::from_millis(80));
+    thread::sleep(clipboard_settle_delay(text));
+    focus_paste_target_window(target_window);
 
     fn key_input(key: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
         INPUT {
@@ -132,7 +180,10 @@ fn paste_text_to_active_window(text: &str) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn paste_text_to_active_window(_text: &str) -> Result<(), String> {
+fn paste_text_to_target_window(
+    _text: &str,
+    _target_window: Option<PasteTargetWindow>,
+) -> Result<(), String> {
     Err("Automatic paste is only supported on Windows.".to_string())
 }
 
@@ -3822,6 +3873,7 @@ fn start_recording_session(app: &AppHandle, source: &str) -> Result<RecordingSes
         source: source.to_string(),
         tracks,
         path,
+        paste_target_window: capture_paste_target_window(),
     })
 }
 
@@ -3885,6 +3937,7 @@ fn stop_recording_session(session: RecordingSession) -> Result<StoppedRecording,
         source,
         tracks,
         path,
+        ..
     } = session;
     let mut output_paths = Vec::new();
 
@@ -4040,6 +4093,7 @@ fn finish_recording_with_settings(
     settings: UserSettings,
     paste: bool,
 ) -> Result<TranscribeFileResult, String> {
+    let paste_target_window = session.paste_target_window;
     let mut stopped = stop_recording_session(session)?;
     let audio_path = if settings.recording_mode == "audioOnly" {
         stopped.primary_path.clone()
@@ -4083,7 +4137,7 @@ fn finish_recording_with_settings(
     )?;
 
     if paste {
-        paste_text_to_active_window(&result.text)?;
+        paste_text_to_target_window(&result.text, paste_target_window)?;
     }
 
     if !settings.save_recordings {
@@ -4295,8 +4349,8 @@ async fn select_audio_files() -> Result<Vec<String>, String> {
             .add_filter(
                 "Audio and Video",
                 &[
-                    "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "mp4", "mkv",
-                    "mov", "webm", "avi",
+                    "wav", "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "mp4", "mkv", "mov",
+                    "webm", "avi",
                 ],
             )
             .pick_files()
@@ -4357,7 +4411,10 @@ fn open_path_dir(request: OpenPathDirRequest) -> Result<String, String> {
             .unwrap_or_else(|| requested_path.clone())
     };
     if !dir.exists() {
-        return Err(format!("Output directory does not exist: {}", dir.display()));
+        return Err(format!(
+            "Output directory does not exist: {}",
+            dir.display()
+        ));
     }
 
     #[cfg(windows)]
@@ -4568,19 +4625,15 @@ fn audio_output_extension(format: &str) -> Result<&'static str, String> {
 
 fn audio_output_codec_args(format: &str, stream_copy: bool) -> Result<Vec<String>, String> {
     if stream_copy {
-        return Ok(vec!["-vn".to_string(), "-c:a".to_string(), "copy".to_string()]);
+        return Ok(vec![
+            "-vn".to_string(),
+            "-c:a".to_string(),
+            "copy".to_string(),
+        ]);
     }
 
     let args = match audio_output_extension(format)? {
-        "wav" => vec![
-            "-vn",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "48000",
-            "-ac",
-            "1",
-        ],
+        "wav" => vec!["-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "1"],
         "mp3" => vec!["-vn", "-acodec", "libmp3lame", "-b:a", "192k"],
         "m4a" | "aac" => vec!["-vn", "-acodec", "aac", "-b:a", "192k"],
         "flac" => vec!["-vn", "-acodec", "flac"],
@@ -4745,7 +4798,10 @@ async fn prepare_audio_preview(
     request: AudioPreviewRequest,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+        let cache_root = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?;
         prepare_audio_preview_in_dir(&PathBuf::from(request.audio_path), &cache_root)
             .map(|path| path.to_string_lossy().to_string())
     })
@@ -4793,13 +4849,13 @@ fn probe_media_duration_seconds(app: &AppHandle, media_path: &Path) -> Option<f6
         .trim()
         .parse::<f64>()
         .ok()?;
-    duration.is_finite().then_some(duration).filter(|value| *value > 0.0)
+    duration
+        .is_finite()
+        .then_some(duration)
+        .filter(|value| *value > 0.0)
 }
 
-fn probe_media_frame_rate_inner(
-    app: &AppHandle,
-    media_path: &Path,
-) -> ProbeMediaFrameRateResult {
+fn probe_media_frame_rate_inner(app: &AppHandle, media_path: &Path) -> ProbeMediaFrameRateResult {
     if !media_path.exists() {
         return ProbeMediaFrameRateResult {
             fps: 25.0,
@@ -4829,7 +4885,9 @@ fn probe_media_frame_rate_inner(
         .arg(media_path);
     suppress_command_window(&mut command);
 
-    let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(20), "frame-rate probe") else {
+    let Ok(output) =
+        run_command_with_timeout(&mut command, Duration::from_secs(20), "frame-rate probe")
+    else {
         return ProbeMediaFrameRateResult {
             fps: 25.0,
             source: "fallback".to_string(),
@@ -4893,7 +4951,10 @@ async fn prepare_audio_waveform(
         width.hash(&mut hasher);
         height.hash(&mut hasher);
         let hash = hasher.finish();
-        let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+        let cache_root = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?;
         let waveform_dir = cache_root.join("audio-waveforms");
         fs::create_dir_all(&waveform_dir).map_err(|error| error.to_string())?;
         let waveform_path = waveform_dir.join(format!("{hash:016x}-{width}x{height}.png"));
@@ -4923,7 +4984,8 @@ async fn prepare_audio_waveform(
             .arg(&waveform_path);
         suppress_command_window(&mut command);
 
-        let output = run_command_with_timeout(&mut command, Duration::from_secs(900), "audio waveform")?;
+        let output =
+            run_command_with_timeout(&mut command, Duration::from_secs(900), "audio waveform")?;
         if !output.status.success() {
             let _ = fs::remove_file(&waveform_path);
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -5002,10 +5064,16 @@ async fn clip_audio_segment(
             unix_timestamp_millis()?,
             request.suggested_name.as_deref(),
         )?;
-        let pre_input_args = vec!["-ss".to_string(), format!("{:.3}", request.start_seconds.max(0.0))];
+        let pre_input_args = vec![
+            "-ss".to_string(),
+            format!("{:.3}", request.start_seconds.max(0.0)),
+        ];
         let post_input_args = vec![
             "-t".to_string(),
-            format!("{:.3}", (request.end_seconds - request.start_seconds).max(0.001)),
+            format!(
+                "{:.3}",
+                (request.end_seconds - request.start_seconds).max(0.001)
+            ),
         ];
         run_ffmpeg_general_command(
             &app,
@@ -5044,7 +5112,10 @@ async fn clip_audio_segments(
 
         let timestamp = unix_timestamp_millis()?;
         if request.merge_segments {
-            let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+            let cache_root = app
+                .path()
+                .app_cache_dir()
+                .map_err(|error| error.to_string())?;
             let temp_dir = cache_root
                 .join("audio-clips")
                 .join(format!("segments-{timestamp}"));
@@ -5053,11 +5124,16 @@ async fn clip_audio_segments(
             let result = (|| {
                 for (index, segment) in request.segments.iter().enumerate() {
                     let temp_output = temp_dir.join(format!("clip-{:03}.wav", index + 1));
-                    let pre_input_args =
-                        vec!["-ss".to_string(), format!("{:.3}", segment.start_seconds.max(0.0))];
+                    let pre_input_args = vec![
+                        "-ss".to_string(),
+                        format!("{:.3}", segment.start_seconds.max(0.0)),
+                    ];
                     let post_input_args = vec![
                         "-t".to_string(),
-                        format!("{:.3}", (segment.end_seconds - segment.start_seconds).max(0.001)),
+                        format!(
+                            "{:.3}",
+                            (segment.end_seconds - segment.start_seconds).max(0.001)
+                        ),
                     ];
                     run_ffmpeg_general_command(
                         &app,
@@ -5098,11 +5174,16 @@ async fn clip_audio_segments(
                 unix_timestamp_millis()?,
                 suggested_name,
             )?;
-            let pre_input_args =
-                vec!["-ss".to_string(), format!("{:.3}", segment.start_seconds.max(0.0))];
+            let pre_input_args = vec![
+                "-ss".to_string(),
+                format!("{:.3}", segment.start_seconds.max(0.0)),
+            ];
             let post_input_args = vec![
                 "-t".to_string(),
-                format!("{:.3}", (segment.end_seconds - segment.start_seconds).max(0.001)),
+                format!(
+                    "{:.3}",
+                    (segment.end_seconds - segment.start_seconds).max(0.001)
+                ),
             ];
             run_ffmpeg_general_command(
                 &app,
@@ -5162,7 +5243,8 @@ async fn split_audio_file(
             .arg(&output_pattern);
         suppress_command_window(&mut command);
 
-        let output = run_command_with_timeout(&mut command, Duration::from_secs(900), "audio split")?;
+        let output =
+            run_command_with_timeout(&mut command, Duration::from_secs(900), "audio split")?;
         if !output.status.success() {
             let prefix = format!("{stem}-split-{timestamp}-");
             if let Ok(entries) = fs::read_dir(&output_dir) {
@@ -5202,7 +5284,10 @@ async fn split_audio_file(
 }
 
 fn ffmpeg_concat_line(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "'\\''");
     format!("file '{normalized}'")
 }
 
@@ -5220,7 +5305,10 @@ fn merge_audio_paths(
     }
     for path in audio_paths {
         if !path.exists() {
-            return Err(format!("Merge source does not exist: {}", path.to_string_lossy()));
+            return Err(format!(
+                "Merge source does not exist: {}",
+                path.to_string_lossy()
+            ));
         }
     }
 
@@ -5237,7 +5325,10 @@ fn merge_audio_paths(
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
 
-    let cache_root = app.path().app_cache_dir().map_err(|error| error.to_string())?;
+    let cache_root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?;
     let concat_dir = cache_root.join("audio-concat");
     fs::create_dir_all(&concat_dir).map_err(|error| error.to_string())?;
     let concat_path = concat_dir.join(format!("concat-{timestamp}.txt"));
@@ -5629,6 +5720,16 @@ mod tests {
         .expect("write engine config");
 
         model_dir
+    }
+
+    #[test]
+    fn clipboard_settle_delay_scales_for_long_text() {
+        let short_delay = clipboard_settle_delay("short");
+        let long_delay = clipboard_settle_delay(&"长文本".repeat(800));
+
+        assert!(short_delay >= Duration::from_millis(80));
+        assert!(long_delay > short_delay);
+        assert!(long_delay <= Duration::from_millis(980));
     }
 
     #[test]
@@ -6540,7 +6641,9 @@ Elapsed seconds: 0.16
         let segments = build_transcript_segments_from_chunks(&transcript_chunks, &source_audio);
 
         assert_eq!(segments[0].start, 0.0);
-        assert!(segments.iter().any(|segment| (segment.start - 60.0).abs() < 0.001));
+        assert!(segments
+            .iter()
+            .any(|segment| (segment.start - 60.0).abs() < 0.001));
         assert_eq!(segments.last().expect("last").end, 120.0);
     }
 

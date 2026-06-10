@@ -209,6 +209,17 @@ function formatSeconds(value: number) {
   return Number.isFinite(value) ? Math.max(0, value).toFixed(3) : "0.000";
 }
 
+function formatClockTime(seconds: number) {
+  const totalMilliseconds = Math.max(0, Math.round((Number.isFinite(seconds) ? seconds : 0) * 1000));
+  const hours = Math.floor(totalMilliseconds / 3_600_000);
+  const minutes = Math.floor((totalMilliseconds % 3_600_000) / 60_000);
+  const wholeSeconds = Math.floor((totalMilliseconds % 60_000) / 1000);
+  const milliseconds = totalMilliseconds % 1000;
+  return `${hours.toString().padStart(2, "0")}:${minutes.toString().padStart(2, "0")}:${wholeSeconds
+    .toString()
+    .padStart(2, "0")}.${milliseconds.toString().padStart(3, "0")}`;
+}
+
 function formatTimecode(seconds: number, fps: number) {
   const safeFps = Math.max(1, Math.round(fps || 25));
   const totalFrames = Math.max(0, Math.round(seconds * safeFps));
@@ -233,6 +244,43 @@ function parseTimecode(value: string, fps: number) {
     return null;
   }
   return hours * 3600 + minutes * 60 + seconds + frames / safeFps;
+}
+
+function parseClockTime(value: string, fps: number) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    return Number(trimmed);
+  }
+
+  const parts = trimmed.split(":");
+  if (parts.length === 4) {
+    return parseTimecode(trimmed, fps);
+  }
+  if (parts.length < 2 || parts.length > 3) {
+    return null;
+  }
+
+  const [rawHours, rawMinutes, rawSeconds] = parts.length === 3 ? parts : ["0", parts[0], parts[1]];
+  const hours = Number(rawHours);
+  const minutes = Number(rawMinutes);
+  const seconds = Number(rawSeconds);
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(seconds) ||
+    hours < 0 ||
+    minutes < 0 ||
+    seconds < 0 ||
+    minutes >= 60 ||
+    seconds >= 60
+  ) {
+    return null;
+  }
+
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function createClipSegment(startSeconds = 0, endSeconds = 10): ClipSegment {
@@ -411,15 +459,43 @@ export function AudioProcessingPage() {
     );
   }
 
-  function setActiveClipBoundary(boundary: "start" | "end", seconds: number) {
-    if (!activeClipSegment) {
-      return;
-    }
+  function setClipSegmentBoundary(id: string, boundary: "start" | "end", seconds: number) {
     const nextSeconds = clampSeconds(seconds, timelineDuration);
-    if (boundary === "start") {
-      updateClipSegment(activeClipSegment.id, { startSeconds: Math.min(nextSeconds, activeClipSegment.endSeconds - 0.001) });
-    } else {
-      updateClipSegment(activeClipSegment.id, { endSeconds: Math.max(nextSeconds, activeClipSegment.startSeconds + 0.001) });
+    setClipSegments((current) =>
+      current.map((segment) => {
+        if (segment.id !== id) {
+          return segment;
+        }
+
+        const duration = Math.max(0.001, segment.endSeconds - segment.startSeconds);
+        if (boundary === "start") {
+          if (nextSeconds < segment.endSeconds) {
+            return { ...segment, startSeconds: nextSeconds };
+          }
+          const endSeconds = Math.min(timelineDuration, nextSeconds + duration);
+          return {
+            ...segment,
+            startSeconds: Math.max(0, Math.min(nextSeconds, endSeconds - 0.001)),
+            endSeconds: Math.max(nextSeconds + 0.001, endSeconds),
+          };
+        }
+
+        if (nextSeconds > segment.startSeconds) {
+          return { ...segment, endSeconds: nextSeconds };
+        }
+        const startSeconds = Math.max(0, nextSeconds - duration);
+        return {
+          ...segment,
+          startSeconds: Math.min(startSeconds, Math.max(0, nextSeconds - 0.001)),
+          endSeconds: Math.max(nextSeconds, startSeconds + 0.001),
+        };
+      }),
+    );
+  }
+
+  function setActiveClipBoundary(boundary: "start" | "end", seconds: number) {
+    if (activeClipSegment) {
+      setClipSegmentBoundary(activeClipSegment.id, boundary, seconds);
     }
   }
 
@@ -543,7 +619,7 @@ export function AudioProcessingPage() {
   }
 
   function markBoundaryFromPlayhead(boundary: "start" | "end") {
-    setActiveClipBoundary(boundary, clipMediaRef.current?.currentTime ?? clipCurrentTime);
+    setActiveClipBoundary(boundary, clipCurrentTime);
   }
 
   function playActiveSelection() {
@@ -584,7 +660,7 @@ export function AudioProcessingPage() {
   }
 
   function addClipSegmentAtPlayhead() {
-    const start = clampSeconds(clipMediaRef.current?.currentTime ?? clipCurrentTime, timelineDuration);
+    const start = clampSeconds(clipCurrentTime, timelineDuration);
     const defaultLength = Math.min(10, Math.max(1, timelineDuration / 20));
     const end = Math.min(timelineDuration, start + defaultLength);
     const safeStart = end > start ? start : Math.max(0, timelineDuration - defaultLength);
@@ -1384,25 +1460,35 @@ export function AudioProcessingPage() {
                   >
                     <strong>片段 {index + 1}</strong>
                     <label>
-                      <span>开始秒</span>
+                      <span>开始时间</span>
                       <input
-                        min="0"
-                        step="0.001"
-                        type="number"
-                        value={formatSeconds(segment.startSeconds)}
+                        aria-label={`片段 ${index + 1} 开始时间`}
+                        inputMode="decimal"
+                        placeholder="00:00:00.000"
+                        value={formatClockTime(segment.startSeconds)}
                         disabled={isProcessing}
-                        onChange={(event) => updateClipSegment(segment.id, { startSeconds: Number(event.target.value) })}
+                        onChange={(event) => {
+                          const seconds = parseClockTime(event.target.value, frameRate.fps);
+                          if (seconds !== null) {
+                            setClipSegmentBoundary(segment.id, "start", seconds);
+                          }
+                        }}
                       />
                     </label>
                     <label>
-                      <span>结束秒</span>
+                      <span>结束时间</span>
                       <input
-                        min="0"
-                        step="0.001"
-                        type="number"
-                        value={formatSeconds(segment.endSeconds)}
+                        aria-label={`片段 ${index + 1} 结束时间`}
+                        inputMode="decimal"
+                        placeholder="00:00:00.000"
+                        value={formatClockTime(segment.endSeconds)}
                         disabled={isProcessing}
-                        onChange={(event) => updateClipSegment(segment.id, { endSeconds: Number(event.target.value) })}
+                        onChange={(event) => {
+                          const seconds = parseClockTime(event.target.value, frameRate.fps);
+                          if (seconds !== null) {
+                            setClipSegmentBoundary(segment.id, "end", seconds);
+                          }
+                        }}
                       />
                     </label>
                     <label>

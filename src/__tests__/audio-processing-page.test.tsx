@@ -416,6 +416,64 @@ describe("AudioProcessingPage", () => {
     );
   });
 
+  it("marks the clip start from the timeline playhead without collapsing the segment", async () => {
+    render(<AudioProcessingPage />);
+
+    fireEvent.click(document.querySelectorAll(".audio-tool-tab")[2] as HTMLButtonElement);
+    fireEvent.click(document.querySelector(".audio-drop-panel .secondary-button") as HTMLButtonElement);
+    await screen.findByText("C:\\recordings\\voice.wav");
+    await waitFor(() => expect(prepareAudioWaveform).toHaveBeenCalled());
+
+    const waveform = document.querySelector(".clip-waveform") as HTMLDivElement;
+    Object.defineProperty(waveform, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({ left: 0, right: 100, top: 0, bottom: 100, width: 100, height: 100, x: 0, y: 0, toJSON: () => {} }),
+    });
+
+    const pointerDown = createEvent.pointerDown(waveform, { clientX: 50 });
+    Object.defineProperty(pointerDown, "clientX", { value: 50 });
+    fireEvent(waveform, pointerDown);
+    const pointerUp = createEvent.pointerUp(window, { clientX: 50 });
+    Object.defineProperty(pointerUp, "clientX", { value: 50 });
+    fireEvent(window, pointerUp);
+    await waitFor(() => expect((document.querySelector(".clip-playhead") as HTMLElement).style.left).toBe("50%"));
+
+    const markInButton = document.querySelectorAll(".clip-preview-actions .secondary-button")[0] as HTMLButtonElement;
+    fireEvent.click(markInButton);
+    fireEvent.click(document.querySelector(".audio-process-button") as HTMLButtonElement);
+
+    await waitFor(() => expect(clipAudioSegments).toHaveBeenCalled());
+    const exportedSegments = vi.mocked(clipAudioSegments).mock.calls[0][1];
+    expect(exportedSegments[0]).toEqual(
+      expect.objectContaining({
+        startSeconds: expect.closeTo(60, 3),
+        endSeconds: expect.closeTo(70, 3),
+      }),
+    );
+  });
+
+  it("accepts clock time values for clip segment boundaries", async () => {
+    render(<AudioProcessingPage />);
+
+    fireEvent.click(document.querySelectorAll(".audio-tool-tab")[2] as HTMLButtonElement);
+    fireEvent.click(document.querySelector(".audio-drop-panel .secondary-button") as HTMLButtonElement);
+    await screen.findByText("C:\\recordings\\voice.wav");
+    await waitFor(() => expect(prepareAudioWaveform).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText("片段 1 开始时间"), { target: { value: "00:01:05.500" } });
+    fireEvent.change(screen.getByLabelText("片段 1 结束时间"), { target: { value: "00:01:10.500" } });
+    fireEvent.click(document.querySelector(".audio-process-button") as HTMLButtonElement);
+
+    await waitFor(() => expect(clipAudioSegments).toHaveBeenCalled());
+    const exportedSegments = vi.mocked(clipAudioSegments).mock.calls[0][1];
+    expect(exportedSegments[0]).toEqual(
+      expect.objectContaining({
+        startSeconds: expect.closeTo(65.5, 3),
+        endSeconds: expect.closeTo(70.5, 3),
+      }),
+    );
+  });
+
   it("does not stop normal media playback at the active clip boundary", async () => {
     render(<AudioProcessingPage />);
 
