@@ -4,15 +4,6 @@ updates:
     directory: "/src-tauri"
     schedule:
       interval: "weekly"
-    ignore:
-      # Hi-Voicer releases Windows artifacts only. glib is pulled into Cargo.lock
-      # by Tauri's Linux GTK/WebKit dependency chain and is not compiled into the
-      # Windows release produced by .github/workflows/release.yml.
-      - dependency-name: "glib"
-        update-types:
-          - "version-update:semver-major"
-          - "version-update:semver-minor"
-          - "version-update:semver-patch"
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
