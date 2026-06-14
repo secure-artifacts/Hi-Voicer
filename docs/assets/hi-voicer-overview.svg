@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="820" viewBox="0 0 1440 820" role="img" aria-labelledby="title desc">
-  <title id="title">Hi-Voicer 1.0.6 current interface overview</title>
+  <title id="title">Hi-Voicer 1.0.7 current interface overview</title>
   <desc id="desc">A dark Hi-Voicer desktop interface overview showing audio processing tabs, waveform clipping, multi-segment selections, queue history, and local transcription tools.</desc>
   <defs>
     <linearGradient id="app-bg" x1="0" y1="0" x2="1" y2="1">
@@ -131,7 +131,7 @@
 
         <g transform="translate(0 602)">
           <rect width="996" height="56" rx="10" fill="#0b3a38" stroke="#20d6c7"/>
-          <text x="20" y="35" fill="#ecfeff" font-size="17" font-weight="850">1.0.6：升级前端构建链；修正 CI 锁文件</text>
+          <text x="20" y="35" fill="#ecfeff" font-size="17" font-weight="850">1.0.7：升级前端构建链；固定发布 npm 版本</text>
         </g>
       </g>
     </g>
