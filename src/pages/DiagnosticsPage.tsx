@@ -1,4 +1,4 @@
-import { Download, FileAudio, FileDown, TestTube2 } from "lucide-react";
+import { FileAudio, FileDown, TestTube2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import {
   getNativeAudioDiagnostics,
@@ -60,7 +60,7 @@ function buildGpuDiagnosticReport(
       `NVIDIA 信息: ${status.cudaDeviceSummary || "(无)"}`,
       `NVIDIA 检测错误: ${status.cudaDetectionError || "(无)"}`,
       `CPU runtime: ${status.cpuRuntimeInstalled ? "已安装" : "未安装/随模型准备"}`,
-      `CUDA runtime: ${status.cudaRuntimeInstalled ? "已安装" : "未安装/需手动准备"}`,
+      `CUDA runtime: ${status.cudaRuntimeInstalled ? "已找到" : "未找到，本软件不会自动下载"}`,
       `CUDA 本次会话停用原因: ${status.cudaDisabledReason || "(无)"}`,
       `状态消息: ${status.message}`,
     );
@@ -305,7 +305,7 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
               <strong>运行时</strong>
               <p>
                 CPU {accelerationStatus.cpuRuntimeInstalled ? "已安装" : "随模型准备"} / CUDA{" "}
-                {accelerationStatus.cudaRuntimeInstalled ? "已安装" : "需手动准备"}
+                {accelerationStatus.cudaRuntimeInstalled ? "已找到" : "未找到，本软件不会自动下载"}
               </p>
             </div>
           )}
@@ -316,8 +316,8 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
           disabled={settings.accelerationMode !== "cuda" || isPreparingAcceleration}
           onClick={() => void handlePrepareAcceleration()}
         >
-          <Download size={17} />
-          {isPreparingAcceleration ? "正在准备 CUDA..." : "准备 CUDA 运行时"}
+          <TestTube2 size={17} />
+          {isPreparingAcceleration ? "正在检测 CUDA..." : "检测本地 CUDA"}
         </button>
         <button
           className="secondary-button"

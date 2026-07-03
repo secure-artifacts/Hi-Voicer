@@ -162,7 +162,7 @@ export function TranscriptionPage({
         filePath,
         status: "queued" as const,
         progress: 0,
-        outputFormats: ["txt", "srt"] as Array<"txt" | "srt">,
+        outputFormats: ["txt", "timelineTxt", "srt", "edl"] as Array<"txt" | "timelineTxt" | "srt" | "edl">,
         message: "等待转录",
       }));
       onTasksChange((current) => [...queuedTasks, ...current.filter((item) => item.id !== "sample-1")]);

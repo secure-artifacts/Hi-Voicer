@@ -8,3 +8,4 @@ log.txt
 .inspect-*/
 .reference/
 .release-artifacts/
+src-tauri/resources/engines/

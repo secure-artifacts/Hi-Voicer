@@ -40,9 +40,20 @@ const SHERPA_CPU_ARCHIVE_NAME: &str =
     "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
 const SHERPA_CPU_RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
 const SHERPA_CUDA_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda";
-const SHERPA_CUDA_ARCHIVE_NAME: &str =
-    "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda.tar.bz2";
-const SHERPA_CUDA_RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda.tar.bz2";
+const SHERPA_CUDA_REQUIRED_DLLS: &[&str] = &[
+    "cudart64_12.dll",
+    "cublas64_12.dll",
+    "cublasLt64_12.dll",
+    "cufft64_11.dll",
+    "cudnn64_9.dll",
+    "cudnn_adv64_9.dll",
+    "cudnn_cnn64_9.dll",
+    "cudnn_engines_precompiled64_9.dll",
+    "cudnn_engines_runtime_compiled64_9.dll",
+    "cudnn_graph64_9.dll",
+    "cudnn_heuristic64_9.dll",
+    "cudnn_ops64_9.dll",
+];
 
 struct RuntimeState {
     settings: Mutex<UserSettings>,
@@ -1014,18 +1025,72 @@ fn download_file(url: &str, destination: &Path) -> Result<(), String> {
     Err(format!("download failed after 3 attempts: {last_error}"))
 }
 
+fn sherpa_runtime_relative_executable(runtime_name: &str) -> PathBuf {
+    PathBuf::from("engines")
+        .join("sherpa")
+        .join(SHERPA_RUNTIME_TAG)
+        .join(runtime_name)
+        .join("bin")
+        .join("sherpa-onnx-offline.exe")
+}
+
 fn sherpa_runtime_executable_path(app: &AppHandle, runtime_name: &str) -> Result<PathBuf, String> {
     let data_dir = app
         .path()
         .app_local_data_dir()
         .map_err(|error| error.to_string())?;
-    Ok(data_dir
-        .join("engines")
-        .join("sherpa")
-        .join(SHERPA_RUNTIME_TAG)
-        .join(runtime_name)
-        .join("bin")
-        .join("sherpa-onnx-offline.exe"))
+    Ok(data_dir.join(sherpa_runtime_relative_executable(runtime_name)))
+}
+
+fn sherpa_runtime_search_roots(
+    data_dir: &Path,
+    resource_dir: Option<&Path>,
+    executable_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = vec![data_dir.to_path_buf()];
+    if let Some(resource_dir) = resource_dir {
+        push_unique_path(&mut roots, resource_dir.to_path_buf());
+    }
+    if let Some(executable_dir) = executable_dir {
+        push_unique_path(&mut roots, executable_dir.to_path_buf());
+    }
+    roots
+}
+
+fn sherpa_runtime_search_roots_for_app(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?;
+    let resource_dir = app.path().resource_dir().ok();
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+
+    Ok(sherpa_runtime_search_roots(
+        &data_dir,
+        resource_dir.as_deref(),
+        executable_dir.as_deref(),
+    ))
+}
+
+fn sherpa_runtime_executable_candidates(roots: &[PathBuf], runtime_name: &str) -> Vec<PathBuf> {
+    let relative = sherpa_runtime_relative_executable(runtime_name);
+    let mut candidates = Vec::new();
+    for root in roots {
+        push_unique_path(&mut candidates, root.join(&relative));
+    }
+    candidates
+}
+
+fn find_sherpa_runtime_executable(
+    app: &AppHandle,
+    runtime_name: &str,
+) -> Result<Option<PathBuf>, String> {
+    let roots = sherpa_runtime_search_roots_for_app(app)?;
+    Ok(sherpa_runtime_executable_candidates(&roots, runtime_name)
+        .into_iter()
+        .find(|path| path.exists()))
 }
 
 fn sherpa_runtime_dir_from_executable(executable: &Path) -> Result<PathBuf, String> {
@@ -1125,15 +1190,6 @@ fn install_sherpa_runtime(app: &AppHandle) -> Result<PathBuf, String> {
         SHERPA_CPU_RUNTIME_NAME,
         SHERPA_CPU_ARCHIVE_NAME,
         SHERPA_CPU_RUNTIME_URL,
-    )
-}
-
-fn install_sherpa_cuda_runtime(app: &AppHandle) -> Result<PathBuf, String> {
-    install_sherpa_runtime_archive(
-        app,
-        SHERPA_CUDA_RUNTIME_NAME,
-        SHERPA_CUDA_ARCHIVE_NAME,
-        SHERPA_CUDA_RUNTIME_URL,
     )
 }
 
@@ -1927,6 +1983,139 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.exists() {
+        push_unique_path(paths, path);
+    }
+}
+
+fn push_cuda_bin_candidates(paths: &mut Vec<PathBuf>, bin: PathBuf) {
+    push_existing_unique_path(paths, bin.clone());
+    if let Ok(entries) = fs::read_dir(&bin) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                push_existing_unique_path(paths, child);
+            }
+        }
+    }
+}
+
+fn push_cuda_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) {
+    push_cuda_bin_candidates(paths, root.join("bin"));
+    push_existing_unique_path(paths, root.clone());
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                push_cuda_bin_candidates(paths, child.join("bin"));
+                push_cuda_bin_candidates(paths, child.join("cuda").join("bin"));
+            }
+        }
+    }
+}
+
+fn cuda_dependency_search_dirs(runtime_executable: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(parent) = runtime_executable.parent() {
+        push_existing_unique_path(&mut dirs, parent.to_path_buf());
+    }
+
+    if let Some(path_value) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&path_value) {
+            push_existing_unique_path(&mut dirs, path);
+        }
+    }
+
+    for (key, value) in std::env::vars_os() {
+        let key = key.to_string_lossy().to_ascii_uppercase();
+        if key == "CUDA_PATH" || key.starts_with("CUDA_PATH_V") || key == "CUDNN_PATH" {
+            push_cuda_root_candidates(&mut dirs, PathBuf::from(value));
+        }
+    }
+
+    for env_name in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(env_name) {
+            let root = PathBuf::from(root);
+            push_cuda_root_candidates(
+                &mut dirs,
+                root.join("NVIDIA GPU Computing Toolkit").join("CUDA"),
+            );
+            push_cuda_root_candidates(&mut dirs, root.join("NVIDIA").join("CUDNN"));
+            push_cuda_root_candidates(&mut dirs, root.join("NVIDIA Corporation").join("CUDNN"));
+        }
+    }
+
+    dirs
+}
+
+fn cuda_dependency_status_from_dirs(
+    dirs: &[PathBuf],
+    required_dlls: &[&str],
+) -> Result<Vec<PathBuf>, String> {
+    let existing_dirs = dirs
+        .iter()
+        .filter(|dir| dir.exists())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut used_dirs = Vec::new();
+    let mut missing = Vec::new();
+
+    for dll in required_dlls {
+        if let Some(dir) = existing_dirs.iter().find(|dir| dir.join(dll).is_file()) {
+            push_unique_path(&mut used_dirs, dir.clone());
+        } else {
+            missing.push(*dll);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(used_dirs);
+    }
+
+    let searched = if existing_dirs.is_empty() {
+        "no existing CUDA library directories were found".to_string()
+    } else {
+        existing_dirs
+            .iter()
+            .map(|dir| dir.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Err(format!(
+        "CUDA dependencies are incomplete; missing: {}. Install NVIDIA CUDA Toolkit 12.x and cuDNN 9.x, or add their bin directories to PATH. Searched: {searched}",
+        missing.join(", ")
+    ))
+}
+
+fn cuda_dependency_status(runtime_executable: &Path) -> Result<Vec<PathBuf>, String> {
+    cuda_dependency_status_from_dirs(
+        &cuda_dependency_search_dirs(runtime_executable),
+        SHERPA_CUDA_REQUIRED_DLLS,
+    )
+}
+
+fn configure_cuda_command_environment(
+    command: &mut Command,
+    executable: &Path,
+    runtime_mode: &str,
+) -> Result<(), String> {
+    if !runtime_mode.eq_ignore_ascii_case("cuda") {
+        return Ok(());
+    }
+
+    let dependency_dirs = cuda_dependency_status(executable)?;
+    let mut path_entries = dependency_dirs;
+    if let Some(existing_path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&existing_path));
+    }
+    let joined_path = std::env::join_paths(path_entries)
+        .map_err(|error| format!("failed to build CUDA PATH: {error}"))?;
+    command.env("PATH", joined_path);
+    Ok(())
+}
 fn nvidia_smi_candidate_paths(
     system_root: Option<&str>,
     windir: Option<&str>,
@@ -2153,7 +2342,7 @@ fn acceleration_status_from_parts(
         } else if let Some(error) = prepare_error {
             (
                 "cpu",
-                format!("CUDA runtime preparation failed; using CPU: {error}"),
+                format!("CUDA runtime check failed; using CPU: {error}"),
             )
         } else {
             match (cuda_available, cuda_runtime_installed) {
@@ -2163,7 +2352,7 @@ fn acceleration_status_from_parts(
                 ),
                 (true, false) => (
                     "cpu",
-                    "NVIDIA CUDA was detected, but the local CUDA runtime is not prepared; transcription will use CPU until CUDA is prepared explicitly.".to_string(),
+                    "NVIDIA CUDA was detected, but no local CUDA-capable Sherpa runtime was found; transcription will use CPU. Hi-Voicer will not download CUDA files automatically.".to_string(),
                 ),
                 (true, true) => (
                     "cuda",
@@ -2174,7 +2363,7 @@ fn acceleration_status_from_parts(
     } else if let Some(error) = prepare_error {
         (
             "cpu",
-            format!("CUDA runtime preparation failed; using CPU: {error}"),
+            format!("CUDA runtime check failed; using CPU: {error}"),
         )
     } else {
         (
@@ -2209,8 +2398,15 @@ fn acceleration_status_for_app(
     let cuda_info = query_nvidia_cuda_info();
     let cpu_runtime_installed =
         sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
-    let cuda_runtime_installed =
-        sherpa_runtime_executable_path(app, SHERPA_CUDA_RUNTIME_NAME)?.exists();
+    let cuda_runtime_executable = find_sherpa_runtime_executable(app, SHERPA_CUDA_RUNTIME_NAME)?;
+    let cuda_runtime_installed = cuda_runtime_executable.is_some();
+    let prepare_error = if selected_mode == "cuda" {
+        cuda_runtime_executable
+            .as_deref()
+            .and_then(|executable| cuda_dependency_status(executable).err())
+    } else {
+        None
+    };
 
     Ok(acceleration_status_from_parts(
         selected_mode,
@@ -2220,7 +2416,7 @@ fn acceleration_status_for_app(
         cpu_runtime_installed,
         cuda_runtime_installed,
         cuda_circuit_reason(app),
-        None,
+        prepare_error,
     ))
 }
 
@@ -2243,28 +2439,41 @@ fn prepare_acceleration_runtime_for_app(
         return acceleration_status_for_app(app, requested_mode);
     }
 
-    let prepare_error = match install_sherpa_cuda_runtime(app) {
-        Ok(executable) => match smoke_test_sherpa_runtime(&executable) {
-            Ok(()) => {
-                mark_cuda_runtime_startup_checked(app, &executable);
-                None
-            }
+    let cuda_runtime_executable = find_sherpa_runtime_executable(app, SHERPA_CUDA_RUNTIME_NAME)?;
+    let mut should_trip_cuda_circuit = false;
+    let prepare_error = if let Some(cuda_runtime_executable) = cuda_runtime_executable {
+        match cuda_dependency_status(&cuda_runtime_executable) {
+            Ok(_) => match smoke_test_sherpa_runtime(&cuda_runtime_executable) {
+                Ok(()) => {
+                    mark_cuda_runtime_startup_checked(app, &cuda_runtime_executable);
+                    None
+                }
+                Err(error) => {
+                    should_trip_cuda_circuit = true;
+                    clear_cuda_runtime_startup_checked(app);
+                    Some(error)
+                }
+            },
             Err(error) => {
                 clear_cuda_runtime_startup_checked(app);
                 Some(error)
             }
-        },
-        Err(error) => Some(error),
+        }
+    } else {
+        clear_cuda_runtime_startup_checked(app);
+        None
     };
     if let Some(error) = prepare_error.as_ref() {
-        trip_cuda_circuit(app, error.clone());
+        if should_trip_cuda_circuit {
+            trip_cuda_circuit(app, error.clone());
+        }
     } else {
         clear_cuda_circuit(app);
     }
     let cpu_runtime_installed =
         sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
     let cuda_runtime_installed =
-        sherpa_runtime_executable_path(app, SHERPA_CUDA_RUNTIME_NAME)?.exists();
+        find_sherpa_runtime_executable(app, SHERPA_CUDA_RUNTIME_NAME)?.is_some();
 
     let mut status = acceleration_status_from_parts(
         selected_mode,
@@ -2278,7 +2487,8 @@ fn prepare_acceleration_runtime_for_app(
     );
     if status.effective_mode == "cuda" {
         status.message =
-            "CUDA runtime is installed and passed the startup check; failures will still fall back to CPU.".to_string();
+            "Local CUDA runtime passed the startup check; failures will still fall back to CPU."
+                .to_string();
     }
 
     Ok(status)
@@ -2321,17 +2531,17 @@ fn resolve_sherpa_runtime(
         };
     }
 
-    let cuda_runtime_executable = match sherpa_runtime_executable_path(
+    let cuda_runtime_executable = match find_sherpa_runtime_executable(
         app,
         SHERPA_CUDA_RUNTIME_NAME,
     ) {
-        Ok(executable) if executable.exists() => executable,
-        Ok(_) => {
+        Ok(Some(executable)) => executable,
+        Ok(None) => {
             return ResolvedSherpaRuntime {
                 executable: cpu_executable,
                 mode: "cpu".to_string(),
                 fallback_reason: Some(
-                    "Local CUDA runtime is not prepared; using CPU without downloading during transcription."
+                    "No local CUDA-capable Sherpa runtime was found; using CPU without downloading during transcription."
                         .to_string(),
                 ),
             };
@@ -2345,6 +2555,16 @@ fn resolve_sherpa_runtime(
         }
     };
     let cuda_executable = sherpa_cli_executable_for_engine(engine, &cuda_runtime_executable);
+
+    if let Err(error) = cuda_dependency_status(&cuda_executable) {
+        return ResolvedSherpaRuntime {
+            executable: cpu_executable,
+            mode: "cpu".to_string(),
+            fallback_reason: Some(format!(
+                "CUDA dependencies are incomplete; using CPU: {error}"
+            )),
+        };
+    }
 
     if !is_cuda_runtime_startup_checked(app, &cuda_executable) {
         if let Err(error) = smoke_test_sherpa_runtime(&cuda_executable) {
@@ -2456,6 +2676,7 @@ fn ensure_sherpa_daemon_running(
     let mut command = Command::new(&server_exe);
     command.args(sherpa_args_for_runtime(&engine.args, None, runtime_mode)?);
     command.arg(format!("--port={SHERPA_DAEMON_PORT}"));
+    configure_cuda_command_environment(&mut command, &server_exe, runtime_mode)?;
     if let Some(parent) = server_exe.parent() {
         command.current_dir(parent);
     }
@@ -2792,6 +3013,20 @@ fn format_timeline_timestamp(seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}:{frames:02}")
 }
 
+fn frames_to_davinci_timecode(frames: u64) -> String {
+    let hours = frames / (DAVINCI_TIMECODE_FPS * 60 * 60);
+    let remainder = frames % (DAVINCI_TIMECODE_FPS * 60 * 60);
+    let minutes = remainder / (DAVINCI_TIMECODE_FPS * 60);
+    let remainder = remainder % (DAVINCI_TIMECODE_FPS * 60);
+    let seconds = remainder / DAVINCI_TIMECODE_FPS;
+    let frame = remainder % DAVINCI_TIMECODE_FPS;
+    format!("{hours:02}:{minutes:02}:{seconds:02}:{frame:02}")
+}
+
+fn seconds_to_davinci_frames(seconds: f64) -> u64 {
+    (seconds.max(0.0) * DAVINCI_TIMECODE_FPS as f64).round() as u64
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TranscriptSegment {
@@ -2982,39 +3217,160 @@ fn build_transcript_segments_from_chunks(
 fn transcript_text_from_chunks(chunks: &[TranscriptTextChunk]) -> String {
     chunks
         .iter()
-        .map(|chunk| chunk.text.trim())
+        .map(|chunk| clean_subtitle_text(&chunk.text))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+fn clean_subtitle_text(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn clean_subtitle_text_one_line(text: &str) -> String {
+    clean_subtitle_text(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn timeline_text_from_segments(segments: &[TranscriptSegment]) -> String {
     segments
         .iter()
-        .map(|segment| {
-            format!(
+        .filter_map(|segment| {
+            let text = clean_subtitle_text(&segment.text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!(
                 "[{} --> {}]\n{}",
                 format_timeline_timestamp(segment.start),
                 format_timeline_timestamp(segment.end),
-                segment.text
+                text
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn timeline_txt_text_from_segments(segments: &[TranscriptSegment]) -> String {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            let text = clean_subtitle_text_one_line(&segment.text);
+            if text.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "[{} --> {}] {}",
+                format_timeline_timestamp(segment.start),
+                format_timeline_timestamp(segment.end),
+                text
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn srt_text_from_segments(segments: &[TranscriptSegment]) -> String {
+    segments
+        .iter()
+        .filter_map(|segment| {
+            let text = clean_subtitle_text(&segment.text);
+            if text.is_empty() {
+                None
+            } else {
+                Some((segment, text))
+            }
+        })
+        .enumerate()
+        .map(|(index, (segment, text))| {
+            format!(
+                "{}\n{} --> {}\n{}",
+                index + 1,
+                format_srt_timestamp(segment.start),
+                format_srt_timestamp(segment.end),
+                text
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
-fn srt_text_from_segments(segments: &[TranscriptSegment]) -> String {
-    let mut output = String::new();
-    for (index, segment) in segments.iter().enumerate() {
-        output.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
-            index + 1,
-            format_srt_timestamp(segment.start),
-            format_srt_timestamp(segment.end),
-            segment.text
-        ));
+fn clean_resolve_marker_text(text: &str, max_length: usize) -> String {
+    let mut without_tags = String::new();
+    let mut in_tag = false;
+    for character in text.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => without_tags.push(character),
+            _ => {}
+        }
     }
-    output
+
+    let one_line = without_tags
+        .replace('|', "/")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one_line.is_empty() {
+        return "Subtitle marker".to_string();
+    }
+    if one_line.chars().count() > max_length {
+        let mut trimmed = one_line
+            .chars()
+            .take(max_length.saturating_sub(1))
+            .collect::<String>();
+        trimmed = trimmed.trim_end().to_string();
+        trimmed.push_str("...");
+        return trimmed;
+    }
+    one_line
+}
+
+fn resolve_marker_edl_from_segments(title: &str, segments: &[TranscriptSegment]) -> String {
+    const TIMELINE_START_FRAMES: u64 = DAVINCI_TIMECODE_FPS * 60 * 60;
+    const MARKER_DURATION_FRAMES: u64 = 1;
+    const MAX_MARKER_TEXT_LENGTH: usize = 180;
+
+    let mut lines = vec![
+        format!("TITLE: {title}"),
+        "FCM: NON-DROP FRAME".to_string(),
+        String::new(),
+    ];
+
+    for (event_index, segment) in segments.iter().enumerate() {
+        let start_frame = TIMELINE_START_FRAMES + seconds_to_davinci_frames(segment.start);
+        let subtitle_duration = seconds_to_davinci_frames(segment.end - segment.start).max(1);
+        let duration_frames = MARKER_DURATION_FRAMES.max(1).min(subtitle_duration.max(1));
+        let end_frame = start_frame + duration_frames;
+        let start_tc = frames_to_davinci_timecode(start_frame);
+        let end_tc = frames_to_davinci_timecode(end_frame);
+        let text = clean_resolve_marker_text(&segment.text, MAX_MARKER_TEXT_LENGTH);
+
+        lines.push(format!(
+            "{:03}  001      V     C        {start_tc} {end_tc} {start_tc} {end_tc}",
+            event_index + 1
+        ));
+        lines.push(format!(
+            " |C:ResolveColorYellow |M:{text} |D:{duration_frames}"
+        ));
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+fn write_utf8_sig(path: &Path, contents: &str) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(contents.len() + 3);
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(contents.as_bytes());
+    fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 fn emit_transcription_progress(
@@ -3059,6 +3415,7 @@ fn transcribe_sherpa_wav_cli(
         runtime_mode,
     )?);
     command.arg(wav_path);
+    configure_cuda_command_environment(&mut command, executable, runtime_mode)?;
     suppress_command_window(&mut command);
 
     let duration = wav_duration_seconds(wav_path).unwrap_or(60.0);
@@ -3121,7 +3478,10 @@ fn transcribe_sherpa_wav(
             started_at,
             "transcribing",
             35,
-            "Running local Sherpa model".to_string(),
+            format!(
+                "Running local Sherpa model on {}",
+                runtime_mode.to_uppercase()
+            ),
             0,
             1,
         );
@@ -3392,13 +3752,23 @@ fn write_transcription_outputs(
     let suffix = unix_timestamp_millis()?;
     let plain_path = output_dir.join(format!("{stem}-{suffix}.txt"));
     let timeline_path = output_dir.join(format!("{stem}-{suffix}-timeline.txt"));
+    let timeline_txt_path = output_dir.join(format!("{stem}-{suffix}-timeline-txt.txt"));
     let srt_path = output_dir.join(format!("{stem}-{suffix}.srt"));
+    let resolve_markers_path = output_dir.join(format!("{stem}-{suffix}.markers.edl"));
     let _ = sherpa_audio_path;
 
     fs::write(&plain_path, text).map_err(|error| error.to_string())?;
     fs::write(&timeline_path, timeline_text_from_segments(segments))
         .map_err(|error| error.to_string())?;
+    write_utf8_sig(
+        &timeline_txt_path,
+        &timeline_txt_text_from_segments(segments),
+    )?;
     fs::write(&srt_path, srt_text_from_segments(segments)).map_err(|error| error.to_string())?;
+    write_utf8_sig(
+        &resolve_markers_path,
+        &resolve_marker_edl_from_segments(stem, segments),
+    )?;
 
     let files = vec![
         TranscriptionOutputFile {
@@ -3412,9 +3782,19 @@ fn write_transcription_outputs(
             path: timeline_path.to_string_lossy().to_string(),
         },
         TranscriptionOutputFile {
+            format: "timelineTxt".to_string(),
+            label: "Timeline TXT one-line (UTF-8 BOM)".to_string(),
+            path: timeline_txt_path.to_string_lossy().to_string(),
+        },
+        TranscriptionOutputFile {
             format: "srt".to_string(),
             label: "SRT subtitles".to_string(),
             path: srt_path.to_string_lossy().to_string(),
+        },
+        TranscriptionOutputFile {
+            format: "resolveMarkers".to_string(),
+            label: "DaVinci Resolve markers".to_string(),
+            path: resolve_markers_path.to_string_lossy().to_string(),
         },
     ];
     let output_paths = files
@@ -3423,8 +3803,12 @@ fn write_transcription_outputs(
         .collect::<Vec<_>>();
     let primary = if preferred_format == "timelineText" {
         timeline_path
+    } else if preferred_format == "timelineTxt" {
+        timeline_txt_path
     } else if preferred_format == "srt" {
         srt_path
+    } else if preferred_format == "resolveMarkers" {
+        resolve_markers_path
     } else {
         plain_path
     };
@@ -3507,13 +3891,23 @@ fn transcribe_file_with_sherpa(
             started_at,
             "transcribing",
             14,
-            "Checking local CUDA runtime; CPU fallback will be used if unavailable.".to_string(),
+            "Checking local CUDA runtime; Hi-Voicer will not download CUDA files and will fall back to CPU if unavailable.".to_string(),
             0,
             0,
         );
     }
 
     let runtime = resolve_sherpa_runtime(&app, &engine, &request.acceleration_mode);
+    emit_transcription_progress(
+        &app,
+        request.task_id.as_deref(),
+        started_at,
+        "transcribing",
+        19,
+        format!("Actual acceleration path: {}", runtime.mode.to_uppercase()),
+        0,
+        0,
+    );
     let runtime_performance = performance_for_acceleration(performance, &runtime.mode);
     if let Some(reason) = runtime.fallback_reason.as_ref() {
         emit_transcription_progress(
@@ -5959,7 +6353,9 @@ mod tests {
         assert_eq!(status.selected_mode, "cuda");
         assert_eq!(status.effective_mode, "cpu");
         assert!(!status.cuda_runtime_installed);
-        assert!(status.message.contains("not prepared"));
+        assert!(status
+            .message
+            .contains("no local CUDA-capable Sherpa runtime"));
     }
 
     #[test]
@@ -6401,8 +6797,8 @@ Elapsed seconds: 0.16
         )
         .expect("outputs");
 
-        assert_eq!(outputs.len(), 3);
-        assert_eq!(files.len(), 3);
+        assert_eq!(outputs.len(), 5);
+        assert_eq!(files.len(), 5);
         assert!(PathBuf::from(&primary).starts_with(&root));
         assert!(primary.ends_with(".txt"));
         assert_eq!(fs::read_to_string(&files[0].path).expect("txt"), "hello");
@@ -6429,25 +6825,99 @@ Elapsed seconds: 0.16
 
         assert!(PathBuf::from(&primary).starts_with(&root));
         assert!(primary.ends_with("-timeline.txt"));
-        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs.len(), 5);
         assert_eq!(
             files
                 .iter()
                 .map(|file| file.format.as_str())
                 .collect::<Vec<_>>(),
-            vec!["plainText", "timelineText", "srt"]
+            vec![
+                "plainText",
+                "timelineText",
+                "timelineTxt",
+                "srt",
+                "resolveMarkers"
+            ]
         );
         assert!(fs::read_to_string(&files[1].path)
             .expect("timeline txt")
             .contains("[00:00:00:00 -->"));
-        assert!(fs::read_to_string(&files[2].path)
+        let timeline_txt_bytes = fs::read(&files[2].path).expect("timeline txt bom");
+        assert_eq!(&timeline_txt_bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let timeline_txt =
+            String::from_utf8(timeline_txt_bytes[3..].to_vec()).expect("timeline txt utf8");
+        assert!(timeline_txt.contains("[00:00:00:00 --> 00:00:01:00] hello"));
+        assert!(!timeline_txt.contains("]\nhello"));
+        assert!(fs::read_to_string(&files[3].path)
             .expect("srt")
             .contains("00:00:00,000 -->"));
+        let resolve_markers = fs::read_to_string(&files[4].path).expect("resolve markers");
+        assert!(resolve_markers.contains("TITLE: sample"));
+        assert!(resolve_markers.contains("FCM: NON-DROP FRAME"));
+        assert!(resolve_markers.contains("01:00:00:00 01:00:00:01"));
+        assert!(resolve_markers.contains("|C:ResolveColorYellow |M:hello |D:1"));
     }
 
     #[test]
     fn formats_timeline_timestamp_as_davinci_timecode() {
         assert_eq!(format_timeline_timestamp(80.5), "00:01:20:12");
+    }
+
+    #[test]
+    fn formats_srt_timestamp_with_standard_millisecond_comma() {
+        assert_eq!(format_srt_timestamp(80.5), "00:01:20,500");
+    }
+
+    #[test]
+    fn timeline_txt_can_be_primary_without_replacing_original_timeline_text() {
+        let root =
+            test_root("timeline-txt-can-be-primary-without-replacing-original-timeline-text");
+        let source_audio = root.join("sample.wav");
+        let sherpa_audio = root.join("sample-16k.wav");
+        fs::write(&source_audio, b"source").expect("write source");
+        write_test_wav(&sherpa_audio);
+        let segments = build_transcript_segments("hello", 1.0, &source_audio);
+
+        let (primary, _outputs, files) = write_transcription_outputs(
+            &root,
+            "timelineTxt",
+            &source_audio,
+            &sherpa_audio,
+            "hello",
+            &segments,
+        )
+        .expect("outputs");
+
+        assert!(primary.ends_with("-timeline-txt.txt"));
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("-timeline.txt")));
+        assert!(files
+            .iter()
+            .any(|file| file.path.ends_with("-timeline-txt.txt")));
+    }
+
+    #[test]
+    fn uses_resolve_markers_as_primary_output_when_requested() {
+        let root = test_root("uses-resolve-markers-as-primary-output-when-requested");
+        let source_audio = root.join("sample.wav");
+        let sherpa_audio = root.join("sample-16k.wav");
+        fs::write(&source_audio, b"source").expect("write source");
+        write_test_wav(&sherpa_audio);
+        let segments = build_transcript_segments("hello", 1.0, &source_audio);
+
+        let (primary, _outputs, _files) = write_transcription_outputs(
+            &root,
+            "resolveMarkers",
+            &source_audio,
+            &sherpa_audio,
+            "hello",
+            &segments,
+        )
+        .expect("outputs");
+
+        assert!(PathBuf::from(&primary).starts_with(&root));
+        assert!(primary.ends_with(".markers.edl"));
     }
 
     #[test]
@@ -6642,6 +7112,70 @@ Elapsed seconds: 0.16
         assert!(detail.contains("verified when recording starts"));
     }
 
+    #[test]
+    fn sherpa_runtime_candidates_include_bundled_and_portable_locations() {
+        let data_dir = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");
+        let resource_dir = PathBuf::from(r"C:\Program Files\Hi-Voicer");
+        let executable_dir = PathBuf::from(r"C:\Portable\Hi-Voicer");
+        let roots =
+            sherpa_runtime_search_roots(&data_dir, Some(&resource_dir), Some(&executable_dir));
+        let candidates = sherpa_runtime_executable_candidates(&roots, SHERPA_CUDA_RUNTIME_NAME);
+
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Program Files\Hi-Voicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
+        )));
+        assert!(candidates.contains(&PathBuf::from(
+            r"C:\Portable\Hi-Voicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
+        )));
+    }
+    #[test]
+    fn cuda_root_candidates_include_versioned_bin_children() {
+        let root = test_root("cuda-root-candidates-include-versioned-bin-children");
+        let versioned_bin = root.join("v9.7").join("bin").join("12.8");
+        fs::create_dir_all(&versioned_bin).expect("create versioned cudnn bin");
+
+        let mut dirs = Vec::new();
+        push_cuda_root_candidates(&mut dirs, root.clone());
+
+        assert!(dirs.contains(&versioned_bin));
+    }
+    #[test]
+    fn cuda_dependency_status_reports_missing_required_dlls() {
+        let root = test_root("cuda-dependency-status-reports-missing-required-dlls");
+        fs::create_dir_all(&root).expect("create cuda dir");
+
+        let error = cuda_dependency_status_from_dirs(
+            &[root.clone()],
+            &["cudart64_12.dll", "cublasLt64_12.dll"],
+        )
+        .expect_err("missing dlls");
+
+        assert!(error.contains("cudart64_12.dll"));
+        assert!(error.contains("cublasLt64_12.dll"));
+        assert!(error.contains(&root.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn cuda_dependency_status_collects_split_dependency_dirs() {
+        let root = test_root("cuda-dependency-status-collects-split-dependency-dirs");
+        let cuda_bin = root.join("cuda").join("bin");
+        let cudnn_bin = root.join("cudnn").join("bin");
+        fs::create_dir_all(&cuda_bin).expect("create cuda bin");
+        fs::create_dir_all(&cudnn_bin).expect("create cudnn bin");
+        fs::write(cuda_bin.join("cudart64_12.dll"), b"dll").expect("write cudart");
+        fs::write(cudnn_bin.join("cudnn64_9.dll"), b"dll").expect("write cudnn");
+
+        let dirs = cuda_dependency_status_from_dirs(
+            &[cuda_bin.clone(), cudnn_bin.clone()],
+            &["cudart64_12.dll", "cudnn64_9.dll"],
+        )
+        .expect("cuda deps");
+
+        assert_eq!(dirs, vec![cuda_bin, cudnn_bin]);
+    }
     #[test]
     fn ffmpeg_search_roots_include_offline_locations() {
         let data_dir = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");

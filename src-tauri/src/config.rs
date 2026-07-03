@@ -169,7 +169,7 @@ impl UserSettings {
         }
         if !matches!(
             self.export_format.as_str(),
-            "plainText" | "timelineText" | "srt"
+            "plainText" | "timelineText" | "timelineTxt" | "srt" | "resolveMarkers"
         ) {
             self.export_format = defaults.export_format;
         }

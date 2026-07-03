@@ -46,14 +46,8 @@ describe("model presets", () => {
     expect(zipformer?.sherpaArgs).toContain("--model-type=zipformer");
   });
 
-  it("keeps Qwen3-ASR 1.7B visible without pretending raw weights are ready", () => {
-    const candidates = modelPresets.filter((model) => model.installKind === "engineRequired");
-
-    expect(candidates.map((model) => model.id)).toEqual(expect.arrayContaining(["qwen3-asr-1.7b"]));
-
-    for (const model of candidates) {
-      expect(model.engineNote).toMatch(/接入|推理|运行/);
-      expect(model.downloadUrl).toContain("huggingface.co/");
-    }
+  it("does not expose Qwen3-ASR 1.7B until a supported local engine exists", () => {
+    expect(modelPresets.map((model) => model.id)).not.toContain("qwen3-asr-1.7b");
+    expect(modelPresets.filter((model) => model.installKind === "engineRequired")).toEqual([]);
   });
 });

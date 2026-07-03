@@ -152,19 +152,6 @@ export const modelPresets: ModelPreset[] = [
     sherpaArgs:
       '--encoder="{modelDir}\\encoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --decoder="{modelDir}\\decoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --joiner="{modelDir}\\joiner-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --tokens="{modelDir}\\tokens.txt" --num-threads=4 --decoding-method=greedy_search --model-type=zipformer',
   },
-  {
-    id: "qwen3-asr-1.7b",
-    name: "Qwen3-ASR 1.7B",
-    family: "qwen",
-    installKind: "engineRequired",
-    size: "约 3-5 GB",
-    quality: "质量优先",
-    memory: "建议独显或高内存机器",
-    recommendedFor: "后续高精度文件转录",
-    license: "Apache 2.0",
-    downloadUrl: "https://huggingface.co/Qwen/Qwen3-ASR-1.7B",
-    engineNote: "暂未接入一键运行。需要稳定的本地推理方案后再开放。",
-  },
 ];
 
 export function findModelPreset(modelId: string) {

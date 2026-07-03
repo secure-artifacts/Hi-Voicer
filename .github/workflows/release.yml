@@ -1,4 +1,4 @@
-name: Release CPU Build
+name: Release Windows Build
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: Build Windows CPU release
+    name: Build Windows release
     runs-on: windows-latest
     permissions:
       id-token: write
@@ -43,6 +43,21 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Prepare bundled Sherpa CUDA runtime
+        shell: pwsh
+        run: |
+          $version = "v1.13.2"
+          $runtime = "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda"
+          $archive = "$runtime.tar.bz2"
+          $url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/$version/$archive"
+          $destination = "src-tauri/resources/engines/sherpa/$version"
+          New-Item -ItemType Directory -Path $destination -Force | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          tar -xf $archive -C $destination
+          Remove-Item -LiteralPath (Join-Path $destination $runtime "include") -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath (Join-Path $destination $runtime "lib") -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -LiteralPath (Join-Path $destination $runtime "bin") | Select-Object Name,Length
 
       - name: Build Tauri app
         run: npm run tauri -- build

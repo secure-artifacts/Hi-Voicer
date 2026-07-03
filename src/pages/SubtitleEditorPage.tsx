@@ -55,23 +55,51 @@ function normalizeSegments(segments: SubtitleSegment[]) {
   });
 }
 
+function cleanSubtitleText(text: string) {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function cleanSubtitleTextOneLine(text: string) {
+  return cleanSubtitleText(text).split(/\s+/).filter(Boolean).join(" ");
+}
+
 function plainText(segments: SubtitleSegment[]) {
-  return segments.map((segment) => segment.text.trim()).filter(Boolean).join("\n");
+  return segments.map((segment) => cleanSubtitleText(segment.text)).filter(Boolean).join("\n");
 }
 
 function timelineText(segments: SubtitleSegment[]) {
   return segments
-    .map((segment) => `[${formatTimelineTimestamp(segment.start)} --> ${formatTimelineTimestamp(segment.end)}]\n${segment.text.trim()}`)
-    .join("\n\n");
+    .map((segment) => {
+      const text = cleanSubtitleText(segment.text);
+      return text ? `[${formatTimelineTimestamp(segment.start)} --> ${formatTimelineTimestamp(segment.end)}]\n${text}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function timelineTxtText(segments: SubtitleSegment[]) {
+  return segments
+    .map((segment) => {
+      const text = cleanSubtitleTextOneLine(segment.text);
+      return text ? `[${formatTimelineTimestamp(segment.start)} --> ${formatTimelineTimestamp(segment.end)}] ${text}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function srtText(segments: SubtitleSegment[]) {
-  return `${segments
+  return segments
+    .map((segment) => ({ segment, text: cleanSubtitleText(segment.text) }))
+    .filter((entry) => entry.text)
     .map(
-      (segment, index) =>
-        `${index + 1}\n${formatSrtTimestamp(segment.start)} --> ${formatSrtTimestamp(segment.end)}\n${segment.text.trim()}`,
+      ({ segment, text }, index) =>
+        `${index + 1}\n${formatSrtTimestamp(segment.start)} --> ${formatSrtTimestamp(segment.end)}\n${text}`,
     )
-    .join("\n\n")}\n`;
+    .join("\n\n");
 }
 
 function joinSubtitleText(left: string, right: string) {
@@ -299,14 +327,21 @@ export function SubtitleEditorPage({ project, onProjectChange, termCategories, o
     ]);
   }
 
-  async function exportText(format: "plainText" | "timelineText" | "srt") {
+  async function exportText(format: "plainText" | "timelineText" | "timelineTxt" | "srt") {
     if (!project) {
       return;
     }
     const stem = stemFromFileName(project.fileName);
-    const content = format === "srt" ? srtText(segments) : format === "timelineText" ? timelineText(segments) : plainText(segments);
+    const content =
+      format === "srt"
+        ? srtText(segments)
+        : format === "timelineTxt"
+          ? `\ufeff${timelineTxtText(segments)}`
+          : format === "timelineText"
+            ? timelineText(segments)
+            : plainText(segments);
     const extension = format === "srt" ? "srt" : "txt";
-    const suffix = format === "timelineText" ? "-timeline" : "";
+    const suffix = format === "timelineTxt" ? "-timeline-txt" : format === "timelineText" ? "-timeline" : "";
     try {
       const path = await saveTextFile(`${stem}${suffix}.${extension}`, content);
       setMessage(path ? `已导出：${path}` : "已取消导出。");
@@ -557,6 +592,10 @@ export function SubtitleEditorPage({ project, onProjectChange, termCategories, o
                 <button className="secondary-button" type="button" onClick={() => void exportText("timelineText")}>
                   <Download size={16} />
                   时间线 TXT
+                </button>
+                <button className="secondary-button" type="button" onClick={() => void exportText("timelineTxt")}>
+                  <Download size={16} />
+                  Timeline-TXT
                 </button>
                 <button className="secondary-button" type="button" onClick={() => void exportText("srt")}>
                   <Subtitles size={16} />

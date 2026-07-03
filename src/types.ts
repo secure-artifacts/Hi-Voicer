@@ -12,7 +12,7 @@ export type PasteMode = "direct" | "clipboard";
 export type RecordingMode = "hold" | "toggle" | "audioOnly";
 export type RecordingSource = "microphone" | "system" | "microphoneAndSystem";
 export type AccelerationMode = "cpu" | "cuda";
-export type ExportFormat = "plainText" | "timelineText" | "srt";
+export type ExportFormat = "plainText" | "timelineText" | "timelineTxt" | "srt" | "resolveMarkers";
 export type ThemeMode = "light" | "dark";
 export type TranscriptionPerformanceMode = "stable" | "balanced" | "fast";
 export type TimelineKind = "estimated" | "model";
@@ -36,7 +36,7 @@ export interface TranscriptTask {
   filePath?: string;
   status: "queued" | "running" | "done" | "failed";
   progress: number;
-  outputFormats: Array<"txt" | "srt" | "json">;
+  outputFormats: Array<"txt" | "timelineTxt" | "srt" | "json" | "edl">;
   message: string;
   outputPath?: string;
   outputPaths?: string[];

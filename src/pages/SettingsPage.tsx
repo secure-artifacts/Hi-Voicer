@@ -258,11 +258,14 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
           <button
             className={settings.accelerationMode === "cuda" ? "segment-button segment-button--active" : "segment-button"}
             type="button"
-            disabled
-            title="GPU 加速后续实验，0.2.0 不作为正式功能发布"
+            title="Experimental NVIDIA CUDA mode. Hi-Voicer will not download CUDA files automatically."
+            onClick={() => {
+              onSettingsChange({ ...settings, accelerationMode: "cuda" });
+              setModelMessage("CUDA experimental mode is selected. Hi-Voicer only checks local NVIDIA/CUDA files and falls back to CPU if unavailable.");
+            }}
           >
             <Zap size={16} />
-            CUDA 后续
+            CUDA (experimental)
           </button>
         </div>
       </SettingRow>
