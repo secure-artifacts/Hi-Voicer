@@ -55,6 +55,9 @@ vi.mock("../lib/api", () => ({
     Promise.resolve({
       directmlCandidate: true,
       modelReady: true,
+      directmlSessionReady: true,
+      directmlSessionError: null,
+      onnxRuntimeBuild: "ORT Build Info: DirectML test build",
       modelId: "sensevoice-small",
       modelName: "SenseVoiceSmall",
       modelDir: "C:\\models\\sensevoice-small",
@@ -68,8 +71,8 @@ vi.mock("../lib/api", () => ({
         },
       ],
       elapsedMs: 45,
-      message: "DirectML PoC prerequisites look ready for SenseVoiceSmall.",
-      nextStep: "Wire ONNX Runtime DirectML and run a real SenseVoice inference smoke test.",
+      message: "DirectML SenseVoice session created; inputs: 1, outputs: 1",
+      nextStep: "Add the DirectML audio feature-extraction and decoder path behind an experimental toggle.",
     }),
   ),
   saveTextFile: vi.fn(() => Promise.resolve("C:\\reports\\diagnostics.txt")),
@@ -128,7 +131,7 @@ describe("DiagnosticsPage", () => {
     await waitFor(() => {
       expect(runDirectMlProbe).toHaveBeenCalledWith(settings);
     });
-    expect(await screen.findByText(/DirectML PoC prerequisites/)).toBeTruthy();
+    expect(await screen.findAllByText(/DirectML SenseVoice session created/)).toHaveLength(2);
     expect(screen.getByText("NVIDIA GeForce RTX 3060")).toBeTruthy();
   });
 

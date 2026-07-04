@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 arboard = "3"
 cpal = "0.15"
 hound = "3.5"
+ort = { version = "2.0.0-rc.12", features = ["directml"] }
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
 rfd = "0.16"
 serde = { version = "1", features = ["derive"] }

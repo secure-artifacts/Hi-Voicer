@@ -413,6 +413,9 @@ struct DirectMlAdapterInfo {
 struct DirectMlProbeResult {
     directml_candidate: bool,
     model_ready: bool,
+    directml_session_ready: bool,
+    directml_session_error: Option<String>,
+    onnx_runtime_build: Option<String>,
     model_id: Option<String>,
     model_name: Option<String>,
     model_dir: String,
@@ -3584,6 +3587,53 @@ fn is_directml_candidate_adapter(adapter: &DirectMlAdapterInfo) -> bool {
         && !name.contains("render driver")
 }
 
+fn create_directml_sensevoice_session(model_path: &Path) -> Result<String, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    use ort::{ep, ep::ExecutionProvider, session::Session};
+
+    let directml = ep::DirectML::default();
+    if !directml.supported_by_platform() {
+        return Err("DirectML execution provider is not supported on this platform.".to_string());
+    }
+
+    match directml.is_available() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(
+                "ONNX Runtime was not built with DirectML execution provider support.".to_string(),
+            );
+        }
+        Err(error) => {
+            return Err(format!("DirectML availability check failed: {error}"));
+        }
+    }
+
+    let mut session_builder = Session::builder()
+        .map_err(|error| format!("ONNX Runtime session builder failed: {error}"))?
+        .with_no_environment_execution_providers()
+        .map_err(|error| format!("Failed to isolate execution providers: {error}"))?
+        .with_execution_providers([directml.build().error_on_failure()])
+        .map_err(|error| format!("Failed to register DirectML execution provider: {error}"))?
+        .with_intra_threads(1)
+        .map_err(|error| format!("Failed to set ONNX Runtime thread count: {error}"))?
+        .with_parallel_execution(false)
+        .map_err(|error| format!("Failed to set ONNX Runtime execution mode: {error}"))?;
+
+    let session = session_builder
+        .commit_from_file(model_path)
+        .map_err(|error| format!("Failed to create DirectML SenseVoice ONNX session: {error}"))?;
+    let input_count = session.inputs().len();
+    let output_count = session.outputs().len();
+    drop(session);
+
+    Ok(format!(
+        "DirectML SenseVoice session created; inputs: {input_count}, outputs: {output_count}"
+    ))
+}
+
 fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
     let started_at = Instant::now();
     let model_path = PathBuf::from(model_dir);
@@ -3606,8 +3656,16 @@ fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
     let adapters = query_directml_candidate_adapters();
     let directml_candidate = adapters.iter().any(is_directml_candidate_adapter);
     let model_ready = is_sensevoice && missing_files.is_empty();
-    let message = if model_ready && directml_candidate {
-        "DirectML PoC prerequisites look ready for SenseVoiceSmall.".to_string()
+    let onnx_runtime_build = Some(ort::info().to_string());
+    let directml_session_result = if model_ready && directml_candidate {
+        create_directml_sensevoice_session(&model_path.join("model.int8.onnx"))
+    } else {
+        Err("DirectML session check skipped because prerequisites are incomplete.".to_string())
+    };
+    let directml_session_ready = directml_session_result.is_ok();
+    let directml_session_error = directml_session_result.as_ref().err().cloned();
+    let message = if let Ok(session_message) = &directml_session_result {
+        session_message.clone()
     } else if !is_sensevoice {
         "DirectML PoC currently only targets SenseVoiceSmall.".to_string()
     } else if !missing_files.is_empty() {
@@ -3615,11 +3673,16 @@ fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
             "SenseVoiceSmall files are incomplete: {}",
             missing_files.join(", ")
         )
-    } else {
+    } else if !directml_candidate {
         "No usable Windows GPU adapter was detected by the DirectML probe.".to_string()
+    } else {
+        directml_session_error
+            .clone()
+            .unwrap_or_else(|| "DirectML SenseVoice session check failed.".to_string())
     };
-    let next_step = if model_ready && directml_candidate {
-        "Wire ONNX Runtime DirectML and run a real SenseVoice inference smoke test.".to_string()
+    let next_step = if directml_session_ready {
+        "Add the DirectML audio feature-extraction and decoder path behind an experimental toggle."
+            .to_string()
     } else {
         "Keep using the stable CPU/Sherpa path; fix the reported prerequisite before testing DirectML inference.".to_string()
     };
@@ -3627,6 +3690,9 @@ fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
     DirectMlProbeResult {
         directml_candidate,
         model_ready,
+        directml_session_ready,
+        directml_session_error,
+        onnx_runtime_build,
         model_id,
         model_name,
         model_dir: model_dir.to_string(),

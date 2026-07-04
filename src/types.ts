@@ -217,6 +217,9 @@ export interface DirectMlAdapterInfo {
 export interface DirectMlProbeResult {
   directmlCandidate: boolean;
   modelReady: boolean;
+  directmlSessionReady: boolean;
+  directmlSessionError?: string | null;
+  onnxRuntimeBuild?: string | null;
   modelId?: string | null;
   modelName?: string | null;
   modelDir: string;
