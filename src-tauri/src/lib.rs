@@ -896,6 +896,20 @@ fn apply_launch_at_startup(_enabled: bool) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn suppress_windows_fault_dialogs() {
+    use windows::Win32::System::Diagnostics::Debug::{
+        SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX,
+    };
+
+    unsafe {
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    }
+}
+
+#[cfg(not(windows))]
+fn suppress_windows_fault_dialogs() {}
+
+#[cfg(windows)]
 fn suppress_command_window(command: &mut Command) {
     use std::os::windows::process::CommandExt;
 
@@ -3673,6 +3687,7 @@ fn create_directml_sensevoice_session_in_child(
         .arg(model_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    suppress_command_window(&mut command);
 
     let output = run_command_with_timeout(
         &mut command,
@@ -3709,6 +3724,7 @@ pub fn run_cli_mode() -> bool {
     if mode != "--hi-voicer-directml-probe" {
         return false;
     }
+    suppress_windows_fault_dialogs();
 
     let Some(model_path) = args.next() else {
         eprintln!("missing model path");
@@ -3731,9 +3747,61 @@ pub fn run_cli_mode() -> bool {
     true
 }
 
-fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
+fn directml_sensevoice_ready(model_path: &Path) -> bool {
+    let Ok(engine) = read_sherpa_engine(model_path) else {
+        return false;
+    };
+    engine.model_id == "sensevoice-small"
+        && model_path.join("engine.json").exists()
+        && model_path.join("model.int8.onnx").exists()
+        && model_path.join("tokens.txt").exists()
+}
+
+fn directml_probe_candidate_dirs(
+    requested_model_dir: &str,
+    app_models_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let requested = PathBuf::from(requested_model_dir);
+    let mut candidates = Vec::new();
+    candidates.push(requested.clone());
+    candidates.push(requested.join("sensevoice-small"));
+    if let Some(parent) = requested.parent() {
+        candidates.push(parent.join("sensevoice-small"));
+    }
+    if let Some(models_dir) = app_models_dir {
+        candidates.push(models_dir.join("sensevoice-small"));
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique
+            .iter()
+            .any(|existing: &PathBuf| existing == &candidate)
+        {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn select_directml_probe_model_dir(
+    requested_model_dir: &str,
+    app_models_dir: Option<PathBuf>,
+) -> PathBuf {
+    let candidates = directml_probe_candidate_dirs(requested_model_dir, app_models_dir);
+    candidates
+        .iter()
+        .find(|candidate| directml_sensevoice_ready(candidate))
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(requested_model_dir))
+}
+
+fn directml_probe_for_model_dir(
+    model_dir: &str,
+    app_models_dir: Option<PathBuf>,
+) -> DirectMlProbeResult {
     let started_at = Instant::now();
-    let model_path = PathBuf::from(model_dir);
+    let model_path = select_directml_probe_model_dir(model_dir, app_models_dir);
     let engine = read_sherpa_engine(&model_path).ok();
     let mut missing_files = Vec::new();
 
@@ -3808,7 +3876,7 @@ fn directml_probe_for_model_dir(model_dir: &str) -> DirectMlProbeResult {
         model_outputs,
         model_id,
         model_name,
-        model_dir: model_dir.to_string(),
+        model_dir: model_path.to_string_lossy().to_string(),
         missing_files,
         adapters,
         elapsed_ms: started_at.elapsed().as_millis(),
@@ -6139,10 +6207,20 @@ async fn run_acceleration_smoke_test(
 }
 
 #[tauri::command]
-async fn run_directml_probe(request: DirectMlProbeRequest) -> Result<DirectMlProbeResult, String> {
-    tauri::async_runtime::spawn_blocking(move || directml_probe_for_model_dir(&request.model_dir))
-        .await
-        .map_err(|error| error.to_string())
+async fn run_directml_probe(
+    app: AppHandle,
+    request: DirectMlProbeRequest,
+) -> Result<DirectMlProbeResult, String> {
+    let app_models_dir = app
+        .path()
+        .app_local_data_dir()
+        .ok()
+        .map(|data_dir| data_dir.join("models"));
+    tauri::async_runtime::spawn_blocking(move || {
+        directml_probe_for_model_dir(&request.model_dir, app_models_dir)
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6545,6 +6623,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn directml_probe_candidates_include_app_sensevoice_model() {
+        let app_models_dir =
+            PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer\models");
+        let candidates = directml_probe_candidate_dirs(
+            r"C:\Portable\Hi-Voicer\models",
+            Some(app_models_dir.clone()),
+        );
+
+        assert!(candidates.contains(&app_models_dir.join("sensevoice-small")));
+    }
+
+    #[test]
+    fn directml_probe_candidates_include_sibling_sensevoice_model() {
+        let candidates = directml_probe_candidate_dirs(r"C:\Models\sherpa-paraformer-zh", None);
+
+        assert!(candidates.contains(&PathBuf::from(r"C:\Models\sensevoice-small")));
     }
 
     #[test]
