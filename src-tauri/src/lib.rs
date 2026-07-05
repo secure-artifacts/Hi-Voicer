@@ -5441,28 +5441,35 @@ fn transcribe_file_with_sherpa(
             request.task_id.as_deref(),
             started_at,
         );
-        let chunks = match chunks {
-            Ok(chunks) => chunks,
-            Err(error) => {
+        match chunks {
+            Ok(chunks) => {
+                let result = finish_transcription_result(
+                    &app,
+                    &request,
+                    started_at,
+                    &audio_path,
+                    &sherpa_audio_path,
+                    chunks,
+                    "DirectML SenseVoice ran, but no transcription text was decoded.",
+                );
                 if sherpa_audio_path != audio_path {
                     let _ = fs::remove_file(&sherpa_audio_path);
                 }
-                return Err(error);
+                return result;
             }
-        };
-        let result = finish_transcription_result(
-            &app,
-            &request,
-            started_at,
-            &audio_path,
-            &sherpa_audio_path,
-            chunks,
-            "DirectML SenseVoice ran, but no transcription text was decoded.",
-        );
-        if sherpa_audio_path != audio_path {
-            let _ = fs::remove_file(&sherpa_audio_path);
+            Err(error) => {
+                emit_transcription_progress(
+                    &app,
+                    request.task_id.as_deref(),
+                    started_at,
+                    "transcribing",
+                    18,
+                    format!("DirectML unavailable; falling back to CPU: {error}"),
+                    0,
+                    0,
+                );
+            }
         }
-        return result;
     }
 
     let model_dir = PathBuf::from(&request.model_dir);
