@@ -3724,15 +3724,8 @@ fn create_directml_identity_session() -> Result<DirectMlSessionProbeCliResult, S
     result
 }
 
-fn create_directml_session_from_file(
-    model_path: &Path,
-    label: &str,
-) -> Result<DirectMlSessionProbeCliResult, String> {
-    if !cfg!(windows) {
-        return Err("DirectML is only available on Windows.".to_string());
-    }
-
-    use ort::{ep, ep::ExecutionProvider, session::Session};
+fn directml_session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
+    use ort::ep::{self, ExecutionProvider};
 
     let directml = ep::DirectML::default();
     if !directml.supported_by_platform() {
@@ -3751,7 +3744,7 @@ fn create_directml_session_from_file(
         }
     }
 
-    let mut session_builder = Session::builder()
+    ort::session::Session::builder()
         .map_err(|error| format!("ONNX Runtime session builder failed: {error}"))?
         .with_no_environment_execution_providers()
         .map_err(|error| format!("Failed to isolate execution providers: {error}"))?
@@ -3760,9 +3753,18 @@ fn create_directml_session_from_file(
         .with_intra_threads(1)
         .map_err(|error| format!("Failed to set ONNX Runtime thread count: {error}"))?
         .with_parallel_execution(false)
-        .map_err(|error| format!("Failed to set ONNX Runtime execution mode: {error}"))?;
+        .map_err(|error| format!("Failed to set ONNX Runtime execution mode: {error}"))
+}
 
-    let session = session_builder
+fn create_directml_session_from_file(
+    model_path: &Path,
+    label: &str,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    let session = directml_session_builder()?
         .commit_from_file(model_path)
         .map_err(|error| format!("Failed to create DirectML {label} ONNX session: {error}"))?;
     let input_count = session.inputs().len();
@@ -3778,6 +3780,97 @@ fn create_directml_session_from_file(
         ),
         model_inputs: inputs,
         model_outputs: outputs,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+
+fn create_directml_sensevoice_encoder_warmup_session(
+    model_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    use half::f16;
+    use ort::{inputs, value::Tensor};
+
+    let mut session = directml_session_builder()?
+        .commit_from_file(model_path)
+        .map_err(|error| format!("Failed to create DirectML split SenseVoice encoder session: {error}"))?;
+    let inputs_summary = ort_outlet_summaries(session.inputs());
+    let outputs_summary = ort_outlet_summaries(session.outputs());
+
+    let fixed_len = 30usize * 17;
+    let speech_feat = Tensor::<f16>::from_array((
+        [1usize, fixed_len, 560],
+        vec![f16::from_f32(0.0); fixed_len * 560],
+    ))
+    .map_err(|error| format!("Failed to create encoder speech_feat tensor: {error}"))?;
+    let mask = Tensor::<f16>::from_array((
+        [1usize, fixed_len],
+        vec![f16::from_f32(1.0); fixed_len],
+    ))
+    .map_err(|error| format!("Failed to create encoder mask tensor: {error}"))?;
+    let prompt_ids = Tensor::<i64>::from_array(([1usize, 4], vec![0i64, 1, 2, 14]))
+        .map_err(|error| format!("Failed to create encoder prompt_ids tensor: {error}"))?;
+
+    let outputs = session
+        .run(inputs![
+            "speech_feat" => speech_feat,
+            "mask" => mask,
+            "prompt_ids" => prompt_ids,
+        ])
+        .map_err(|error| format!("DirectML split SenseVoice encoder warmup failed: {error}"))?;
+    let output_count = outputs.len();
+    drop(outputs);
+    drop(session);
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!(
+            "DirectML split SenseVoice encoder warmup completed; outputs: {output_count}"
+        ),
+        model_inputs: inputs_summary,
+        model_outputs: outputs_summary,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+
+fn create_directml_sensevoice_ctc_warmup_session(
+    model_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    use half::f16;
+    use ort::{inputs, value::Tensor};
+
+    let mut session = directml_session_builder()?
+        .commit_from_file(model_path)
+        .map_err(|error| format!("Failed to create DirectML split SenseVoice CTC session: {error}"))?;
+    let inputs_summary = ort_outlet_summaries(session.inputs());
+    let outputs_summary = ort_outlet_summaries(session.outputs());
+
+    let fixed_len = 30usize * 17 + 4;
+    let enc_out = Tensor::<f16>::from_array((
+        [1usize, fixed_len, 512],
+        vec![f16::from_f32(0.0); fixed_len * 512],
+    ))
+    .map_err(|error| format!("Failed to create CTC enc_out tensor: {error}"))?;
+
+    let outputs = session
+        .run(inputs!["enc_out" => enc_out])
+        .map_err(|error| format!("DirectML split SenseVoice CTC warmup failed: {error}"))?;
+    let output_count = outputs.len();
+    drop(outputs);
+    drop(session);
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!("DirectML split SenseVoice CTC warmup completed; outputs: {output_count}"),
+        model_inputs: inputs_summary,
+        model_outputs: outputs_summary,
         onnx_runtime_build: Some(ort::info().to_string()),
     })
 }
@@ -3858,6 +3951,22 @@ pub fn run_cli_mode() -> bool {
             };
             create_directml_session_from_file(&PathBuf::from(model_path), "SenseVoice")
         }
+        "--hi-voicer-directml-sensevoice-encoder-warmup" => {
+            suppress_windows_fault_dialogs();
+            let Some(model_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            create_directml_sensevoice_encoder_warmup_session(&PathBuf::from(model_path))
+        }
+        "--hi-voicer-directml-sensevoice-ctc-warmup" => {
+            suppress_windows_fault_dialogs();
+            let Some(model_path) = args.next() else {
+                eprintln!("missing CTC path");
+                std::process::exit(2);
+            };
+            create_directml_sensevoice_ctc_warmup_session(&PathBuf::from(model_path))
+        }
         _ => return false,
     };
 
@@ -3929,13 +4038,16 @@ fn directml_split_sensevoice_candidate_dirs(
     let mut candidates = Vec::new();
     candidates.push(requested.clone());
     candidates.push(requested.join("sensevoice-directml"));
+    candidates.push(requested.join("Sensevoice-Small-ONNX"));
     candidates.push(requested.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
     if let Some(parent) = requested.parent() {
         candidates.push(parent.join("sensevoice-directml"));
+        candidates.push(parent.join("Sensevoice-Small-ONNX"));
         candidates.push(parent.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
     }
     if let Some(models_dir) = app_models_dir {
         candidates.push(models_dir.join("sensevoice-directml"));
+        candidates.push(models_dir.join("Sensevoice-Small-ONNX"));
         candidates.push(models_dir.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
     }
 
@@ -3972,16 +4084,16 @@ fn create_directml_split_sensevoice_sessions_in_child(
     candidate: &DirectMlSplitSenseVoiceCandidate,
 ) -> Result<DirectMlSessionProbeCliResult, String> {
     let encoder = create_directml_session_in_child(
-        "--hi-voicer-directml-probe",
+        "--hi-voicer-directml-sensevoice-encoder-warmup",
         Some(&candidate.encoder),
-        Duration::from_secs(30),
-        "DirectML SenseVoice split encoder child probe",
+        Duration::from_secs(60),
+        "DirectML SenseVoice split encoder warmup child probe",
     )?;
     let ctc = create_directml_session_in_child(
-        "--hi-voicer-directml-probe",
+        "--hi-voicer-directml-sensevoice-ctc-warmup",
         Some(&candidate.ctc),
-        Duration::from_secs(30),
-        "DirectML SenseVoice split CTC child probe",
+        Duration::from_secs(60),
+        "DirectML SenseVoice split CTC warmup child probe",
     )?;
 
     let mut model_inputs = Vec::new();
@@ -4004,7 +4116,7 @@ fn create_directml_split_sensevoice_sessions_in_child(
 
     Ok(DirectMlSessionProbeCliResult {
         ok: true,
-        message: "DirectML split SenseVoice sessions created for encoder and CTC".to_string(),
+        message: "DirectML split SenseVoice encoder and CTC warmups completed".to_string(),
         model_inputs,
         model_outputs,
         onnx_runtime_build: encoder.onnx_runtime_build.or(ctc.onnx_runtime_build),

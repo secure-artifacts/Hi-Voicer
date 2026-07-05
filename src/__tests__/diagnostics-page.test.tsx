@@ -144,7 +144,7 @@ describe("DiagnosticsPage", () => {
     });
     expect(await screen.findAllByText(/DirectML SenseVoice session created/)).toHaveLength(2);
     expect(screen.getByText(/Minimal ONNX session created/)).toBeTruthy();
-    expect(screen.getByText(/Encoder and CTC sessions created/)).toBeTruthy();
+    expect(screen.getByText(/Encoder and CTC warmups completed/)).toBeTruthy();
     expect(screen.getByText(/encoder speech: Tensor<Float32>/)).toBeTruthy();
     expect(screen.getByText(/language: Tensor<Int64>/)).toBeTruthy();
     expect(screen.getByText("NVIDIA GeForce RTX 3060")).toBeTruthy();

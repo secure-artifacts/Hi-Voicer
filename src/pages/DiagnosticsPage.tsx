@@ -344,7 +344,7 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
               <strong>Split SenseVoice DirectML</strong>
               <p>
                 {directMlProbeResult.splitModelSessionReady
-                  ? "Encoder and CTC sessions created"
+                  ? "Encoder and CTC warmups completed"
                   : directMlProbeResult.splitModelSessionError ||
                     "Missing: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "split model files")}
               </p>
