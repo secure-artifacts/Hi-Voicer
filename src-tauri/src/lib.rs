@@ -2449,6 +2449,20 @@ fn acceleration_status_for_app(
     let cpu_runtime_installed =
         sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
 
+    if _requested_mode == "directml" {
+        return Ok(AccelerationStatus {
+            selected_mode: "directml".to_string(),
+            effective_mode: "directml".to_string(),
+            cuda_available: false,
+            cuda_device_summary: None,
+            cuda_detection_error: None,
+            cpu_runtime_installed,
+            cuda_runtime_installed: false,
+            cuda_disabled_reason: None,
+            message: "DirectML experimental mode is selected; use the diagnostics page to verify the GPU adapter and split SenseVoice model.".to_string(),
+        });
+    }
+
     Ok(acceleration_status_from_parts(
         "cpu",
         false,
@@ -3881,6 +3895,65 @@ fn sensevoice_mel_filters(
     filters
 }
 
+fn read_wav_mono_16k_f32(wav_path: &Path) -> Result<Vec<f32>, String> {
+    let mut reader = hound::WavReader::open(wav_path).map_err(|error| error.to_string())?;
+    let spec = reader.spec();
+    if spec.sample_rate != 16_000 || spec.channels != 1 {
+        return Err(format!(
+            "DirectML SenseVoice expects 16kHz mono WAV; got {} Hz / {} channels.",
+            spec.sample_rate, spec.channels
+        ));
+    }
+
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => reader
+            .samples::<i16>()
+            .map(|sample| {
+                sample
+                    .map(|value| value as f32 / i16::MAX as f32)
+                    .map_err(|error| error.to_string())
+            })
+            .collect(),
+        (hound::SampleFormat::Float, 32) => reader
+            .samples::<f32>()
+            .map(|sample| sample.map_err(|error| error.to_string()))
+            .collect(),
+        _ => Err(format!(
+            "DirectML SenseVoice expects PCM s16 or f32 WAV; got {:?} / {} bits.",
+            spec.sample_format, spec.bits_per_sample
+        )),
+    }
+}
+
+fn pad_sensevoice_lfr_features(
+    lfr_features: &SenseVoiceLfrFeatures,
+    fixed_len: usize,
+) -> (Vec<half::f16>, Vec<half::f16>, usize) {
+    let valid_frames = lfr_features.frames.min(fixed_len);
+    let mut padded_features = vec![half::f16::from_f32(0.0); fixed_len * 560];
+    for frame in 0..valid_frames {
+        for value_index in 0..560 {
+            padded_features[frame * 560 + value_index] =
+                half::f16::from_f32(lfr_features.values[frame * 560 + value_index]);
+        }
+    }
+    if valid_frames > 0 {
+        let last_source = (valid_frames - 1) * 560;
+        for frame in valid_frames..fixed_len {
+            for value_index in 0..560 {
+                padded_features[frame * 560 + value_index] =
+                    half::f16::from_f32(lfr_features.values[last_source + value_index]);
+            }
+        }
+    }
+    let mut mask_values = vec![half::f16::from_f32(0.0); fixed_len];
+    for value in mask_values.iter_mut().take(valid_frames) {
+        *value = half::f16::from_f32(1.0);
+    }
+
+    (padded_features, mask_values, valid_frames)
+}
+
 fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
     const SAMPLE_RATE: usize = 16_000;
     const N_FFT: usize = 400;
@@ -4221,6 +4294,138 @@ fn create_directml_sensevoice_ctc_warmup_session(
     })
 }
 
+fn run_directml_sensevoice_lfr_chunk(
+    encoder_session: &mut ort::session::Session,
+    ctc_session: &mut ort::session::Session,
+    pieces: &[String],
+    lfr_features: &SenseVoiceLfrFeatures,
+) -> Result<(String, Vec<i32>, usize), String> {
+    use half::f16;
+    use ort::{inputs, value::Tensor};
+
+    let fixed_len = 30usize * 17;
+    let (padded_features, mask_values, valid_frames) =
+        pad_sensevoice_lfr_features(lfr_features, fixed_len);
+    if valid_frames == 0 {
+        return Ok((String::new(), Vec::new(), 0));
+    }
+
+    let speech_feat = Tensor::<f16>::from_array(([1usize, fixed_len, 560], padded_features))
+        .map_err(|error| format!("Failed to create encoder speech_feat tensor: {error}"))?;
+    let mask = Tensor::<f16>::from_array(([1usize, fixed_len], mask_values))
+        .map_err(|error| format!("Failed to create encoder mask tensor: {error}"))?;
+    let prompt_ids = Tensor::<i64>::from_array(([1usize, 4], vec![0i64, 1, 2, 14]))
+        .map_err(|error| format!("Failed to create encoder prompt_ids tensor: {error}"))?;
+
+    let encoder_outputs = encoder_session
+        .run(inputs![
+            "speech_feat" => speech_feat,
+            "mask" => mask,
+            "prompt_ids" => prompt_ids,
+        ])
+        .map_err(|error| format!("DirectML split SenseVoice encoder run failed: {error}"))?;
+    let (encoder_shape, encoder_data) = encoder_outputs[0]
+        .try_extract_tensor::<f16>()
+        .map_err(|error| format!("Failed to extract encoder output tensor: {error}"))?;
+    let encoder_shape_usize = encoder_shape
+        .iter()
+        .map(|dim| usize::try_from(*dim).map_err(|_| format!("Invalid encoder output dim: {dim}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let encoder_data = encoder_data.to_vec();
+    drop(encoder_outputs);
+
+    let enc_out = Tensor::<f16>::from_array((encoder_shape_usize, encoder_data))
+        .map_err(|error| format!("Failed to create CTC enc_out tensor: {error}"))?;
+    let ctc_outputs = ctc_session
+        .run(inputs!["enc_out" => enc_out])
+        .map_err(|error| format!("DirectML split SenseVoice CTC run failed: {error}"))?;
+    let (indices_shape, topk_indices) = ctc_outputs[1]
+        .try_extract_tensor::<i32>()
+        .map_err(|error| format!("Failed to extract CTC topk_indices tensor: {error}"))?;
+    let topk_shape = indices_shape
+        .iter()
+        .map(|dim| usize::try_from(*dim).map_err(|_| format!("Invalid CTC topk dim: {dim}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (collapsed_ids, decoded_text) =
+        ctc_greedy_decode_top1(&topk_indices, &topk_shape, valid_frames, pieces);
+    drop(ctc_outputs);
+
+    Ok((decoded_text, collapsed_ids, valid_frames))
+}
+
+fn create_directml_sensevoice_wav_transcription_session(
+    wav_path: &Path,
+    encoder_path: &Path,
+    ctc_path: &Path,
+    tokenizer_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    let pieces = load_sentencepiece_pieces(tokenizer_path)?;
+    let mut encoder_session = directml_session_builder()?
+        .commit_from_file(encoder_path)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice encoder session: {error}")
+        })?;
+    let encoder_inputs_summary = ort_outlet_summaries(encoder_session.inputs());
+    let encoder_outputs_summary = ort_outlet_summaries(encoder_session.outputs());
+    let mut ctc_session = directml_session_builder()?
+        .commit_from_file(ctc_path)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice CTC session: {error}")
+        })?;
+    let ctc_inputs_summary = ort_outlet_summaries(ctc_session.inputs());
+    let ctc_outputs_summary = ort_outlet_summaries(ctc_session.outputs());
+
+    let audio = read_wav_mono_16k_f32(wav_path)?;
+    let chunk_samples = 30usize * 16_000;
+    let total_chunks = audio.len().div_ceil(chunk_samples).max(1);
+    let mut text_chunks = Vec::new();
+
+    for chunk_audio in audio.chunks(chunk_samples) {
+        let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
+        let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
+            &mut encoder_session,
+            &mut ctc_session,
+            &pieces,
+            &lfr_features,
+        )?;
+        let text = clean_subtitle_text_one_line(&text);
+        if !text.is_empty() {
+            text_chunks.push(text);
+        }
+    }
+
+    let mut model_inputs = Vec::new();
+    model_inputs.extend(
+        encoder_inputs_summary
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_inputs.extend(ctc_inputs_summary.iter().map(|item| format!("ctc {item}")));
+
+    let mut model_outputs = Vec::new();
+    model_outputs.extend(
+        encoder_outputs_summary
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_outputs.extend(ctc_outputs_summary.iter().map(|item| format!("ctc {item}")));
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!(
+            "DirectML split SenseVoice WAV transcription completed; chunks: {total_chunks}; decoded text: {}",
+            text_chunks.join("\n")
+        ),
+        model_inputs,
+        model_outputs,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+
 fn create_directml_sensevoice_chain_smoke_session(
     encoder_path: &Path,
     ctc_path: &Path,
@@ -4464,6 +4669,31 @@ pub fn run_cli_mode() -> bool {
             };
             create_directml_sensevoice_ctc_warmup_session(&PathBuf::from(model_path))
         }
+        "--hi-voicer-directml-sensevoice-transcribe-wav" => {
+            suppress_windows_fault_dialogs();
+            let Some(wav_path) = args.next() else {
+                eprintln!("missing WAV path");
+                std::process::exit(2);
+            };
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(ctc_path) = args.next() else {
+                eprintln!("missing CTC path");
+                std::process::exit(2);
+            };
+            let Some(tokenizer_path) = args.next() else {
+                eprintln!("missing tokenizer path");
+                std::process::exit(2);
+            };
+            create_directml_sensevoice_wav_transcription_session(
+                &PathBuf::from(wav_path),
+                &PathBuf::from(encoder_path),
+                &PathBuf::from(ctc_path),
+                &PathBuf::from(tokenizer_path),
+            )
+        }
         "--hi-voicer-directml-sensevoice-chain-smoke" => {
             suppress_windows_fault_dialogs();
             let Some(encoder_path) = args.next() else {
@@ -4609,6 +4839,87 @@ fn select_directml_split_sensevoice_candidate(
                     split_sensevoice_candidate_for_dir(&PathBuf::from(requested_model_dir))
                 })
         })
+}
+
+fn transcribe_directml_sensevoice_wav(
+    app: &AppHandle,
+    candidate: &DirectMlSplitSenseVoiceCandidate,
+    wav_path: &Path,
+    task_id: Option<&str>,
+    started_at: Instant,
+) -> Result<Vec<TranscriptTextChunk>, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+    let missing = split_sensevoice_missing_files(candidate);
+    if !missing.is_empty() {
+        return Err(format!(
+            "DirectML split SenseVoice files are incomplete: {}",
+            missing.join(", ")
+        ));
+    }
+
+    emit_transcription_progress(
+        app,
+        task_id,
+        started_at,
+        "transcribing",
+        18,
+        "Loading DirectML split SenseVoice sessions".to_string(),
+        0,
+        0,
+    );
+
+    let pieces = load_sentencepiece_pieces(&candidate.tokenizer)?;
+    let mut encoder_session = directml_session_builder()?
+        .commit_from_file(&candidate.encoder)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice encoder session: {error}")
+        })?;
+    let mut ctc_session = directml_session_builder()?
+        .commit_from_file(&candidate.ctc)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice CTC session: {error}")
+        })?;
+
+    let audio = read_wav_mono_16k_f32(wav_path)?;
+    let chunk_samples = 30usize * 16_000;
+    let total_chunks = audio.len().div_ceil(chunk_samples).max(1);
+    let mut transcript_chunks = Vec::new();
+
+    for (chunk_index, chunk_audio) in audio.chunks(chunk_samples).enumerate() {
+        let start = chunk_index as f64 * 30.0;
+        let end = start + chunk_audio.len() as f64 / 16_000.0;
+        let progress = 20 + ((chunk_index as u32 * 70) / total_chunks as u32).min(70) as u8;
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            progress,
+            format!(
+                "DirectML SenseVoice chunk {}/{}",
+                chunk_index + 1,
+                total_chunks
+            ),
+            chunk_index,
+            total_chunks,
+        );
+
+        let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
+        let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
+            &mut encoder_session,
+            &mut ctc_session,
+            &pieces,
+            &lfr_features,
+        )?;
+        let text = clean_subtitle_text_one_line(&text);
+        if !text.is_empty() {
+            transcript_chunks.push(TranscriptTextChunk { text, start, end });
+        }
+    }
+
+    Ok(transcript_chunks)
 }
 
 fn create_directml_split_sensevoice_sessions_in_child(
@@ -4827,7 +5138,11 @@ fn run_acceleration_smoke_test_inner(
     request: AccelerationSmokeTestRequest,
 ) -> Result<AccelerationSmokeTestResult, String> {
     let started_at = Instant::now();
-    let requested_mode = "cpu";
+    let requested_mode = if request.acceleration_mode == "directml" {
+        "directml"
+    } else {
+        "cpu"
+    };
     let model_dir = PathBuf::from(&request.model_dir);
     let engine = read_sherpa_engine(&model_dir)?;
     let cpu_executable = PathBuf::from(&engine.executable);
@@ -4967,6 +5282,87 @@ fn write_transcription_outputs(
     Ok((primary.to_string_lossy().to_string(), output_paths, files))
 }
 
+fn finish_transcription_result(
+    app: &AppHandle,
+    request: &TranscribeFileRequest,
+    started_at: Instant,
+    source_audio_path: &Path,
+    sherpa_audio_path: &Path,
+    transcript_chunks: Vec<TranscriptTextChunk>,
+    empty_error: &str,
+) -> Result<TranscribeFileResult, String> {
+    let transcript_chunks = transcript_chunks
+        .into_iter()
+        .map(|chunk| TranscriptTextChunk {
+            text: apply_hotwords(&chunk.text, &request.hotwords),
+            start: chunk.start,
+            end: chunk.end,
+        })
+        .collect::<Vec<_>>();
+    let text = transcript_text_from_chunks(&transcript_chunks);
+
+    if text.is_empty() {
+        return Err(empty_error.to_string());
+    }
+
+    let duration = wav_duration_seconds(sherpa_audio_path)?.max(1.0);
+    let review_audio_path = persist_review_audio(app, source_audio_path, sherpa_audio_path)?;
+    let segments = if transcript_chunks.is_empty() {
+        build_transcript_segments(&text, duration, &review_audio_path)
+    } else {
+        build_transcript_segments_from_chunks(&transcript_chunks, &review_audio_path)
+    };
+
+    let (output_path, output_paths, output_files) = if request.save_output {
+        emit_transcription_progress(
+            app,
+            request.task_id.as_deref(),
+            started_at,
+            "exporting",
+            95,
+            "Generating export files".to_string(),
+            0,
+            0,
+        );
+        let output_dir = app
+            .path()
+            .app_cache_dir()
+            .map_err(|error| error.to_string())?
+            .join("transcripts");
+        write_transcription_outputs(
+            &output_dir,
+            &request.output_format,
+            source_audio_path,
+            sherpa_audio_path,
+            &text,
+            &segments,
+        )?
+    } else {
+        (String::new(), Vec::new(), Vec::new())
+    };
+
+    emit_transcription_progress(
+        app,
+        request.task_id.as_deref(),
+        started_at,
+        "done",
+        100,
+        "Transcription complete".to_string(),
+        0,
+        0,
+    );
+
+    Ok(TranscribeFileResult {
+        text,
+        output_path,
+        output_paths,
+        output_files,
+        segments,
+        timeline_kind: "estimated".to_string(),
+        source_audio_path: review_audio_path.to_string_lossy().to_string(),
+    })
+}
+
 fn persist_review_audio(
     app: &AppHandle,
     source_audio_path: &Path,
@@ -5020,6 +5416,55 @@ fn transcribe_file_with_sherpa(
         0,
     );
 
+    if request.acceleration_mode == "directml" {
+        emit_transcription_progress(
+            &app,
+            request.task_id.as_deref(),
+            started_at,
+            "transcribing",
+            17,
+            "Actual acceleration path: DIRECTML experimental SenseVoice".to_string(),
+            0,
+            0,
+        );
+        let app_models_dir = app
+            .path()
+            .app_local_data_dir()
+            .ok()
+            .map(|data_dir| data_dir.join("models"));
+        let candidate =
+            select_directml_split_sensevoice_candidate(&request.model_dir, app_models_dir);
+        let chunks = transcribe_directml_sensevoice_wav(
+            &app,
+            &candidate,
+            &sherpa_audio_path,
+            request.task_id.as_deref(),
+            started_at,
+        );
+        let chunks = match chunks {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                if sherpa_audio_path != audio_path {
+                    let _ = fs::remove_file(&sherpa_audio_path);
+                }
+                return Err(error);
+            }
+        };
+        let result = finish_transcription_result(
+            &app,
+            &request,
+            started_at,
+            &audio_path,
+            &sherpa_audio_path,
+            chunks,
+            "DirectML SenseVoice ran, but no transcription text was decoded.",
+        );
+        if sherpa_audio_path != audio_path {
+            let _ = fs::remove_file(&sherpa_audio_path);
+        }
+        return result;
+    }
+
     let model_dir = PathBuf::from(&request.model_dir);
     let engine = read_sherpa_engine(&model_dir)?;
 
@@ -5068,80 +5513,26 @@ fn transcribe_file_with_sherpa(
     );
     let raw_chunks = match chunk_result {
         Ok(chunks) => chunks,
-        Err(error) => return Err(error),
+        Err(error) => {
+            if sherpa_audio_path != audio_path {
+                let _ = fs::remove_file(&sherpa_audio_path);
+            }
+            return Err(error);
+        }
     };
-    let transcript_chunks = raw_chunks
-        .into_iter()
-        .map(|chunk| TranscriptTextChunk {
-            text: apply_hotwords(&chunk.text, &request.hotwords),
-            start: chunk.start,
-            end: chunk.end,
-        })
-        .collect::<Vec<_>>();
-    let text = transcript_text_from_chunks(&transcript_chunks);
-
-    if text.is_empty() {
-        return Err("Sherpa ran, but no transcription text was parsed.".to_string());
-    }
-
-    let duration = wav_duration_seconds(&sherpa_audio_path)?.max(1.0);
-    let review_audio_path = persist_review_audio(&app, &audio_path, &sherpa_audio_path)?;
-    let segments = if transcript_chunks.is_empty() {
-        build_transcript_segments(&text, duration, &review_audio_path)
-    } else {
-        build_transcript_segments_from_chunks(&transcript_chunks, &review_audio_path)
-    };
-
-    let (output_path, output_paths, output_files) = if request.save_output {
-        emit_transcription_progress(
-            &app,
-            request.task_id.as_deref(),
-            started_at,
-            "exporting",
-            95,
-            "Generating export files".to_string(),
-            0,
-            0,
-        );
-        let output_dir = app
-            .path()
-            .app_cache_dir()
-            .map_err(|error| error.to_string())?
-            .join("transcripts");
-        write_transcription_outputs(
-            &output_dir,
-            &request.output_format,
-            &audio_path,
-            &sherpa_audio_path,
-            &text,
-            &segments,
-        )?
-    } else {
-        (String::new(), Vec::new(), Vec::new())
-    };
+    let result = finish_transcription_result(
+        &app,
+        &request,
+        started_at,
+        &audio_path,
+        &sherpa_audio_path,
+        raw_chunks,
+        "Sherpa ran, but no transcription text was parsed.",
+    );
     if sherpa_audio_path != audio_path {
         let _ = fs::remove_file(&sherpa_audio_path);
     }
-    emit_transcription_progress(
-        &app,
-        request.task_id.as_deref(),
-        started_at,
-        "done",
-        100,
-        "杞綍瀹屾垚".to_string(),
-        0,
-        0,
-    );
-
-    Ok(TranscribeFileResult {
-        text,
-        output_path,
-        output_paths,
-        output_files,
-        segments,
-        timeline_kind: "estimated".to_string(),
-        source_audio_path: review_audio_path.to_string_lossy().to_string(),
-    })
+    result
 }
 fn write_i16_samples(
     writer: &Arc<Mutex<Option<hound::WavWriter<BufWriter<File>>>>>,

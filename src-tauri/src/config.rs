@@ -164,7 +164,7 @@ impl UserSettings {
         ) {
             self.recording_source = defaults.recording_source;
         }
-        if !matches!(self.acceleration_mode.as_str(), "cpu") {
+        if !matches!(self.acceleration_mode.as_str(), "cpu" | "directml") {
             self.acceleration_mode = defaults.acceleration_mode;
         }
         if !matches!(

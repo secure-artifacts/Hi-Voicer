@@ -1,4 +1,4 @@
-import { Check, Cpu, Download, FolderOpen, Keyboard, Mic, MonitorSpeaker, Moon, Sun, Volume2 } from "lucide-react";
+import { Check, Cpu, Download, FolderOpen, Gauge, Keyboard, Mic, MonitorSpeaker, Moon, Sun, Volume2 } from "lucide-react";
 import type { KeyboardEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { SettingRow } from "../components/SettingRow";
@@ -254,6 +254,14 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
           >
             <Cpu size={16} />
             CPU
+          </button>
+          <button
+            className={settings.accelerationMode === "directml" ? "segment-button segment-button--active" : "segment-button"}
+            type="button"
+            onClick={() => onSettingsChange({ ...settings, accelerationMode: "directml" })}
+          >
+            <Gauge size={16} />
+            DirectML（实验）
           </button>
 
         </div>

@@ -26,7 +26,7 @@ const STORAGE_KEY = "hi-voicer-settings";
 const pasteModes = ["direct", "clipboard"] as const;
 const recordingModes = ["hold", "toggle", "audioOnly"] as const;
 const recordingSources = ["microphone", "system", "microphoneAndSystem"] as const;
-const accelerationModes = ["cpu"] as const;
+const accelerationModes = ["cpu", "directml"] as const;
 const themeModes = ["light", "dark"] as const;
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
@@ -86,7 +86,7 @@ function saveFallbackSettings(settings: UserSettings): UserSettings {
     pasteMode: "direct",
     recordingMode: "hold",
     recordingSource: "microphone",
-    accelerationMode: "cpu",
+    accelerationMode: settings.accelerationMode ?? "cpu",
     theme: "light",
     saveRecordings: false,
     launchAtStartup: false,
