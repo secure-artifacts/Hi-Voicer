@@ -3672,7 +3672,13 @@ fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
 }
 
-fn sensevoice_mel_filters(sr: usize, n_fft: usize, n_mels: usize, f_min: f32, f_max: f32) -> Vec<f32> {
+fn sensevoice_mel_filters(
+    sr: usize,
+    n_fft: usize,
+    n_mels: usize,
+    f_min: f32,
+    f_max: f32,
+) -> Vec<f32> {
     let bins = n_fft / 2 + 1;
     let mel_min = hz_to_mel(f_min);
     let mel_max = hz_to_mel(f_max);
@@ -3781,8 +3787,7 @@ fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
     let mut padded_mel = vec![0.0f32; padded_mel_frames * N_MELS];
 
     for frame in 0..3 {
-        padded_mel[frame * N_MELS..(frame + 1) * N_MELS]
-            .copy_from_slice(&log_mel[0..N_MELS]);
+        padded_mel[frame * N_MELS..(frame + 1) * N_MELS].copy_from_slice(&log_mel[0..N_MELS]);
     }
     for frame in 0..frame_count {
         let source = frame * N_MELS;
@@ -3950,7 +3955,9 @@ fn create_directml_sensevoice_encoder_warmup_session(
 
     let mut session = directml_session_builder()?
         .commit_from_file(model_path)
-        .map_err(|error| format!("Failed to create DirectML split SenseVoice encoder session: {error}"))?;
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice encoder session: {error}")
+        })?;
     let inputs_summary = ort_outlet_summaries(session.inputs());
     let outputs_summary = ort_outlet_summaries(session.outputs());
 
@@ -4020,7 +4027,9 @@ fn create_directml_sensevoice_ctc_warmup_session(
 
     let mut session = directml_session_builder()?
         .commit_from_file(model_path)
-        .map_err(|error| format!("Failed to create DirectML split SenseVoice CTC session: {error}"))?;
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice CTC session: {error}")
+        })?;
     let inputs_summary = ort_outlet_summaries(session.inputs());
     let outputs_summary = ort_outlet_summaries(session.outputs());
 
@@ -4047,16 +4056,138 @@ fn create_directml_sensevoice_ctc_warmup_session(
     })
 }
 
-fn create_directml_session_in_child(
+fn create_directml_sensevoice_chain_smoke_session(
+    encoder_path: &Path,
+    ctc_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    use half::f16;
+    use ort::{inputs, value::Tensor};
+
+    let mut encoder_session = directml_session_builder()?
+        .commit_from_file(encoder_path)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice encoder session: {error}")
+        })?;
+    let encoder_inputs_summary = ort_outlet_summaries(encoder_session.inputs());
+    let encoder_outputs_summary = ort_outlet_summaries(encoder_session.outputs());
+
+    let fixed_len = 30usize * 17;
+    let frontend_audio = vec![0.0f32; 16_000];
+    let lfr_features = extract_sensevoice_lfr_features(&frontend_audio);
+    let valid_frames = lfr_features.frames.min(fixed_len);
+    let mut padded_features = vec![f16::from_f32(0.0); fixed_len * 560];
+    for frame in 0..valid_frames {
+        for value_index in 0..560 {
+            padded_features[frame * 560 + value_index] =
+                f16::from_f32(lfr_features.values[frame * 560 + value_index]);
+        }
+    }
+    if valid_frames > 0 {
+        let last_source = (valid_frames - 1) * 560;
+        for frame in valid_frames..fixed_len {
+            for value_index in 0..560 {
+                padded_features[frame * 560 + value_index] =
+                    f16::from_f32(lfr_features.values[last_source + value_index]);
+            }
+        }
+    }
+    let mut mask_values = vec![f16::from_f32(0.0); fixed_len];
+    for value in mask_values.iter_mut().take(valid_frames) {
+        *value = f16::from_f32(1.0);
+    }
+
+    let speech_feat = Tensor::<f16>::from_array(([1usize, fixed_len, 560], padded_features))
+        .map_err(|error| format!("Failed to create encoder speech_feat tensor: {error}"))?;
+    let mask = Tensor::<f16>::from_array(([1usize, fixed_len], mask_values))
+        .map_err(|error| format!("Failed to create encoder mask tensor: {error}"))?;
+    let prompt_ids = Tensor::<i64>::from_array(([1usize, 4], vec![0i64, 1, 2, 14]))
+        .map_err(|error| format!("Failed to create encoder prompt_ids tensor: {error}"))?;
+
+    let encoder_outputs = encoder_session
+        .run(inputs![
+            "speech_feat" => speech_feat,
+            "mask" => mask,
+            "prompt_ids" => prompt_ids,
+        ])
+        .map_err(|error| format!("DirectML split SenseVoice encoder run failed: {error}"))?;
+    let (encoder_shape, encoder_data) = encoder_outputs[0]
+        .try_extract_tensor::<f16>()
+        .map_err(|error| format!("Failed to extract encoder output tensor: {error}"))?;
+    let encoder_shape_usize = encoder_shape
+        .iter()
+        .map(|dim| usize::try_from(*dim).map_err(|_| format!("Invalid encoder output dim: {dim}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let encoder_data = encoder_data.to_vec();
+    drop(encoder_outputs);
+    drop(encoder_session);
+
+    let mut ctc_session = directml_session_builder()?
+        .commit_from_file(ctc_path)
+        .map_err(|error| {
+            format!("Failed to create DirectML split SenseVoice CTC session: {error}")
+        })?;
+    let ctc_inputs_summary = ort_outlet_summaries(ctc_session.inputs());
+    let ctc_outputs_summary = ort_outlet_summaries(ctc_session.outputs());
+    let enc_out = Tensor::<f16>::from_array((encoder_shape_usize, encoder_data))
+        .map_err(|error| format!("Failed to create CTC enc_out tensor: {error}"))?;
+    let ctc_outputs = ctc_session
+        .run(inputs!["enc_out" => enc_out])
+        .map_err(|error| format!("DirectML split SenseVoice CTC run failed: {error}"))?;
+    let (_indices_shape, topk_indices) = ctc_outputs[1]
+        .try_extract_tensor::<i32>()
+        .map_err(|error| format!("Failed to extract CTC topk_indices tensor: {error}"))?;
+    let token_preview = topk_indices
+        .iter()
+        .step_by(100)
+        .skip(4)
+        .take(12)
+        .map(|token| token.to_string())
+        .collect::<Vec<_>>();
+    drop(ctc_outputs);
+    drop(ctc_session);
+
+    let mut model_inputs = Vec::new();
+    model_inputs.extend(
+        encoder_inputs_summary
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_inputs.extend(ctc_inputs_summary.iter().map(|item| format!("ctc {item}")));
+
+    let mut model_outputs = Vec::new();
+    model_outputs.extend(
+        encoder_outputs_summary
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_outputs.extend(ctc_outputs_summary.iter().map(|item| format!("ctc {item}")));
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!(
+            "DirectML split SenseVoice encoder->CTC smoke completed; LFR frames: {valid_frames}; top1 token ids: {}",
+            token_preview.join(", ")
+        ),
+        model_inputs,
+        model_outputs,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+
+fn create_directml_session_in_child_with_args(
     mode: &str,
-    model_path: Option<&Path>,
+    model_paths: &[&Path],
     timeout: Duration,
     description: &str,
 ) -> Result<DirectMlSessionProbeCliResult, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let mut command = Command::new(executable);
     command.arg(mode);
-    if let Some(model_path) = model_path {
+    for model_path in model_paths {
         command.arg(model_path);
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -4082,6 +4213,20 @@ fn create_directml_session_in_child(
     Err(format!(
         "{description} failed with exit code {code}: {detail}"
     ))
+}
+
+fn create_directml_session_in_child(
+    mode: &str,
+    model_path: Option<&Path>,
+    timeout: Duration,
+    description: &str,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    match model_path {
+        Some(model_path) => {
+            create_directml_session_in_child_with_args(mode, &[model_path], timeout, description)
+        }
+        None => create_directml_session_in_child_with_args(mode, &[], timeout, description),
+    }
 }
 
 fn create_directml_provider_session_in_child() -> Result<DirectMlSessionProbeCliResult, String> {
@@ -4138,6 +4283,21 @@ pub fn run_cli_mode() -> bool {
                 std::process::exit(2);
             };
             create_directml_sensevoice_ctc_warmup_session(&PathBuf::from(model_path))
+        }
+        "--hi-voicer-directml-sensevoice-chain-smoke" => {
+            suppress_windows_fault_dialogs();
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(ctc_path) = args.next() else {
+                eprintln!("missing CTC path");
+                std::process::exit(2);
+            };
+            create_directml_sensevoice_chain_smoke_session(
+                &PathBuf::from(encoder_path),
+                &PathBuf::from(ctc_path),
+            )
         }
         _ => return false,
     };
@@ -4211,16 +4371,28 @@ fn directml_split_sensevoice_candidate_dirs(
     candidates.push(requested.clone());
     candidates.push(requested.join("sensevoice-directml"));
     candidates.push(requested.join("Sensevoice-Small-ONNX"));
-    candidates.push(requested.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+    candidates.push(
+        requested
+            .join("SenseVoice-Small")
+            .join("Sensevoice-Small-ONNX"),
+    );
     if let Some(parent) = requested.parent() {
         candidates.push(parent.join("sensevoice-directml"));
         candidates.push(parent.join("Sensevoice-Small-ONNX"));
-        candidates.push(parent.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+        candidates.push(
+            parent
+                .join("SenseVoice-Small")
+                .join("Sensevoice-Small-ONNX"),
+        );
     }
     if let Some(models_dir) = app_models_dir {
         candidates.push(models_dir.join("sensevoice-directml"));
         candidates.push(models_dir.join("Sensevoice-Small-ONNX"));
-        candidates.push(models_dir.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+        candidates.push(
+            models_dir
+                .join("SenseVoice-Small")
+                .join("Sensevoice-Small-ONNX"),
+        );
     }
 
     let mut unique = Vec::new();
@@ -4248,51 +4420,21 @@ fn select_directml_split_sensevoice_candidate(
             candidates
                 .first()
                 .map(|path| split_sensevoice_candidate_for_dir(path))
-                .unwrap_or_else(|| split_sensevoice_candidate_for_dir(&PathBuf::from(requested_model_dir)))
+                .unwrap_or_else(|| {
+                    split_sensevoice_candidate_for_dir(&PathBuf::from(requested_model_dir))
+                })
         })
 }
 
 fn create_directml_split_sensevoice_sessions_in_child(
     candidate: &DirectMlSplitSenseVoiceCandidate,
 ) -> Result<DirectMlSessionProbeCliResult, String> {
-    let encoder = create_directml_session_in_child(
-        "--hi-voicer-directml-sensevoice-encoder-warmup",
-        Some(&candidate.encoder),
-        Duration::from_secs(60),
-        "DirectML SenseVoice split encoder warmup child probe",
-    )?;
-    let ctc = create_directml_session_in_child(
-        "--hi-voicer-directml-sensevoice-ctc-warmup",
-        Some(&candidate.ctc),
-        Duration::from_secs(60),
-        "DirectML SenseVoice split CTC warmup child probe",
-    )?;
-
-    let mut model_inputs = Vec::new();
-    model_inputs.extend(
-        encoder
-            .model_inputs
-            .iter()
-            .map(|item| format!("encoder {item}")),
-    );
-    model_inputs.extend(ctc.model_inputs.iter().map(|item| format!("ctc {item}")));
-
-    let mut model_outputs = Vec::new();
-    model_outputs.extend(
-        encoder
-            .model_outputs
-            .iter()
-            .map(|item| format!("encoder {item}")),
-    );
-    model_outputs.extend(ctc.model_outputs.iter().map(|item| format!("ctc {item}")));
-
-    Ok(DirectMlSessionProbeCliResult {
-        ok: true,
-        message: "DirectML split SenseVoice encoder and CTC warmups completed".to_string(),
-        model_inputs,
-        model_outputs,
-        onnx_runtime_build: encoder.onnx_runtime_build.or(ctc.onnx_runtime_build),
-    })
+    create_directml_session_in_child_with_args(
+        "--hi-voicer-directml-sensevoice-chain-smoke",
+        &[candidate.encoder.as_path(), candidate.ctc.as_path()],
+        Duration::from_secs(90),
+        "DirectML SenseVoice split encoder-to-CTC child probe",
+    )
 }
 
 fn directml_probe_candidate_dirs(
@@ -4363,7 +4505,10 @@ fn directml_probe_for_model_dir(
     let provider_session_result = if directml_candidate {
         create_directml_provider_session_in_child()
     } else {
-        Err("DirectML provider check skipped because no usable GPU adapter was detected.".to_string())
+        Err(
+            "DirectML provider check skipped because no usable GPU adapter was detected."
+                .to_string(),
+        )
     };
     let provider_session_ready = provider_session_result
         .as_ref()
@@ -4376,7 +4521,10 @@ fn directml_probe_for_model_dir(
     let split_model_session_result = if split_model_ready && provider_session_ready {
         create_directml_split_sensevoice_sessions_in_child(&split_candidate)
     } else if !provider_session_ready {
-        Err("Split SenseVoice session check skipped because the DirectML provider probe failed.".to_string())
+        Err(
+            "Split SenseVoice session check skipped because the DirectML provider probe failed."
+                .to_string(),
+        )
     } else {
         Err("Split SenseVoice files are incomplete.".to_string())
     };
@@ -4399,7 +4547,10 @@ fn directml_probe_for_model_dir(
     } else if model_ready && provider_session_ready {
         create_directml_sensevoice_session_in_child(&model_path.join("model.int8.onnx"))
     } else if !provider_session_ready {
-        Err("SenseVoice session check skipped because the DirectML provider probe failed.".to_string())
+        Err(
+            "SenseVoice session check skipped because the DirectML provider probe failed."
+                .to_string(),
+        )
     } else {
         Err("DirectML session check skipped because prerequisites are incomplete.".to_string())
     };
@@ -7269,10 +7420,8 @@ mod tests {
             fs::write(model_dir.join(file), b"placeholder").expect("write split file");
         }
 
-        let candidate = select_directml_split_sensevoice_candidate(
-            root.to_string_lossy().as_ref(),
-            None,
-        );
+        let candidate =
+            select_directml_split_sensevoice_candidate(root.to_string_lossy().as_ref(), None);
 
         assert_eq!(candidate.model_dir, model_dir);
         assert!(split_sensevoice_missing_files(&candidate).is_empty());
