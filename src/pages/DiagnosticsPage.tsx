@@ -69,6 +69,11 @@ function buildDiagnosticReport(
       "DirectML candidate: " + (directMlProbeResult.directmlCandidate ? "yes" : "no"),
       "DirectML provider ready: " + (directMlProbeResult.providerSessionReady ? "yes" : "no"),
       "DirectML provider error: " + (directMlProbeResult.providerSessionError || "(none)"),
+      "Split SenseVoice ready: " + (directMlProbeResult.splitModelReady ? "yes" : "no"),
+      "Split SenseVoice dir: " + (directMlProbeResult.splitModelDir || "(none)"),
+      "Split SenseVoice missing files: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "(none)"),
+      "Split SenseVoice session ready: " + (directMlProbeResult.splitModelSessionReady ? "yes" : "no"),
+      "Split SenseVoice session error: " + (directMlProbeResult.splitModelSessionError || "(none)"),
       "SenseVoice model ready: " + (directMlProbeResult.modelReady ? "yes" : "no"),
       "DirectML session ready: " + (directMlProbeResult.directmlSessionReady ? "yes" : "no"),
       "DirectML session error: " + (directMlProbeResult.directmlSessionError || "(none)"),
@@ -335,8 +340,17 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
               <strong>DirectML provider</strong>
               <p>{directMlProbeResult.providerSessionReady ? "Minimal ONNX session created" : directMlProbeResult.providerSessionError || "DirectML provider probe failed"}</p>
             </div>
+            <div className={"diagnostic-row diagnostic-row--" + (directMlProbeResult.splitModelSessionReady ? "ok" : "warning")}>
+              <strong>Split SenseVoice DirectML</strong>
+              <p>
+                {directMlProbeResult.splitModelSessionReady
+                  ? "Encoder and CTC sessions created"
+                  : directMlProbeResult.splitModelSessionError ||
+                    "Missing: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "split model files")}
+              </p>
+            </div>
             <div className={"diagnostic-row diagnostic-row--" + (directMlProbeResult.modelReady ? "ok" : "warning")}>
-              <strong>SenseVoiceSmall</strong>
+              <strong>Sherpa SenseVoiceSmall</strong>
               <p>
                 {directMlProbeResult.modelReady
                   ? "Model files are ready"
@@ -347,6 +361,18 @@ export function DiagnosticsPage({ items, modelReady, settings }: DiagnosticsPage
               <strong>DirectML session</strong>
               <p>{directMlProbeResult.directmlSessionReady ? directMlProbeResult.message : directMlProbeResult.directmlSessionError || directMlProbeResult.message}</p>
             </div>
+            {directMlProbeResult.splitModelInputs.length > 0 && (
+              <div className="diagnostic-row diagnostic-row--ok">
+                <strong>Split model inputs</strong>
+                <p>{directMlProbeResult.splitModelInputs.join(" | ")}</p>
+              </div>
+            )}
+            {directMlProbeResult.splitModelOutputs.length > 0 && (
+              <div className="diagnostic-row diagnostic-row--ok">
+                <strong>Split model outputs</strong>
+                <p>{directMlProbeResult.splitModelOutputs.join(" | ")}</p>
+              </div>
+            )}
             {directMlProbeResult.modelInputs.length > 0 && (
               <div className="diagnostic-row diagnostic-row--ok">
                 <strong>Model inputs</strong>

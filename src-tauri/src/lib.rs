@@ -408,7 +408,7 @@ struct DirectMlAdapterInfo {
     status: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DirectMlSessionProbeCliResult {
     ok: bool,
@@ -424,6 +424,13 @@ struct DirectMlProbeResult {
     directml_candidate: bool,
     provider_session_ready: bool,
     provider_session_error: Option<String>,
+    split_model_ready: bool,
+    split_model_dir: Option<String>,
+    split_model_missing_files: Vec<String>,
+    split_model_session_ready: bool,
+    split_model_session_error: Option<String>,
+    split_model_inputs: Vec<String>,
+    split_model_outputs: Vec<String>,
     model_ready: bool,
     directml_session_ready: bool,
     directml_session_error: Option<String>,
@@ -3870,6 +3877,14 @@ pub fn run_cli_mode() -> bool {
     true
 }
 
+#[derive(Debug, Clone)]
+struct DirectMlSplitSenseVoiceCandidate {
+    model_dir: PathBuf,
+    encoder: PathBuf,
+    ctc: PathBuf,
+    tokenizer: PathBuf,
+}
+
 fn directml_sensevoice_ready(model_path: &Path) -> bool {
     let Ok(engine) = read_sherpa_engine(model_path) else {
         return false;
@@ -3878,6 +3893,122 @@ fn directml_sensevoice_ready(model_path: &Path) -> bool {
         && model_path.join("engine.json").exists()
         && model_path.join("model.int8.onnx").exists()
         && model_path.join("tokens.txt").exists()
+}
+
+fn split_sensevoice_candidate_for_dir(model_dir: &Path) -> DirectMlSplitSenseVoiceCandidate {
+    DirectMlSplitSenseVoiceCandidate {
+        model_dir: model_dir.to_path_buf(),
+        encoder: model_dir.join("SenseVoice-Encoder.fp16.onnx"),
+        ctc: model_dir.join("SenseVoice-CTC.fp16.onnx"),
+        tokenizer: model_dir.join("tokenizer.bpe.model"),
+    }
+}
+
+fn split_sensevoice_missing_files(candidate: &DirectMlSplitSenseVoiceCandidate) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !candidate.model_dir.exists() {
+        missing.push("split model directory".to_string());
+    }
+    for (label, path) in [
+        ("SenseVoice-Encoder.fp16.onnx", &candidate.encoder),
+        ("SenseVoice-CTC.fp16.onnx", &candidate.ctc),
+        ("tokenizer.bpe.model", &candidate.tokenizer),
+    ] {
+        if !path.exists() {
+            missing.push(label.to_string());
+        }
+    }
+    missing
+}
+
+fn directml_split_sensevoice_candidate_dirs(
+    requested_model_dir: &str,
+    app_models_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let requested = PathBuf::from(requested_model_dir);
+    let mut candidates = Vec::new();
+    candidates.push(requested.clone());
+    candidates.push(requested.join("sensevoice-directml"));
+    candidates.push(requested.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+    if let Some(parent) = requested.parent() {
+        candidates.push(parent.join("sensevoice-directml"));
+        candidates.push(parent.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+    }
+    if let Some(models_dir) = app_models_dir {
+        candidates.push(models_dir.join("sensevoice-directml"));
+        candidates.push(models_dir.join("SenseVoice-Small").join("Sensevoice-Small-ONNX"));
+    }
+
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        if !unique
+            .iter()
+            .any(|existing: &PathBuf| existing == &candidate)
+        {
+            unique.push(candidate);
+        }
+    }
+    unique
+}
+
+fn select_directml_split_sensevoice_candidate(
+    requested_model_dir: &str,
+    app_models_dir: Option<PathBuf>,
+) -> DirectMlSplitSenseVoiceCandidate {
+    let candidates = directml_split_sensevoice_candidate_dirs(requested_model_dir, app_models_dir);
+    candidates
+        .iter()
+        .map(|path| split_sensevoice_candidate_for_dir(path))
+        .find(|candidate| split_sensevoice_missing_files(candidate).is_empty())
+        .unwrap_or_else(|| {
+            candidates
+                .first()
+                .map(|path| split_sensevoice_candidate_for_dir(path))
+                .unwrap_or_else(|| split_sensevoice_candidate_for_dir(&PathBuf::from(requested_model_dir)))
+        })
+}
+
+fn create_directml_split_sensevoice_sessions_in_child(
+    candidate: &DirectMlSplitSenseVoiceCandidate,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    let encoder = create_directml_session_in_child(
+        "--hi-voicer-directml-probe",
+        Some(&candidate.encoder),
+        Duration::from_secs(30),
+        "DirectML SenseVoice split encoder child probe",
+    )?;
+    let ctc = create_directml_session_in_child(
+        "--hi-voicer-directml-probe",
+        Some(&candidate.ctc),
+        Duration::from_secs(30),
+        "DirectML SenseVoice split CTC child probe",
+    )?;
+
+    let mut model_inputs = Vec::new();
+    model_inputs.extend(
+        encoder
+            .model_inputs
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_inputs.extend(ctc.model_inputs.iter().map(|item| format!("ctc {item}")));
+
+    let mut model_outputs = Vec::new();
+    model_outputs.extend(
+        encoder
+            .model_outputs
+            .iter()
+            .map(|item| format!("encoder {item}")),
+    );
+    model_outputs.extend(ctc.model_outputs.iter().map(|item| format!("ctc {item}")));
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: "DirectML split SenseVoice sessions created for encoder and CTC".to_string(),
+        model_inputs,
+        model_outputs,
+        onnx_runtime_build: encoder.onnx_runtime_build.or(ctc.onnx_runtime_build),
+    })
 }
 
 fn directml_probe_candidate_dirs(
@@ -3924,7 +4055,8 @@ fn directml_probe_for_model_dir(
     app_models_dir: Option<PathBuf>,
 ) -> DirectMlProbeResult {
     let started_at = Instant::now();
-    let model_path = select_directml_probe_model_dir(model_dir, app_models_dir);
+    let model_path = select_directml_probe_model_dir(model_dir, app_models_dir.clone());
+    let split_candidate = select_directml_split_sensevoice_candidate(model_dir, app_models_dir);
     let engine = read_sherpa_engine(&model_path).ok();
     let mut missing_files = Vec::new();
 
@@ -3954,7 +4086,33 @@ fn directml_probe_for_model_dir(
         .map(|result| result.ok)
         .unwrap_or(false);
     let provider_session_error = provider_session_result.as_ref().err().cloned();
-    let directml_session_result = if model_ready && provider_session_ready {
+
+    let split_model_missing_files = split_sensevoice_missing_files(&split_candidate);
+    let split_model_ready = split_model_missing_files.is_empty();
+    let split_model_session_result = if split_model_ready && provider_session_ready {
+        create_directml_split_sensevoice_sessions_in_child(&split_candidate)
+    } else if !provider_session_ready {
+        Err("Split SenseVoice session check skipped because the DirectML provider probe failed.".to_string())
+    } else {
+        Err("Split SenseVoice files are incomplete.".to_string())
+    };
+    let split_model_session_ready = split_model_session_result
+        .as_ref()
+        .map(|result| result.ok)
+        .unwrap_or(false);
+    let split_model_session_error = split_model_session_result.as_ref().err().cloned();
+    let split_model_inputs = split_model_session_result
+        .as_ref()
+        .map(|result| result.model_inputs.clone())
+        .unwrap_or_default();
+    let split_model_outputs = split_model_session_result
+        .as_ref()
+        .map(|result| result.model_outputs.clone())
+        .unwrap_or_default();
+
+    let directml_session_result = if split_model_session_ready {
+        split_model_session_result.clone()
+    } else if model_ready && provider_session_ready {
         create_directml_sensevoice_session_in_child(&model_path.join("model.int8.onnx"))
     } else if !provider_session_ready {
         Err("SenseVoice session check skipped because the DirectML provider probe failed.".to_string())
@@ -3969,6 +4127,7 @@ fn directml_probe_for_model_dir(
     let onnx_runtime_build = directml_session_result
         .as_ref()
         .ok()
+        .or_else(|| split_model_session_result.as_ref().ok())
         .or_else(|| provider_session_result.as_ref().ok())
         .and_then(|result| result.onnx_runtime_build.clone());
     let model_inputs = directml_session_result
@@ -3997,13 +4156,17 @@ fn directml_probe_for_model_dir(
             .clone()
             .unwrap_or_else(|| "DirectML SenseVoice session check failed.".to_string())
     };
-    let next_step = if directml_session_ready {
+    let next_step = if split_model_session_ready {
+        "Split SenseVoice encoder/CTC sessions work with DirectML; next implement fixed-shape audio feature input and CTC decoding behind an experimental engine.".to_string()
+    } else if directml_session_ready {
         "Add the DirectML audio feature-extraction and decoder path behind an experimental toggle."
             .to_string()
+    } else if provider_session_ready && split_model_ready {
+        "DirectML provider works, but split SenseVoice session creation failed; inspect unsupported operators or try another ONNX Runtime version.".to_string()
     } else if provider_session_ready && model_ready {
-        "DirectML provider works, but SenseVoiceSmall session creation failed; test another ONNX Runtime version or a DirectML-friendly split model before enabling transcription.".to_string()
+        "DirectML provider works, but Sherpa SenseVoiceSmall session creation failed; use a DirectML-friendly split model before enabling transcription.".to_string()
     } else if provider_session_ready {
-        "DirectML provider works; install or select SenseVoiceSmall before testing model compatibility.".to_string()
+        "DirectML provider works; place split SenseVoice files under models\\sensevoice-directml or CapsWriter-style models\\SenseVoice-Small\\Sensevoice-Small-ONNX.".to_string()
     } else {
         "Keep using the stable CPU/Sherpa path; DirectML provider session is not reliable on this machine.".to_string()
     };
@@ -4012,6 +4175,13 @@ fn directml_probe_for_model_dir(
         directml_candidate,
         provider_session_ready,
         provider_session_error,
+        split_model_ready,
+        split_model_dir: Some(split_candidate.model_dir.to_string_lossy().to_string()),
+        split_model_missing_files,
+        split_model_session_ready,
+        split_model_session_error,
+        split_model_inputs,
+        split_model_outputs,
         model_ready,
         directml_session_ready,
         directml_session_error,
@@ -6776,6 +6946,33 @@ mod tests {
 
         assert!(text.contains("Identity"));
         assert!(text.contains("HiVoicerDirectMlIdentityGraph"));
+    }
+
+    #[test]
+    fn split_sensevoice_candidate_detects_ready_capswriter_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-voicer-split-sensevoice-test-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis().unwrap_or(0)
+        ));
+        let model_dir = root.join("SenseVoice-Small").join("Sensevoice-Small-ONNX");
+        fs::create_dir_all(&model_dir).expect("create split model dir");
+        for file in [
+            "SenseVoice-Encoder.fp16.onnx",
+            "SenseVoice-CTC.fp16.onnx",
+            "tokenizer.bpe.model",
+        ] {
+            fs::write(model_dir.join(file), b"placeholder").expect("write split file");
+        }
+
+        let candidate = select_directml_split_sensevoice_candidate(
+            root.to_string_lossy().as_ref(),
+            None,
+        );
+
+        assert_eq!(candidate.model_dir, model_dir);
+        assert!(split_sensevoice_missing_files(&candidate).is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

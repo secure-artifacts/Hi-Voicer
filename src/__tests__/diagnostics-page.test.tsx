@@ -56,6 +56,13 @@ vi.mock("../lib/api", () => ({
       directmlCandidate: true,
       providerSessionReady: true,
       providerSessionError: null,
+      splitModelReady: true,
+      splitModelDir: "C:\models\sensevoice-directml",
+      splitModelMissingFiles: [],
+      splitModelSessionReady: true,
+      splitModelSessionError: null,
+      splitModelInputs: ["encoder speech: Tensor<Float32>(1, 3000, 80)", "ctc hidden: Tensor<Float32>(1, 750, 512)"],
+      splitModelOutputs: ["encoder out: Tensor<Float32>(1, 750, 512)", "ctc logits: Tensor<Float32>(1, 750, 250000)"],
       modelReady: true,
       directmlSessionReady: true,
       directmlSessionError: null,
@@ -137,7 +144,9 @@ describe("DiagnosticsPage", () => {
     });
     expect(await screen.findAllByText(/DirectML SenseVoice session created/)).toHaveLength(2);
     expect(screen.getByText(/Minimal ONNX session created/)).toBeTruthy();
-    expect(screen.getByText(/speech: Tensor<Float32>/)).toBeTruthy();
+    expect(screen.getByText(/Encoder and CTC sessions created/)).toBeTruthy();
+    expect(screen.getByText(/encoder speech: Tensor<Float32>/)).toBeTruthy();
+    expect(screen.getByText(/language: Tensor<Int64>/)).toBeTruthy();
     expect(screen.getByText("NVIDIA GeForce RTX 3060")).toBeTruthy();
   });
 

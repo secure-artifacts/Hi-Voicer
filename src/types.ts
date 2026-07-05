@@ -218,6 +218,13 @@ export interface DirectMlProbeResult {
   directmlCandidate: boolean;
   providerSessionReady: boolean;
   providerSessionError?: string | null;
+  splitModelReady: boolean;
+  splitModelDir?: string | null;
+  splitModelMissingFiles: string[];
+  splitModelSessionReady: boolean;
+  splitModelSessionError?: string | null;
+  splitModelInputs: string[];
+  splitModelOutputs: string[];
   modelReady: boolean;
   directmlSessionReady: boolean;
   directmlSessionError?: string | null;
