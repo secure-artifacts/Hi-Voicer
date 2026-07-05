@@ -3954,9 +3954,62 @@ fn pad_sensevoice_lfr_features(
     (padded_features, mask_values, valid_frames)
 }
 
+fn fft_radix2_in_place(real: &mut [f32], imag: &mut [f32]) {
+    let n = real.len();
+    debug_assert!(n.is_power_of_two());
+    debug_assert_eq!(imag.len(), n);
+
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            real.swap(i, j);
+            imag.swap(i, j);
+        }
+    }
+
+    let mut len = 2usize;
+    while len <= n {
+        let angle = -2.0 * std::f32::consts::PI / len as f32;
+        let w_len_real = angle.cos();
+        let w_len_imag = angle.sin();
+
+        for start in (0..n).step_by(len) {
+            let mut w_real = 1.0f32;
+            let mut w_imag = 0.0f32;
+            for offset in 0..(len / 2) {
+                let even = start + offset;
+                let odd = even + len / 2;
+
+                let odd_real = real[odd] * w_real - imag[odd] * w_imag;
+                let odd_imag = real[odd] * w_imag + imag[odd] * w_real;
+                let even_real = real[even];
+                let even_imag = imag[even];
+
+                real[even] = even_real + odd_real;
+                imag[even] = even_imag + odd_imag;
+                real[odd] = even_real - odd_real;
+                imag[odd] = even_imag - odd_imag;
+
+                let next_w_real = w_real * w_len_real - w_imag * w_len_imag;
+                w_imag = w_real * w_len_imag + w_imag * w_len_real;
+                w_real = next_w_real;
+            }
+        }
+
+        len <<= 1;
+    }
+}
+
 fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
     const SAMPLE_RATE: usize = 16_000;
-    const N_FFT: usize = 400;
+    const WINDOW_LENGTH: usize = 400;
+    const FFT_LENGTH: usize = 512;
     const HOP_LENGTH: usize = 160;
     const N_MELS: usize = 80;
     const LFR_STACK: usize = 7;
@@ -3976,38 +4029,40 @@ fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
     }
     normalized.clear();
 
-    let half_n_fft = N_FFT / 2;
-    let mut padded = Vec::with_capacity(emphasized.len() + N_FFT);
+    let half_n_fft = WINDOW_LENGTH / 2;
+    let mut padded = Vec::with_capacity(emphasized.len() + WINDOW_LENGTH);
     padded.extend(std::iter::repeat(0.0f32).take(half_n_fft));
     padded.extend_from_slice(&emphasized);
     padded.extend(std::iter::repeat(0.0f32).take(half_n_fft));
 
-    let frame_count = if padded.len() >= N_FFT {
-        1 + (padded.len() - N_FFT) / HOP_LENGTH
+    let frame_count = if padded.len() >= WINDOW_LENGTH {
+        1 + (padded.len() - WINDOW_LENGTH) / HOP_LENGTH
     } else {
         1
     };
-    let filters = sensevoice_mel_filters(SAMPLE_RATE, N_FFT, N_MELS, 20.0, 8000.0);
-    let window = (0..N_FFT)
-        .map(|index| 0.54 - 0.46 * (2.0 * std::f32::consts::PI * index as f32 / N_FFT as f32).cos())
+    let filters = sensevoice_mel_filters(SAMPLE_RATE, FFT_LENGTH, N_MELS, 20.0, 8000.0);
+    let window = (0..WINDOW_LENGTH)
+        .map(|index| {
+            0.54 - 0.46 * (2.0 * std::f32::consts::PI * index as f32 / WINDOW_LENGTH as f32).cos()
+        })
         .collect::<Vec<_>>();
 
-    let bins = N_FFT / 2 + 1;
+    let bins = FFT_LENGTH / 2 + 1;
     let mut log_mel = vec![0.0f32; frame_count * N_MELS];
     let mut magnitudes = vec![0.0f32; bins];
+    let mut fft_real = vec![0.0f32; FFT_LENGTH];
+    let mut fft_imag = vec![0.0f32; FFT_LENGTH];
 
     for frame_index in 0..frame_count {
         let offset = frame_index * HOP_LENGTH;
+        fft_real.fill(0.0);
+        fft_imag.fill(0.0);
+        for index in 0..WINDOW_LENGTH {
+            fft_real[index] = padded.get(offset + index).copied().unwrap_or(0.0) * window[index];
+        }
+        fft_radix2_in_place(&mut fft_real, &mut fft_imag);
         for bin in 0..bins {
-            let mut real = 0.0f32;
-            let mut imag = 0.0f32;
-            for index in 0..N_FFT {
-                let sample = padded.get(offset + index).copied().unwrap_or(0.0) * window[index];
-                let angle = -2.0 * std::f32::consts::PI * bin as f32 * index as f32 / N_FFT as f32;
-                real += sample * angle.cos();
-                imag += sample * angle.sin();
-            }
-            magnitudes[bin] = real * real + imag * imag;
+            magnitudes[bin] = fft_real[bin] * fft_real[bin] + fft_imag[bin] * fft_imag[bin];
         }
 
         for mel in 0..N_MELS {
@@ -4384,14 +4439,23 @@ fn create_directml_sensevoice_wav_transcription_session(
     let total_chunks = audio.len().div_ceil(chunk_samples).max(1);
     let mut text_chunks = Vec::new();
 
+    let mut total_feature_ms = 0u128;
+    let mut total_inference_ms = 0u128;
+
     for chunk_audio in audio.chunks(chunk_samples) {
+        let feature_started_at = Instant::now();
         let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
+        total_feature_ms += feature_started_at.elapsed().as_millis();
+
+        let inference_started_at = Instant::now();
         let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
             &mut encoder_session,
             &mut ctc_session,
             &pieces,
             &lfr_features,
         )?;
+        total_inference_ms += inference_started_at.elapsed().as_millis();
+
         let text = clean_subtitle_text_one_line(&text);
         if !text.is_empty() {
             text_chunks.push(text);
@@ -4417,7 +4481,7 @@ fn create_directml_sensevoice_wav_transcription_session(
     Ok(DirectMlSessionProbeCliResult {
         ok: true,
         message: format!(
-            "DirectML split SenseVoice WAV transcription completed; chunks: {total_chunks}; decoded text: {}",
+            "DirectML split SenseVoice WAV transcription completed; chunks: {total_chunks}; feature {total_feature_ms} ms; inference {total_inference_ms} ms; decoded text: {}",
             text_chunks.join("\n")
         ),
         model_inputs,
@@ -4886,6 +4950,8 @@ fn transcribe_directml_sensevoice_wav(
     let chunk_samples = 30usize * 16_000;
     let total_chunks = audio.len().div_ceil(chunk_samples).max(1);
     let mut transcript_chunks = Vec::new();
+    let mut total_feature_ms = 0u128;
+    let mut total_inference_ms = 0u128;
 
     for (chunk_index, chunk_audio) in audio.chunks(chunk_samples).enumerate() {
         let start = chunk_index as f64 * 30.0;
@@ -4906,18 +4972,57 @@ fn transcribe_directml_sensevoice_wav(
             total_chunks,
         );
 
+        let feature_started_at = Instant::now();
         let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
+        let feature_ms = feature_started_at.elapsed().as_millis();
+        total_feature_ms += feature_ms;
+
+        let inference_started_at = Instant::now();
         let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
             &mut encoder_session,
             &mut ctc_session,
             &pieces,
             &lfr_features,
         )?;
+        let inference_ms = inference_started_at.elapsed().as_millis();
+        total_inference_ms += inference_ms;
+
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            progress,
+            format!(
+                "DirectML SenseVoice chunk {}/{} finished; feature {} ms, inference {} ms",
+                chunk_index + 1,
+                total_chunks,
+                feature_ms,
+                inference_ms
+            ),
+            chunk_index + 1,
+            total_chunks,
+        );
+
         let text = clean_subtitle_text_one_line(&text);
         if !text.is_empty() {
             transcript_chunks.push(TranscriptTextChunk { text, start, end });
         }
     }
+
+    emit_transcription_progress(
+        app,
+        task_id,
+        started_at,
+        "transcribing",
+        92,
+        format!(
+            "DirectML SenseVoice timing: feature {} ms, inference {} ms",
+            total_feature_ms, total_inference_ms
+        ),
+        total_chunks,
+        total_chunks,
+    );
 
     Ok(transcript_chunks)
 }
@@ -7958,6 +8063,29 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn radix2_fft_detects_expected_frequency_bin() {
+        let sample_rate = 16_000.0f32;
+        let freq = 1_000.0f32;
+        let n = 512usize;
+        let mut real = (0..n)
+            .map(|index| (2.0 * std::f32::consts::PI * freq * index as f32 / sample_rate).sin())
+            .collect::<Vec<_>>();
+        let mut imag = vec![0.0f32; n];
+
+        fft_radix2_in_place(&mut real, &mut imag);
+
+        let peak_bin = (1..(n / 2))
+            .max_by(|left, right| {
+                let left_power = real[*left] * real[*left] + imag[*left] * imag[*left];
+                let right_power = real[*right] * real[*right] + imag[*right] * imag[*right];
+                left_power.total_cmp(&right_power)
+            })
+            .expect("peak bin");
+
+        assert_eq!(peak_bin, 32);
     }
 
     #[test]
