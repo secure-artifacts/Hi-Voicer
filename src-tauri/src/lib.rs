@@ -5197,9 +5197,9 @@ fn directml_probe_for_model_dir(
             .unwrap_or_else(|| "DirectML SenseVoice session check failed.".to_string())
     };
     let next_step = if split_model_session_ready {
-        "Split SenseVoice DirectML encoder->CTC->tokenizer smoke works; next wire real audio/video input and chunk merging behind an experimental engine.".to_string()
+        "DirectML SenseVoice is ready for experimental transcription; compare timing and output quality with CPU before making it the default path.".to_string()
     } else if directml_session_ready {
-        "Add the DirectML real-media transcription path behind an experimental toggle.".to_string()
+        "DirectML SenseVoice is ready for experimental transcription; run a real audio/video transcription to compare timing and output quality.".to_string()
     } else if provider_session_ready && split_model_ready {
         "DirectML provider works, but split SenseVoice session creation failed; inspect unsupported operators or try another ONNX Runtime version.".to_string()
     } else if provider_session_ready && model_ready {
