@@ -3658,6 +3658,160 @@ fn append_proto_message(out: &mut Vec<u8>, field_number: u32, value: Vec<u8>) {
     out.extend_from_slice(&value);
 }
 
+#[derive(Debug, Clone)]
+struct SenseVoiceLfrFeatures {
+    frames: usize,
+    values: Vec<f32>,
+}
+
+fn hz_to_mel(freq: f32) -> f32 {
+    2595.0 * (1.0 + freq / 700.0).log10()
+}
+
+fn mel_to_hz(mel: f32) -> f32 {
+    700.0 * (10.0f32.powf(mel / 2595.0) - 1.0)
+}
+
+fn sensevoice_mel_filters(sr: usize, n_fft: usize, n_mels: usize, f_min: f32, f_max: f32) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
+    let mel_min = hz_to_mel(f_min);
+    let mel_max = hz_to_mel(f_max);
+    let mel_points = (0..(n_mels + 2))
+        .map(|index| mel_min + (mel_max - mel_min) * index as f32 / (n_mels + 1) as f32)
+        .map(mel_to_hz)
+        .collect::<Vec<_>>();
+    let diffs = mel_points
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let mut filters = vec![0.0f32; bins * n_mels];
+
+    for bin in 0..bins {
+        let freq = bin as f32 * (sr as f32 / 2.0) / (bins - 1) as f32;
+        for mel in 0..n_mels {
+            let left = mel_points[mel];
+            let center = mel_points[mel + 1];
+            let right = mel_points[mel + 2];
+            let lower = if diffs[mel].abs() > f32::EPSILON {
+                (freq - left) / diffs[mel]
+            } else {
+                0.0
+            };
+            let upper = if diffs[mel + 1].abs() > f32::EPSILON {
+                (right - freq) / diffs[mel + 1]
+            } else {
+                0.0
+            };
+            filters[bin * n_mels + mel] = lower.min(upper).max(0.0);
+            let _ = center;
+        }
+    }
+
+    filters
+}
+
+fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
+    const SAMPLE_RATE: usize = 16_000;
+    const N_FFT: usize = 400;
+    const HOP_LENGTH: usize = 160;
+    const N_MELS: usize = 80;
+    const LFR_STACK: usize = 7;
+    const LFR_SKIP: usize = 6;
+
+    let mut normalized = if audio.is_empty() {
+        vec![0.0f32]
+    } else {
+        let mean = audio.iter().sum::<f32>() / audio.len() as f32;
+        audio.iter().map(|sample| sample - mean).collect::<Vec<_>>()
+    };
+
+    let mut emphasized = vec![0.0f32; normalized.len()];
+    emphasized[0] = normalized[0];
+    for index in 1..normalized.len() {
+        emphasized[index] = normalized[index] - 0.97 * normalized[index - 1];
+    }
+    normalized.clear();
+
+    let half_n_fft = N_FFT / 2;
+    let mut padded = Vec::with_capacity(emphasized.len() + N_FFT);
+    padded.extend(std::iter::repeat(0.0f32).take(half_n_fft));
+    padded.extend_from_slice(&emphasized);
+    padded.extend(std::iter::repeat(0.0f32).take(half_n_fft));
+
+    let frame_count = if padded.len() >= N_FFT {
+        1 + (padded.len() - N_FFT) / HOP_LENGTH
+    } else {
+        1
+    };
+    let filters = sensevoice_mel_filters(SAMPLE_RATE, N_FFT, N_MELS, 20.0, 8000.0);
+    let window = (0..N_FFT)
+        .map(|index| 0.54 - 0.46 * (2.0 * std::f32::consts::PI * index as f32 / N_FFT as f32).cos())
+        .collect::<Vec<_>>();
+
+    let bins = N_FFT / 2 + 1;
+    let mut log_mel = vec![0.0f32; frame_count * N_MELS];
+    let mut magnitudes = vec![0.0f32; bins];
+
+    for frame_index in 0..frame_count {
+        let offset = frame_index * HOP_LENGTH;
+        for bin in 0..bins {
+            let mut real = 0.0f32;
+            let mut imag = 0.0f32;
+            for index in 0..N_FFT {
+                let sample = padded.get(offset + index).copied().unwrap_or(0.0) * window[index];
+                let angle = -2.0 * std::f32::consts::PI * bin as f32 * index as f32 / N_FFT as f32;
+                real += sample * angle.cos();
+                imag += sample * angle.sin();
+            }
+            magnitudes[bin] = real * real + imag * imag;
+        }
+
+        for mel in 0..N_MELS {
+            let mut energy = 0.0f32;
+            for bin in 0..bins {
+                energy += magnitudes[bin] * filters[bin * N_MELS + mel];
+            }
+            log_mel[frame_index * N_MELS + mel] = (energy + 1.0e-7).ln();
+        }
+    }
+
+    let lfr_frames = (frame_count + 5) / LFR_SKIP;
+    let right_pad_len = lfr_frames * LFR_SKIP + LFR_STACK - frame_count;
+    let padded_mel_frames = 3 + frame_count + right_pad_len;
+    let mut padded_mel = vec![0.0f32; padded_mel_frames * N_MELS];
+
+    for frame in 0..3 {
+        padded_mel[frame * N_MELS..(frame + 1) * N_MELS]
+            .copy_from_slice(&log_mel[0..N_MELS]);
+    }
+    for frame in 0..frame_count {
+        let source = frame * N_MELS;
+        let target = (frame + 3) * N_MELS;
+        padded_mel[target..target + N_MELS].copy_from_slice(&log_mel[source..source + N_MELS]);
+    }
+    let last_source = (frame_count - 1) * N_MELS;
+    for frame in 0..right_pad_len {
+        let target = (3 + frame_count + frame) * N_MELS;
+        padded_mel[target..target + N_MELS]
+            .copy_from_slice(&log_mel[last_source..last_source + N_MELS]);
+    }
+
+    let mut values = vec![0.0f32; lfr_frames * N_MELS * LFR_STACK];
+    for frame in 0..lfr_frames {
+        for stack in 0..LFR_STACK {
+            let source_frame = stack + frame * LFR_SKIP;
+            let source = source_frame * N_MELS;
+            let target = frame * N_MELS * LFR_STACK + stack * N_MELS;
+            values[target..target + N_MELS].copy_from_slice(&padded_mel[source..source + N_MELS]);
+        }
+    }
+
+    SenseVoiceLfrFeatures {
+        frames: lfr_frames,
+        values,
+    }
+}
+
 fn directml_identity_model_bytes() -> Vec<u8> {
     fn dim(value: u64) -> Vec<u8> {
         let mut out = Vec::new();
@@ -3801,16 +3955,34 @@ fn create_directml_sensevoice_encoder_warmup_session(
     let outputs_summary = ort_outlet_summaries(session.outputs());
 
     let fixed_len = 30usize * 17;
-    let speech_feat = Tensor::<f16>::from_array((
-        [1usize, fixed_len, 560],
-        vec![f16::from_f32(0.0); fixed_len * 560],
-    ))
-    .map_err(|error| format!("Failed to create encoder speech_feat tensor: {error}"))?;
-    let mask = Tensor::<f16>::from_array((
-        [1usize, fixed_len],
-        vec![f16::from_f32(1.0); fixed_len],
-    ))
-    .map_err(|error| format!("Failed to create encoder mask tensor: {error}"))?;
+    let frontend_audio = vec![0.0f32; 16_000];
+    let lfr_features = extract_sensevoice_lfr_features(&frontend_audio);
+    let valid_frames = lfr_features.frames.min(fixed_len);
+    let mut padded_features = vec![f16::from_f32(0.0); fixed_len * 560];
+    for frame in 0..valid_frames {
+        for value_index in 0..560 {
+            padded_features[frame * 560 + value_index] =
+                f16::from_f32(lfr_features.values[frame * 560 + value_index]);
+        }
+    }
+    if valid_frames > 0 {
+        let last_source = (valid_frames - 1) * 560;
+        for frame in valid_frames..fixed_len {
+            for value_index in 0..560 {
+                padded_features[frame * 560 + value_index] =
+                    f16::from_f32(lfr_features.values[last_source + value_index]);
+            }
+        }
+    }
+    let mut mask_values = vec![f16::from_f32(0.0); fixed_len];
+    for value in mask_values.iter_mut().take(valid_frames) {
+        *value = f16::from_f32(1.0);
+    }
+
+    let speech_feat = Tensor::<f16>::from_array(([1usize, fixed_len, 560], padded_features))
+        .map_err(|error| format!("Failed to create encoder speech_feat tensor: {error}"))?;
+    let mask = Tensor::<f16>::from_array(([1usize, fixed_len], mask_values))
+        .map_err(|error| format!("Failed to create encoder mask tensor: {error}"))?;
     let prompt_ids = Tensor::<i64>::from_array(([1usize, 4], vec![0i64, 1, 2, 14]))
         .map_err(|error| format!("Failed to create encoder prompt_ids tensor: {error}"))?;
 
@@ -3828,7 +4000,7 @@ fn create_directml_sensevoice_encoder_warmup_session(
     Ok(DirectMlSessionProbeCliResult {
         ok: true,
         message: format!(
-            "DirectML split SenseVoice encoder warmup completed; outputs: {output_count}"
+            "DirectML split SenseVoice encoder frontend warmup completed; LFR frames: {valid_frames}, outputs: {output_count}"
         ),
         model_inputs: inputs_summary,
         model_outputs: outputs_summary,
@@ -7049,6 +7221,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn sensevoice_lfr_features_have_expected_shape_for_one_second_audio() {
+        let audio = vec![0.0f32; 16_000];
+        let features = extract_sensevoice_lfr_features(&audio);
+
+        assert_eq!(features.frames, 17);
+        assert_eq!(features.values.len(), 17 * 560);
+        assert!(features.values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn sensevoice_lfr_features_handle_short_audio() {
+        let audio = vec![0.0f32; 400];
+        let features = extract_sensevoice_lfr_features(&audio);
+
+        assert!(features.frames >= 1);
+        assert_eq!(features.values.len(), features.frames * 560);
+        assert!(features.values.iter().all(|value| value.is_finite()));
     }
 
     #[test]
