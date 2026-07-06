@@ -81,6 +81,8 @@ export interface UserSettings {
   recordingMode: RecordingMode;
   recordingSource: RecordingSource;
   accelerationMode: AccelerationMode;
+  directmlVerified: boolean;
+  directmlVerifiedAt?: string | null;
   hotwords: HotwordRule[];
   termCategories: TermCategory[];
   theme: ThemeMode;
@@ -127,6 +129,8 @@ export interface TranscribeFileResult {
   segments: SubtitleSegment[];
   timelineKind: TimelineKind;
   sourceAudioPath: string;
+  usedAccelerationMode?: AccelerationMode | "none";
+  accelerationFallbackUsed?: boolean;
 }
 
 export interface TranscriptionOutputFile {

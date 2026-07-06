@@ -261,10 +261,13 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
             onClick={() => onSettingsChange({ ...settings, accelerationMode: "directml" })}
           >
             <Gauge size={16} />
-            DirectML（实验）
+            {settings.directmlVerified ? "DirectML（已验证）" : "DirectML（实验）"}
           </button>
 
         </div>
+        {settings.directmlVerified && settings.directmlVerifiedAt && (
+          <span className="setting-hint">本机验证时间：{new Date(settings.directmlVerifiedAt).toLocaleString()}</span>
+        )}
       </SettingRow>
 
       <div className="setting-row setting-row--stacked">

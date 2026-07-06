@@ -916,6 +916,13 @@ textarea:focus-visible {
   color: var(--primary-strong);
 }
 
+.setting-hint {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
 .mode-grid,
 .model-grid {
   display: grid;

@@ -16,6 +16,8 @@ pub struct UserSettings {
     pub recording_mode: String,
     pub recording_source: String,
     pub acceleration_mode: String,
+    pub directml_verified: bool,
+    pub directml_verified_at: Option<String>,
     pub hotwords: Vec<HotwordRule>,
     pub term_categories: Vec<TermCategory>,
     pub export_format: String,
@@ -86,6 +88,8 @@ impl Default for UserSettings {
             recording_mode: "hold".to_string(),
             recording_source: "microphone".to_string(),
             acceleration_mode: "cpu".to_string(),
+            directml_verified: false,
+            directml_verified_at: None,
             hotwords: Vec::new(),
             term_categories: vec![
                 TermCategory {
@@ -166,6 +170,9 @@ impl UserSettings {
         }
         if !matches!(self.acceleration_mode.as_str(), "cpu" | "directml") {
             self.acceleration_mode = defaults.acceleration_mode;
+        }
+        if !self.directml_verified {
+            self.directml_verified_at = None;
         }
         if !matches!(
             self.export_format.as_str(),

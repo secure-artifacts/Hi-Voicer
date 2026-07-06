@@ -39,29 +39,12 @@ const SHERPA_CPU_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Rel
 const SHERPA_CPU_ARCHIVE_NAME: &str =
     "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
 const SHERPA_CPU_RUNTIME_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.2/sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts.tar.bz2";
-const SHERPA_CUDA_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda";
-const SHERPA_CUDA_REQUIRED_DLLS: &[&str] = &[
-    "cudart64_12.dll",
-    "cublas64_12.dll",
-    "cublasLt64_12.dll",
-    "cufft64_11.dll",
-    "cudnn64_9.dll",
-    "cudnn_adv64_9.dll",
-    "cudnn_cnn64_9.dll",
-    "cudnn_engines_precompiled64_9.dll",
-    "cudnn_engines_runtime_compiled64_9.dll",
-    "cudnn_graph64_9.dll",
-    "cudnn_heuristic64_9.dll",
-    "cudnn_ops64_9.dll",
-];
 
 struct RuntimeState {
     settings: Mutex<UserSettings>,
     recording: Mutex<Option<RecordingSession>>,
     sherpa_daemon: Mutex<Option<SherpaDaemon>>,
     sherpa_runtime_install: Mutex<()>,
-    cuda_disabled_reason: Mutex<Option<String>>,
-    cuda_startup_checked_runtime: Mutex<Option<String>>,
 }
 
 struct RecordingSession {
@@ -472,6 +455,8 @@ struct TranscribeFileResult {
     segments: Vec<TranscriptSegment>,
     timeline_kind: String,
     source_audio_path: String,
+    used_acceleration_mode: String,
+    acceleration_fallback_used: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1100,57 +1085,6 @@ fn sherpa_runtime_executable_path(app: &AppHandle, runtime_name: &str) -> Result
         .app_local_data_dir()
         .map_err(|error| error.to_string())?;
     Ok(data_dir.join(sherpa_runtime_relative_executable(runtime_name)))
-}
-
-fn sherpa_runtime_search_roots(
-    data_dir: &Path,
-    resource_dir: Option<&Path>,
-    executable_dir: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut roots = vec![data_dir.to_path_buf()];
-    if let Some(resource_dir) = resource_dir {
-        push_unique_path(&mut roots, resource_dir.to_path_buf());
-    }
-    if let Some(executable_dir) = executable_dir {
-        push_unique_path(&mut roots, executable_dir.to_path_buf());
-    }
-    roots
-}
-
-fn sherpa_runtime_search_roots_for_app(app: &AppHandle) -> Result<Vec<PathBuf>, String> {
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .map_err(|error| error.to_string())?;
-    let resource_dir = app.path().resource_dir().ok();
-    let executable_dir = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf));
-
-    Ok(sherpa_runtime_search_roots(
-        &data_dir,
-        resource_dir.as_deref(),
-        executable_dir.as_deref(),
-    ))
-}
-
-fn sherpa_runtime_executable_candidates(roots: &[PathBuf], runtime_name: &str) -> Vec<PathBuf> {
-    let relative = sherpa_runtime_relative_executable(runtime_name);
-    let mut candidates = Vec::new();
-    for root in roots {
-        push_unique_path(&mut candidates, root.join(&relative));
-    }
-    candidates
-}
-
-fn find_sherpa_runtime_executable(
-    app: &AppHandle,
-    runtime_name: &str,
-) -> Result<Option<PathBuf>, String> {
-    let roots = sherpa_runtime_search_roots_for_app(app)?;
-    Ok(sherpa_runtime_executable_candidates(&roots, runtime_name)
-        .into_iter()
-        .find(|path| path.exists()))
 }
 
 fn sherpa_runtime_dir_from_executable(executable: &Path) -> Result<PathBuf, String> {
@@ -1990,395 +1924,6 @@ struct ResolvedSherpaRuntime {
     fallback_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-struct NvidiaCudaInfo {
-    available: bool,
-    device_summary: Option<String>,
-    detection_error: Option<String>,
-}
-
-fn parse_nvidia_smi_query_output(output: &str) -> Option<String> {
-    let devices = output
-        .lines()
-        .filter_map(|line| {
-            let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
-            if parts.len() < 3 {
-                return None;
-            }
-            let name = parts[0].trim();
-            let driver = parts[1].trim();
-            let memory_mb = parts[2].trim();
-            if name.is_empty() {
-                return None;
-            }
-
-            let driver_text = if driver.is_empty() {
-                "driver unknown".to_string()
-            } else {
-                format!("driver {driver}")
-            };
-            let memory_text = if memory_mb.is_empty() {
-                "VRAM unknown".to_string()
-            } else {
-                format!("VRAM {memory_mb} MB")
-            };
-            Some(format!("{name} / {driver_text} / {memory_text}"))
-        })
-        .collect::<Vec<_>>();
-
-    if devices.is_empty() {
-        None
-    } else {
-        Some(devices.join("; "))
-    }
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
-fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if path.exists() {
-        push_unique_path(paths, path);
-    }
-}
-
-fn push_cuda_bin_candidates(paths: &mut Vec<PathBuf>, bin: PathBuf) {
-    push_existing_unique_path(paths, bin.clone());
-    if let Ok(entries) = fs::read_dir(&bin) {
-        for entry in entries.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                push_existing_unique_path(paths, child);
-            }
-        }
-    }
-}
-
-fn push_cuda_root_candidates(paths: &mut Vec<PathBuf>, root: PathBuf) {
-    push_cuda_bin_candidates(paths, root.join("bin"));
-    push_existing_unique_path(paths, root.clone());
-    if let Ok(entries) = fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            let child = entry.path();
-            if child.is_dir() {
-                push_cuda_bin_candidates(paths, child.join("bin"));
-                push_cuda_bin_candidates(paths, child.join("cuda").join("bin"));
-            }
-        }
-    }
-}
-
-fn cuda_dependency_search_dirs(runtime_executable: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    if let Some(parent) = runtime_executable.parent() {
-        push_existing_unique_path(&mut dirs, parent.to_path_buf());
-    }
-
-    if let Some(path_value) = std::env::var_os("PATH") {
-        for path in std::env::split_paths(&path_value) {
-            push_existing_unique_path(&mut dirs, path);
-        }
-    }
-
-    for (key, value) in std::env::vars_os() {
-        let key = key.to_string_lossy().to_ascii_uppercase();
-        if key == "CUDA_PATH" || key.starts_with("CUDA_PATH_V") || key == "CUDNN_PATH" {
-            push_cuda_root_candidates(&mut dirs, PathBuf::from(value));
-        }
-    }
-
-    for env_name in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
-        if let Some(root) = std::env::var_os(env_name) {
-            let root = PathBuf::from(root);
-            push_cuda_root_candidates(
-                &mut dirs,
-                root.join("NVIDIA GPU Computing Toolkit").join("CUDA"),
-            );
-            push_cuda_root_candidates(&mut dirs, root.join("NVIDIA").join("CUDNN"));
-            push_cuda_root_candidates(&mut dirs, root.join("NVIDIA Corporation").join("CUDNN"));
-        }
-    }
-
-    dirs
-}
-
-fn cuda_dependency_status_from_dirs(
-    dirs: &[PathBuf],
-    required_dlls: &[&str],
-) -> Result<Vec<PathBuf>, String> {
-    let existing_dirs = dirs
-        .iter()
-        .filter(|dir| dir.exists())
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut used_dirs = Vec::new();
-    let mut missing = Vec::new();
-
-    for dll in required_dlls {
-        if let Some(dir) = existing_dirs.iter().find(|dir| dir.join(dll).is_file()) {
-            push_unique_path(&mut used_dirs, dir.clone());
-        } else {
-            missing.push(*dll);
-        }
-    }
-
-    if missing.is_empty() {
-        return Ok(used_dirs);
-    }
-
-    let searched = if existing_dirs.is_empty() {
-        "no existing CUDA library directories were found".to_string()
-    } else {
-        existing_dirs
-            .iter()
-            .map(|dir| dir.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    Err(format!(
-        "CUDA dependencies are incomplete; missing: {}. Install NVIDIA CUDA Toolkit 12.x and cuDNN 9.x, or add their bin directories to PATH. Searched: {searched}",
-        missing.join(", ")
-    ))
-}
-
-fn cuda_dependency_status(runtime_executable: &Path) -> Result<Vec<PathBuf>, String> {
-    cuda_dependency_status_from_dirs(
-        &cuda_dependency_search_dirs(runtime_executable),
-        SHERPA_CUDA_REQUIRED_DLLS,
-    )
-}
-
-fn configure_cuda_command_environment(
-    command: &mut Command,
-    executable: &Path,
-    runtime_mode: &str,
-) -> Result<(), String> {
-    if !runtime_mode.eq_ignore_ascii_case("cuda") {
-        return Ok(());
-    }
-
-    let dependency_dirs = cuda_dependency_status(executable)?;
-    let mut path_entries = dependency_dirs;
-    if let Some(existing_path) = std::env::var_os("PATH") {
-        path_entries.extend(std::env::split_paths(&existing_path));
-    }
-    let joined_path = std::env::join_paths(path_entries)
-        .map_err(|error| format!("failed to build CUDA PATH: {error}"))?;
-    command.env("PATH", joined_path);
-    Ok(())
-}
-fn nvidia_smi_candidate_paths(
-    system_root: Option<&str>,
-    windir: Option<&str>,
-    program_files: Option<&str>,
-) -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from("nvidia-smi")];
-
-    for root in [system_root, windir].into_iter().flatten() {
-        push_unique_path(
-            &mut paths,
-            PathBuf::from(root).join("System32").join("nvidia-smi.exe"),
-        );
-    }
-
-    if let Some(program_files) = program_files {
-        push_unique_path(
-            &mut paths,
-            PathBuf::from(program_files)
-                .join("NVIDIA Corporation")
-                .join("NVSMI")
-                .join("nvidia-smi.exe"),
-        );
-    }
-
-    paths
-}
-
-fn nvidia_smi_candidates() -> Vec<PathBuf> {
-    nvidia_smi_candidate_paths(
-        std::env::var("SystemRoot").ok().as_deref(),
-        std::env::var("WINDIR").ok().as_deref(),
-        std::env::var("ProgramFiles").ok().as_deref(),
-    )
-}
-
-fn query_nvidia_cuda_info() -> NvidiaCudaInfo {
-    query_nvidia_cuda_info_from_candidates(&nvidia_smi_candidates())
-}
-
-fn nvidia_cuda_info_from_output(
-    candidate: &Path,
-    output: Output,
-) -> Result<NvidiaCudaInfo, String> {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-
-    if !output.status.success() {
-        return Err(format!(
-            "{} exited with {}: {}",
-            candidate.to_string_lossy(),
-            output.status,
-            combined.trim()
-        ));
-    }
-
-    let Some(device_summary) = parse_nvidia_smi_query_output(&stdout) else {
-        return Err(format!(
-            "{} returned no parseable GPU rows: {}",
-            candidate.to_string_lossy(),
-            combined.trim()
-        ));
-    };
-
-    Ok(NvidiaCudaInfo {
-        available: true,
-        device_summary: Some(device_summary),
-        detection_error: None,
-    })
-}
-
-fn query_nvidia_cuda_info_from_candidates(candidates: &[PathBuf]) -> NvidiaCudaInfo {
-    let mut errors = Vec::new();
-
-    for candidate in candidates {
-        let mut command = Command::new(candidate);
-        command.args([
-            "--query-gpu=name,driver_version,memory.total",
-            "--format=csv,noheader,nounits",
-        ]);
-        suppress_command_window(&mut command);
-
-        match run_command_with_timeout(
-            &mut command,
-            Duration::from_secs(5),
-            "NVIDIA CUDA detection",
-        ) {
-            Ok(output) => match nvidia_cuda_info_from_output(candidate, output) {
-                Ok(info) => return info,
-                Err(error) => errors.push(error),
-            },
-            Err(error) => errors.push(format!("{}: {error}", candidate.to_string_lossy())),
-        }
-    }
-
-    let tried = candidates
-        .iter()
-        .map(|candidate| candidate.to_string_lossy().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    NvidiaCudaInfo {
-        available: false,
-        device_summary: None,
-        detection_error: Some(format!(
-            "No usable nvidia-smi was found; tried: {tried}. Errors: {}",
-            errors.join("; ")
-        )),
-    }
-}
-
-fn smoke_test_sherpa_runtime(executable: &Path) -> Result<(), String> {
-    if !executable.exists() {
-        return Err(format!(
-            "runtime executable not found: {}",
-            executable.to_string_lossy()
-        ));
-    }
-
-    let mut command = Command::new(executable);
-    command.arg("--help");
-    if let Some(parent) = executable.parent() {
-        command.current_dir(parent);
-    }
-    suppress_command_window(&mut command);
-
-    let output = run_command_with_timeout(
-        &mut command,
-        Duration::from_secs(15),
-        "Sherpa runtime startup check",
-    )?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    let combined_lower = combined.to_ascii_lowercase();
-
-    if output.status.success()
-        || combined_lower.contains("usage")
-        || combined_lower.contains("sherpa-onnx")
-    {
-        return Ok(());
-    }
-
-    Err(format!("runtime startup check failed: {}", combined.trim()))
-}
-
-fn cuda_runtime_check_matches(checked_runtime: Option<&str>, executable: &Path) -> bool {
-    let executable_text = executable.to_string_lossy();
-    match checked_runtime {
-        Some(checked_runtime) => checked_runtime == executable_text.as_ref(),
-        None => false,
-    }
-}
-
-fn is_cuda_runtime_startup_checked(app: &AppHandle, executable: &Path) -> bool {
-    let Some(state) = app.try_state::<RuntimeState>() else {
-        return false;
-    };
-    state
-        .cuda_startup_checked_runtime
-        .lock()
-        .ok()
-        .map(|checked_runtime| cuda_runtime_check_matches(checked_runtime.as_deref(), executable))
-        .unwrap_or(false)
-}
-
-fn mark_cuda_runtime_startup_checked(app: &AppHandle, executable: &Path) {
-    if let Some(state) = app.try_state::<RuntimeState>() {
-        if let Ok(mut checked_runtime) = state.cuda_startup_checked_runtime.lock() {
-            *checked_runtime = Some(executable.to_string_lossy().to_string());
-        }
-    }
-}
-
-fn clear_cuda_runtime_startup_checked(app: &AppHandle) {
-    if let Some(state) = app.try_state::<RuntimeState>() {
-        if let Ok(mut checked_runtime) = state.cuda_startup_checked_runtime.lock() {
-            *checked_runtime = None;
-        }
-    }
-}
-
-fn cuda_circuit_reason(app: &AppHandle) -> Option<String> {
-    let state = app.try_state::<RuntimeState>()?;
-    state
-        .cuda_disabled_reason
-        .lock()
-        .ok()
-        .and_then(|reason| reason.clone())
-}
-
-fn trip_cuda_circuit(app: &AppHandle, reason: String) {
-    if let Some(state) = app.try_state::<RuntimeState>() {
-        if let Ok(mut disabled_reason) = state.cuda_disabled_reason.lock() {
-            *disabled_reason = Some(reason);
-        }
-    }
-    clear_cuda_runtime_startup_checked(app);
-}
-
-fn clear_cuda_circuit(app: &AppHandle) {
-    if let Some(state) = app.try_state::<RuntimeState>() {
-        if let Ok(mut disabled_reason) = state.cuda_disabled_reason.lock() {
-            *disabled_reason = None;
-        }
-    }
-}
-
 fn acceleration_status_from_parts(
     selected_mode: &str,
     cuda_available: bool,
@@ -2584,7 +2129,6 @@ fn ensure_sherpa_daemon_running(
     let mut command = Command::new(&server_exe);
     command.args(sherpa_args_for_runtime(&engine.args, None, runtime_mode)?);
     command.arg(format!("--port={SHERPA_DAEMON_PORT}"));
-    configure_cuda_command_environment(&mut command, &server_exe, runtime_mode)?;
     if let Some(parent) = server_exe.parent() {
         command.current_dir(parent);
     }
@@ -3323,7 +2867,6 @@ fn transcribe_sherpa_wav_cli(
         runtime_mode,
     )?);
     command.arg(wav_path);
-    configure_cuda_command_environment(&mut command, executable, runtime_mode)?;
     suppress_command_window(&mut command);
 
     let duration = wav_duration_seconds(wav_path).unwrap_or(60.0);
@@ -5395,6 +4938,8 @@ fn finish_transcription_result(
     sherpa_audio_path: &Path,
     transcript_chunks: Vec<TranscriptTextChunk>,
     empty_error: &str,
+    used_acceleration_mode: &str,
+    acceleration_fallback_used: bool,
 ) -> Result<TranscribeFileResult, String> {
     let transcript_chunks = transcript_chunks
         .into_iter()
@@ -5465,6 +5010,8 @@ fn finish_transcription_result(
         segments,
         timeline_kind: "estimated".to_string(),
         source_audio_path: review_audio_path.to_string_lossy().to_string(),
+        used_acceleration_mode: used_acceleration_mode.to_string(),
+        acceleration_fallback_used,
     })
 }
 
@@ -5556,6 +5103,8 @@ fn transcribe_file_with_sherpa(
                     &sherpa_audio_path,
                     chunks,
                     "DirectML SenseVoice ran, but no transcription text was decoded.",
+                    "directml",
+                    false,
                 );
                 if sherpa_audio_path != audio_path {
                     let _ = fs::remove_file(&sherpa_audio_path);
@@ -5640,6 +5189,8 @@ fn transcribe_file_with_sherpa(
         &sherpa_audio_path,
         raw_chunks,
         "Sherpa ran, but no transcription text was parsed.",
+        &runtime.mode,
+        request.acceleration_mode != runtime.mode,
     );
     if sherpa_audio_path != audio_path {
         let _ = fs::remove_file(&sherpa_audio_path);
@@ -6185,6 +5736,8 @@ fn finish_recording_with_settings(
             segments: Vec::new(),
             timeline_kind: "estimated".to_string(),
             source_audio_path: audio_path_text,
+            used_acceleration_mode: "none".to_string(),
+            acceleration_fallback_used: false,
         });
     }
 
@@ -7699,8 +7252,6 @@ pub fn run() {
             recording: Mutex::new(None),
             sherpa_daemon: Mutex::new(None),
             sherpa_runtime_install: Mutex::new(()),
-            cuda_disabled_reason: Mutex::new(None),
-            cuda_startup_checked_runtime: Mutex::new(None),
         })
         .setup(|app| {
             let settings = read_settings(&app.handle()).unwrap_or_else(|_| UserSettings::default());
@@ -7773,19 +7324,6 @@ mod tests {
         root
     }
 
-    #[cfg(windows)]
-    fn test_exit_status(code: u32) -> std::process::ExitStatus {
-        use std::os::windows::process::ExitStatusExt;
-
-        std::process::ExitStatus::from_raw(code)
-    }
-
-    #[cfg(unix)]
-    fn test_exit_status(code: u32) -> std::process::ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-
-        std::process::ExitStatus::from_raw((code as i32) << 8)
-    }
 
     fn write_installed_model(models_dir: &Path, model_id: &str, executable: &Path) -> PathBuf {
         let model_dir = models_dir.join(model_id);
@@ -8031,41 +7569,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_nvidia_smi_query_output_for_diagnostics() {
-        let summary = parse_nvidia_smi_query_output(
-            "NVIDIA GeForce RTX 4070, 552.44, 12282\nNVIDIA RTX A2000, 551.86, 6144\n",
-        )
-        .expect("summary");
-
-        assert!(summary.contains("RTX 4070"));
-        assert!(summary.contains("driver 552.44"));
-        assert!(summary.contains("VRAM 12282 MB"));
-        assert!(summary.contains("RTX A2000"));
-    }
-
-    #[test]
-    fn builds_nvidia_smi_candidate_paths_for_common_windows_installs() {
-        let paths = nvidia_smi_candidate_paths(
-            Some(r"C:\Windows"),
-            Some(r"C:\Windows"),
-            Some(r"C:\Program Files"),
-        );
-
-        assert_eq!(paths[0], PathBuf::from("nvidia-smi"));
-        assert!(paths.contains(&PathBuf::from(r"C:\Windows\System32\nvidia-smi.exe")));
-        assert!(paths.contains(&PathBuf::from(
-            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-        )));
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|path| path.to_string_lossy().contains("System32"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
     fn radix2_fft_detects_expected_frequency_bin() {
         let sample_rate = 16_000.0f32;
         let freq = 1_000.0f32;
@@ -8260,49 +7763,6 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_cuda_info_requires_parseable_successful_output() {
-        let candidate = PathBuf::from("nvidia-smi");
-        let info = nvidia_cuda_info_from_output(
-            &candidate,
-            Output {
-                status: test_exit_status(0),
-                stdout: b"NVIDIA GeForce RTX 4070, 552.44, 12282\n".to_vec(),
-                stderr: Vec::new(),
-            },
-        )
-        .expect("cuda info");
-
-        assert!(info.available);
-        assert!(info
-            .device_summary
-            .as_deref()
-            .unwrap_or_default()
-            .contains("RTX 4070"));
-
-        let error = nvidia_cuda_info_from_output(
-            &candidate,
-            Output {
-                status: test_exit_status(1),
-                stdout: Vec::new(),
-                stderr: b"driver unavailable".to_vec(),
-            },
-        )
-        .expect_err("non-zero output");
-        assert!(error.contains("driver unavailable"));
-
-        let error = nvidia_cuda_info_from_output(
-            &candidate,
-            Output {
-                status: test_exit_status(0),
-                stdout: b"not csv\n".to_vec(),
-                stderr: Vec::new(),
-            },
-        )
-        .expect_err("unparseable output");
-        assert!(error.contains("no parseable GPU rows"));
-    }
-
-    #[test]
     fn derives_runtime_dir_from_executable_path() {
         let executable = PathBuf::from(
             r"C:\HiVoicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe",
@@ -8406,35 +7866,6 @@ mod tests {
             sherpa_max_single_pass_seconds(&paraformer),
             LONG_AUDIO_THRESHOLD_SECONDS
         );
-    }
-
-    #[test]
-    fn cuda_startup_check_cache_is_bound_to_exact_runtime() {
-        let cuda_executable = PathBuf::from(
-            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe",
-        );
-        let cpu_executable = PathBuf::from(
-            r"C:\HiVoicer\runtimes\sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts\bin\sherpa-onnx-offline.exe",
-        );
-        let checked_runtime = cuda_executable.to_string_lossy().to_string();
-
-        assert!(cuda_runtime_check_matches(
-            Some(&checked_runtime),
-            &cuda_executable
-        ));
-        assert!(!cuda_runtime_check_matches(
-            Some(&checked_runtime),
-            &cpu_executable
-        ));
-        assert!(!cuda_runtime_check_matches(None, &cuda_executable));
-    }
-
-    #[test]
-    fn smoke_test_runtime_reports_missing_executable() {
-        let root = test_root("smoke-test-runtime-reports-missing-executable");
-        let error = smoke_test_sherpa_runtime(&root.join("missing.exe")).expect_err("missing exe");
-
-        assert!(error.contains("runtime executable not found"));
     }
 
     #[test]
@@ -8938,87 +8369,6 @@ Elapsed seconds: 0.16
         assert!(detail.contains("48000 Hz"));
         assert!(detail.contains("WASAPI loopback"));
         assert!(detail.contains("verified when recording starts"));
-    }
-
-    #[test]
-    fn sherpa_runtime_candidates_include_bundled_and_portable_locations() {
-        let data_dir = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");
-        let resource_dir = PathBuf::from(r"C:\Program Files\Hi-Voicer");
-        let executable_dir = PathBuf::from(r"C:\Portable\Hi-Voicer");
-        let roots =
-            sherpa_runtime_search_roots(&data_dir, Some(&resource_dir), Some(&executable_dir));
-        let candidates = sherpa_runtime_executable_candidates(&roots, SHERPA_CUDA_RUNTIME_NAME);
-
-        assert!(candidates.contains(&PathBuf::from(
-            r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
-        )));
-        assert!(candidates.contains(&PathBuf::from(
-            r"C:\Program Files\Hi-Voicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
-        )));
-        assert!(candidates.contains(&PathBuf::from(
-            r"C:\Portable\Hi-Voicer\engines\sherpa\v1.13.2\sherpa-onnx-v1.13.2-cuda-12.x-cudnn-9.x-win-x64-cuda\bin\sherpa-onnx-offline.exe"
-        )));
-    }
-    #[test]
-    fn cuda_root_candidates_include_versioned_bin_children() {
-        let root = test_root("cuda-root-candidates-include-versioned-bin-children");
-        let versioned_bin = root.join("v9.7").join("bin").join("12.8");
-        fs::create_dir_all(&versioned_bin).expect("create versioned cudnn bin");
-
-        let mut dirs = Vec::new();
-        push_cuda_root_candidates(&mut dirs, root.clone());
-
-        assert!(dirs.contains(&versioned_bin));
-    }
-    #[test]
-    fn cuda_dependency_status_reports_missing_required_dlls() {
-        let root = test_root("cuda-dependency-status-reports-missing-required-dlls");
-        fs::create_dir_all(&root).expect("create cuda dir");
-
-        let error = cuda_dependency_status_from_dirs(
-            &[root.clone()],
-            &["cudart64_12.dll", "cublasLt64_12.dll"],
-        )
-        .expect_err("missing dlls");
-
-        assert!(error.contains("cudart64_12.dll"));
-        assert!(error.contains("cublasLt64_12.dll"));
-        assert!(error.contains(&root.to_string_lossy().to_string()));
-    }
-
-    #[test]
-    fn cuda_dependency_status_collects_split_dependency_dirs() {
-        let root = test_root("cuda-dependency-status-collects-split-dependency-dirs");
-        let cuda_bin = root.join("cuda").join("bin");
-        let cudnn_bin = root.join("cudnn").join("bin");
-        fs::create_dir_all(&cuda_bin).expect("create cuda bin");
-        fs::create_dir_all(&cudnn_bin).expect("create cudnn bin");
-        fs::write(cuda_bin.join("cudart64_12.dll"), b"dll").expect("write cudart");
-        fs::write(cudnn_bin.join("cudnn64_9.dll"), b"dll").expect("write cudnn");
-
-        let dirs = cuda_dependency_status_from_dirs(
-            &[cuda_bin.clone(), cudnn_bin.clone()],
-            &["cudart64_12.dll", "cudnn64_9.dll"],
-        )
-        .expect("cuda deps");
-
-        assert_eq!(dirs, vec![cuda_bin, cudnn_bin]);
-    }
-    #[test]
-    fn ffmpeg_search_roots_include_offline_locations() {
-        let data_dir = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");
-        let resource_dir = PathBuf::from(r"C:\Program Files\Hi-Voicer");
-        let executable_dir = PathBuf::from(r"C:\Portable\Hi-Voicer");
-
-        let roots =
-            ffmpeg_runtime_search_roots(&data_dir, Some(&resource_dir), Some(&executable_dir));
-
-        assert!(roots.contains(&PathBuf::from(
-            r"C:\Users\tester\AppData\Local\com.local.hivoicer\engines\ffmpeg"
-        )));
-        assert!(roots.contains(&PathBuf::from(r"C:\Program Files\Hi-Voicer\engines\ffmpeg")));
-        assert!(roots.contains(&PathBuf::from(r"C:\Program Files\Hi-Voicer\ffmpeg")));
-        assert!(roots.contains(&PathBuf::from(r"C:\Portable\Hi-Voicer\engines\ffmpeg")));
     }
 
     #[test]

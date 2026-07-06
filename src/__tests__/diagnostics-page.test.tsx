@@ -1,5 +1,5 @@
-﻿import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialDiagnostics, initialSettings } from "../data/mockState";
 import {
   getNativeAudioDiagnostics,
@@ -10,6 +10,7 @@ import {
   transcribeFile,
 } from "../lib/api";
 import { DiagnosticsPage } from "../pages/DiagnosticsPage";
+import type { UserSettings } from "../types";
 
 vi.mock("../lib/api", () => ({
   getAccelerationStatus: vi.fn(() =>
@@ -88,12 +89,28 @@ vi.mock("../lib/api", () => ({
   ),
   saveTextFile: vi.fn(() => Promise.resolve("C:\\reports\\diagnostics.txt")),
   selectAudioFiles: vi.fn(() => Promise.resolve(["C:\\audio\\sample.wav"])),
-  transcribeFile: vi.fn(() => Promise.resolve({ text: "recognized", outputPath: "" })),
+  transcribeFile: vi.fn((_audioPath: string, settings: { accelerationMode: string }) =>
+    Promise.resolve({
+      text: settings.accelerationMode === "directml" ? "recognized" : "recognized",
+      outputPath: "",
+      outputPaths: [],
+      outputFiles: [],
+      segments: [{ id: "1", index: 1, start: 0, end: 10, text: "recognized", sourceAudioPath: "C:\\audio\\sample.wav" }],
+      timelineKind: "estimated",
+      sourceAudioPath: "C:\\audio\\sample.wav",
+      usedAccelerationMode: settings.accelerationMode,
+      accelerationFallbackUsed: false,
+    }),
+  ),
 }));
 
 describe("DiagnosticsPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("runs a model smoke test without saving transcript output", async () => {
@@ -108,11 +125,11 @@ describe("DiagnosticsPage", () => {
     expect(await screen.findByText("recognized")).toBeTruthy();
   });
 
-  it("shows the current CPU runtime status", async () => {
+  it("shows the current acceleration runtime status", async () => {
     render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={initialSettings} />);
 
     expect(await screen.findByText("CPU selected")).toBeTruthy();
-    expect(screen.getByText("CPU")).toBeTruthy();
+    expect(screen.getByText("cpu")).toBeTruthy();
     expect(screen.queryByText(/NVIDIA|CUDA/)).toBeNull();
   });
 
@@ -182,5 +199,52 @@ describe("DiagnosticsPage", () => {
     expect(saveTextFile).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("实际路径: cpu"));
     expect(saveTextFile).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("USB Microphone"));
   });
+
+  it("runs a CPU vs DirectML benchmark on a selected audio file", async () => {
+    const settings = { ...initialSettings, modelDir: "C:\\models\\sensevoice-small" };
+    const onSettingsChange = vi.fn();
+    render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={settings} onSettingsChange={onSettingsChange} />);
+    let currentBenchmarkMode: string | null = null;
+    vi.mocked(transcribeFile).mockImplementation((_audioPath: string, benchmarkSettings: UserSettings) => {
+      currentBenchmarkMode = benchmarkSettings.accelerationMode;
+      return Promise.resolve({
+        text: "recognized",
+        outputPath: "",
+        outputPaths: [],
+        outputFiles: [],
+        segments: [{ id: "1", index: 1, start: 0, end: 10, text: "recognized", sourceAudioPath: "C:\\audio\\sample.wav" }],
+        timelineKind: "estimated",
+        sourceAudioPath: "C:\\audio\\sample.wav",
+        usedAccelerationMode: benchmarkSettings.accelerationMode,
+        accelerationFallbackUsed: false,
+      });
+    });
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      if (currentBenchmarkMode === "cpu") return 10000;
+      if (currentBenchmarkMode === "directml") return 11000;
+      return 0;
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /CPU vs DirectML benchmark/ }));
+
+    await waitFor(() => {
+      expect(transcribeFile).toHaveBeenCalledWith(
+        "C:\\audio\\sample.wav",
+        expect.objectContaining({ accelerationMode: "cpu" }),
+        expect.objectContaining({ saveOutput: false, performanceMode: "stable" }),
+      );
+      expect(transcribeFile).toHaveBeenCalledWith(
+        "C:\\audio\\sample.wav",
+        expect.objectContaining({ accelerationMode: "directml" }),
+        expect.objectContaining({ saveOutput: false, performanceMode: "stable" }),
+      );
+    });
+    expect(await screen.findByText("Benchmark verdict")).toBeTruthy();
+    expect(screen.getByText(/Decision metrics/)).toBeTruthy();
+    expect(onSettingsChange).toHaveBeenCalledWith(
+      expect.objectContaining({ directmlVerified: true, directmlVerifiedAt: expect.any(String) }),
+    );
+  });
+
 });
 

@@ -4,4 +4,4 @@ Hi-Voicer currently ships without a bundled GPU runtime. Local transcription mod
 
 CUDA support has been removed from the public product path because it requires NVIDIA-specific CUDA Toolkit and cuDNN dependencies that are difficult to distribute reliably for ordinary Windows users.
 
-Future GPU experiments should use separate, explicitly validated DirectML or Vulkan/GGUF runners before becoming part of the public release path.
+DirectML acceleration is experimental and must be validated per machine with diagnostics and CPU comparison before it is treated as a reliable path.

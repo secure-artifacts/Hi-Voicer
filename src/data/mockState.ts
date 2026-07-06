@@ -47,6 +47,8 @@ export const initialSettings: UserSettings = {
   recordingMode: "hold",
   recordingSource: "microphone",
   accelerationMode: "cpu",
+  directmlVerified: false,
+  directmlVerifiedAt: null,
   hotwords: initialHotwords,
   termCategories: initialTermCategories,
   theme: "light",
