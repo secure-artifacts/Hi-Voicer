@@ -52,8 +52,22 @@ export const modelPresets: ModelPreset[] = [
       { path: "tokenizer/vocab.json", url: hf("pantinor/sherpa-onnx-qwen3-asr-0.6b-int8", "tokenizer/vocab.json") },
     ],
     sherpaArgs:
-      '--qwen3-asr-conv-frontend="{modelDir}\\conv_frontend.onnx" --qwen3-asr-encoder="{modelDir}\\encoder.int8.onnx" --qwen3-asr-decoder="{modelDir}\\decoder.int8.onnx" --qwen3-asr-tokenizer="{modelDir}\\tokenizer" --feat-dim=128 --num-threads=3 --qwen3-asr-max-new-tokens=128',
+      '--qwen3-asr-conv-frontend="{modelDir}\\conv_frontend.onnx" --qwen3-asr-encoder="{modelDir}\\encoder.int8.onnx" --qwen3-asr-decoder="{modelDir}\\decoder.int8.onnx" --qwen3-asr-tokenizer="{modelDir}\\tokenizer" --feat-dim=128 --num-threads=6 --qwen3-asr-max-new-tokens=128',
+  },  {
+    id: "faster-whisper",
+    name: "Faster-Whisper 高级引擎",
+    family: "whisper",
+    installKind: "engineRequired",
+    size: "可选引擎包",
+    quality: "长文件稳定，NVIDIA GPU 路线成熟",
+    memory: "CPU 可跑；GPU 加速推荐 NVIDIA 显卡",
+    recommendedFor: "长视频字幕、稳定文件转录，作为可选专业引擎",
+    license: "MIT / model license varies",
+    downloadUrl: "https://github.com/SYSTRAN/faster-whisper",
+    engineNote:
+      "Faster-Whisper 需要单独配置 worker 和模型目录。PoC 期请准备包含 engine.json 的本地目录，engine 设为 faster-whisper，executable 指向 worker。",
   },
+
   {
     id: "sherpa-funasr-nano",
     name: "Sherpa FunASR-Nano",
@@ -83,26 +97,7 @@ export const modelPresets: ModelPreset[] = [
     sherpaArgs:
       '--funasr-nano-encoder-adaptor="{modelDir}\\encoder_adaptor.int8.onnx" --funasr-nano-llm="{modelDir}\\llm.int8.onnx" --funasr-nano-embedding="{modelDir}\\embedding.int8.onnx" --funasr-nano-tokenizer="{modelDir}\\Qwen3-0.6B" --num-threads=3',
   },
-  {
-    id: "whisper-base",
-    name: "OpenAI Whisper Base",
-    family: "whisper",
-    installKind: "sherpaOnnx",
-    size: "约 170 MB",
-    quality: "通用、多语言、稳",
-    memory: "CPU 可跑，但实时输入延迟偏高",
-    recommendedFor: "多语言文件转录，兼容性验证",
-    license: "Apache 2.0",
-    downloadUrl: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-base",
-    engineNote: "使用 OpenAI Whisper Base 的 Sherpa-ONNX 导出版本。",
-    modelFiles: [
-      { path: "base-encoder.int8.onnx", url: hf("csukuangfj/sherpa-onnx-whisper-base", "base-encoder.int8.onnx") },
-      { path: "base-decoder.int8.onnx", url: hf("csukuangfj/sherpa-onnx-whisper-base", "base-decoder.int8.onnx") },
-      { path: "base-tokens.txt", url: hf("csukuangfj/sherpa-onnx-whisper-base", "base-tokens.txt") },
-    ],
-    sherpaArgs:
-      '--whisper-encoder="{modelDir}\\base-encoder.int8.onnx" --whisper-decoder="{modelDir}\\base-decoder.int8.onnx" --tokens="{modelDir}\\base-tokens.txt" --whisper-task=transcribe --num-threads=4 --model-type=whisper',
-  },
+
   {
     id: "sherpa-paraformer-zh",
     name: "Sherpa Paraformer 中文",
@@ -122,36 +117,7 @@ export const modelPresets: ModelPreset[] = [
     sherpaArgs:
       '--paraformer="{modelDir}\\model.int8.onnx" --tokens="{modelDir}\\tokens.txt" --num-threads=4 --decoding-method=greedy_search --model-type=paraformer',
   },
-  {
-    id: "sherpa-zipformer-zh",
-    name: "Sherpa Zipformer 中文",
-    family: "sherpa",
-    installKind: "sherpaOnnx",
-    size: "约 75 MB",
-    quality: "短句实时识别更稳",
-    memory: "CPU 可跑",
-    recommendedFor: "热键语音输入，短句实时识别",
-    license: "Apache 2.0",
-    downloadUrl: "https://huggingface.co/k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12",
-    engineNote: "使用 k2-fsa 的 Zipformer transducer 模型，包含 encoder、decoder、joiner 和 tokens。",
-    modelFiles: [
-      {
-        path: "encoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        url: hf("k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12", "encoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx"),
-      },
-      {
-        path: "decoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        url: hf("k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12", "decoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx"),
-      },
-      {
-        path: "joiner-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        url: hf("k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12", "joiner-epoch-20-avg-1-chunk-16-left-128.int8.onnx"),
-      },
-      { path: "tokens.txt", url: hf("k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12", "tokens.txt") },
-    ],
-    sherpaArgs:
-      '--encoder="{modelDir}\\encoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --decoder="{modelDir}\\decoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --joiner="{modelDir}\\joiner-epoch-20-avg-1-chunk-16-left-128.int8.onnx" --tokens="{modelDir}\\tokens.txt" --num-threads=4 --decoding-method=greedy_search --model-type=zipformer',
-  },
+
 ];
 
 export function findModelPreset(modelId: string) {

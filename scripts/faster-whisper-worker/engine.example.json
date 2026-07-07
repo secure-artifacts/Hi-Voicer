@@ -1,0 +1,9 @@
+{
+  "engine": "faster-whisper",
+  "modelId": "faster-whisper-large-v3-turbo",
+  "modelName": "Faster-Whisper Large v3 Turbo",
+  "modelDir": "C:\\Users\\TOM\\AppData\\Local\\com.local.hivoicer\\models\\faster-whisper-large-v3-turbo",
+  "executable": "C:\\Users\\TOM\\AppData\\Local\\com.local.hivoicer\\engines\\faster-whisper\\fw-worker.exe",
+  "args": "--device cuda --compute-type int8_float16 --language zh --vad-filter true --condition-on-previous-text false --beam-size 5",
+  "requiredFiles": []
+}

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { initialSettings, initialTasks } from "../data/mockState";
-import { saveExistingFile, selectAudioFiles, selectDirectory, transcribeFile } from "../lib/api";
+import { cancelTranscription, saveExistingFile, selectAudioFiles, selectDirectory, transcribeFile } from "../lib/api";
 import { TranscriptionPage } from "../pages/TranscriptionPage";
 import type { TranscriptTask } from "../types";
 
@@ -13,6 +13,7 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 vi.mock("../lib/api", () => ({
+  cancelTranscription: vi.fn(() => Promise.resolve()),
   listenTranscriptionProgress: vi.fn(() => Promise.resolve(() => {})),
   saveExistingFile: vi.fn(() => Promise.resolve("C:\\exports\\demo.txt")),
   selectAudioFiles: vi.fn(() => Promise.resolve(["C:\\audio\\demo.wav"])),
@@ -30,9 +31,9 @@ vi.mock("../lib/api", () => ({
   ),
 }));
 
-function renderTranscriptionPage() {
+function renderTranscriptionPage(seedTasks: TranscriptTask[] = initialTasks) {
   function Harness() {
-    const [tasks, setTasks] = useState<TranscriptTask[]>(initialTasks);
+    const [tasks, setTasks] = useState<TranscriptTask[]>(seedTasks);
 
     return <TranscriptionPage tasks={tasks} onTasksChange={setTasks} settings={initialSettings} />;
   }
@@ -95,6 +96,25 @@ describe("TranscriptionPage", () => {
     expect(selectDirectory).toHaveBeenCalledTimes(1);
   });
 
+  it("cancels a running transcription task", async () => {
+    renderTranscriptionPage([
+      {
+        id: "running-1",
+        fileName: "long.wav",
+        filePath: "C:\\audio\\long.wav",
+        status: "running",
+        progress: 42,
+        outputFormats: ["txt"],
+        message: "Transcribing chunk 2/5",
+      },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "停止 long.wav" }));
+
+    await waitFor(() => {
+      expect(cancelTranscription).toHaveBeenCalledWith("running-1");
+    });
+  });
   it("requests audio files from the picker", async () => {
     renderTranscriptionPage();
 

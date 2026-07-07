@@ -203,16 +203,19 @@ function buildDiagnosticReport(
 
   lines.push("", "[DirectML PoC]");
   if (directMlProbeResult) {
+    const isQwenProbe = directMlProbeResult.modelId === "qwen3-asr-0.6b";
+    const chainLabel = isQwenProbe ? "Qwen DirectML chain" : "Split SenseVoice";
+    const modelLabel = isQwenProbe ? "Qwen3-ASR 0.6B" : "SenseVoice model";
     lines.push(
       "DirectML candidate: " + (directMlProbeResult.directmlCandidate ? "yes" : "no"),
       "DirectML provider ready: " + (directMlProbeResult.providerSessionReady ? "yes" : "no"),
       "DirectML provider error: " + (directMlProbeResult.providerSessionError || "(none)"),
-      "Split SenseVoice ready: " + (directMlProbeResult.splitModelReady ? "yes" : "no"),
-      "Split SenseVoice dir: " + (directMlProbeResult.splitModelDir || "(none)"),
-      "Split SenseVoice missing files: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "(none)"),
-      "Split SenseVoice session ready: " + (directMlProbeResult.splitModelSessionReady ? "yes" : "no"),
-      "Split SenseVoice session error: " + (directMlProbeResult.splitModelSessionError || "(none)"),
-      "SenseVoice model ready: " + (directMlProbeResult.modelReady ? "yes" : "no"),
+      chainLabel + " ready: " + (isQwenProbe ? (directMlProbeResult.directmlSessionReady ? "yes" : "no") : (directMlProbeResult.splitModelReady ? "yes" : "no")),
+      chainLabel + " dir: " + (directMlProbeResult.splitModelDir || directMlProbeResult.modelDir || "(none)"),
+      chainLabel + " missing files: " + ((isQwenProbe ? directMlProbeResult.missingFiles : directMlProbeResult.splitModelMissingFiles).join(", ") || "(none)"),
+      chainLabel + " session ready: " + (isQwenProbe ? (directMlProbeResult.directmlSessionReady ? "yes" : "no") : (directMlProbeResult.splitModelSessionReady ? "yes" : "no")),
+      chainLabel + " session error: " + ((isQwenProbe ? directMlProbeResult.directmlSessionError : directMlProbeResult.splitModelSessionError) || "(none)"),
+      modelLabel + " ready: " + (directMlProbeResult.modelReady ? "yes" : "no"),
       "DirectML session ready: " + (directMlProbeResult.directmlSessionReady ? "yes" : "no"),
       "DirectML session error: " + (directMlProbeResult.directmlSessionError || "(none)"),
       "ONNX Runtime: " + (directMlProbeResult.onnxRuntimeBuild || "(unknown)"),
@@ -299,6 +302,7 @@ export function DiagnosticsPage({ items, modelReady, settings, onSettingsChange 
   const [isCheckingNativeAudio, setIsCheckingNativeAudio] = useState(false);
   const [isBenchmarkingAcceleration, setIsBenchmarkingAcceleration] = useState(false);
   const [accelerationBenchmarkResult, setAccelerationBenchmarkResult] = useState<AccelerationBenchmarkResult | null>(null);
+  const directMlProbeIsQwen = directMlProbeResult?.modelId === "qwen3-asr-0.6b";
 
   useEffect(() => {
     let disposed = false;
@@ -559,21 +563,25 @@ export function DiagnosticsPage({ items, modelReady, settings, onSettingsChange 
               <strong>DirectML provider</strong>
               <p>{directMlProbeResult.providerSessionReady ? "Minimal ONNX session created" : directMlProbeResult.providerSessionError || "DirectML provider probe failed"}</p>
             </div>
-            <div className={"diagnostic-row diagnostic-row--" + (directMlProbeResult.splitModelSessionReady ? "ok" : "warning")}>
-              <strong>Split SenseVoice DirectML</strong>
+            <div className={"diagnostic-row diagnostic-row--" + ((directMlProbeIsQwen ? directMlProbeResult.directmlSessionReady : directMlProbeResult.splitModelSessionReady) ? "ok" : "warning")}>
+              <strong>{directMlProbeIsQwen ? "Qwen DirectML chain" : "Split SenseVoice DirectML"}</strong>
               <p>
-                {directMlProbeResult.splitModelSessionReady
-                  ? "Encoder and CTC warmups completed"
-                  : directMlProbeResult.splitModelSessionError ||
-                    "Missing: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "split model files")}
+                {directMlProbeIsQwen
+                  ? directMlProbeResult.directmlSessionReady
+                    ? "Conv, encoder, and decoder single-step warmup completed"
+                    : directMlProbeResult.directmlSessionError || "Missing: " + (directMlProbeResult.missingFiles.join(", ") || "Qwen model files")
+                  : directMlProbeResult.splitModelSessionReady
+                    ? "Encoder and CTC warmups completed"
+                    : directMlProbeResult.splitModelSessionError ||
+                      "Missing: " + (directMlProbeResult.splitModelMissingFiles.join(", ") || "split model files")}
               </p>
             </div>
             <div className={"diagnostic-row diagnostic-row--" + (directMlProbeResult.modelReady ? "ok" : "warning")}>
-              <strong>Sherpa SenseVoiceSmall</strong>
+              <strong>{directMlProbeIsQwen ? "Qwen3-ASR 0.6B" : "Sherpa SenseVoiceSmall"}</strong>
               <p>
                 {directMlProbeResult.modelReady
                   ? "Model files are ready"
-                  : "Missing: " + (directMlProbeResult.missingFiles.join(", ") || "SenseVoiceSmall model")}
+                  : "Missing: " + (directMlProbeResult.missingFiles.join(", ") || (directMlProbeIsQwen ? "Qwen3-ASR 0.6B model" : "SenseVoiceSmall model"))}
               </p>
             </div>
             <div className={"diagnostic-row diagnostic-row--" + (directMlProbeResult.directmlSessionReady ? "ok" : "warning")}>
@@ -582,25 +590,25 @@ export function DiagnosticsPage({ items, modelReady, settings, onSettingsChange 
             </div>
             {directMlProbeResult.splitModelInputs.length > 0 && (
               <div className="diagnostic-row diagnostic-row--ok">
-                <strong>Split model inputs</strong>
+                <strong>{directMlProbeIsQwen ? "Qwen chain inputs" : "Split model inputs"}</strong>
                 <p>{directMlProbeResult.splitModelInputs.join(" | ")}</p>
               </div>
             )}
             {directMlProbeResult.splitModelOutputs.length > 0 && (
               <div className="diagnostic-row diagnostic-row--ok">
-                <strong>Split model outputs</strong>
+                <strong>{directMlProbeIsQwen ? "Qwen chain outputs" : "Split model outputs"}</strong>
                 <p>{directMlProbeResult.splitModelOutputs.join(" | ")}</p>
               </div>
             )}
             {directMlProbeResult.modelInputs.length > 0 && (
               <div className="diagnostic-row diagnostic-row--ok">
-                <strong>Model inputs</strong>
+                <strong>{directMlProbeIsQwen ? "Qwen chain inputs" : "Model inputs"}</strong>
                 <p>{directMlProbeResult.modelInputs.join(" | ")}</p>
               </div>
             )}
             {directMlProbeResult.modelOutputs.length > 0 && (
               <div className="diagnostic-row diagnostic-row--ok">
-                <strong>Model outputs</strong>
+                <strong>{directMlProbeIsQwen ? "Qwen chain outputs" : "Model outputs"}</strong>
                 <p>{directMlProbeResult.modelOutputs.join(" | ")}</p>
               </div>
             )}

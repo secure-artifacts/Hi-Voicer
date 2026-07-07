@@ -167,6 +167,54 @@ describe("DiagnosticsPage", () => {
     expect(screen.getByText("NVIDIA GeForce RTX 3060")).toBeTruthy();
   });
 
+  it("shows Qwen DirectML chain probe results", async () => {
+    vi.mocked(runDirectMlProbe).mockResolvedValueOnce({
+      directmlCandidate: true,
+      providerSessionReady: true,
+      providerSessionError: null,
+      splitModelReady: false,
+      splitModelDir: null,
+      splitModelMissingFiles: [],
+      splitModelSessionReady: false,
+      splitModelSessionError: null,
+      splitModelInputs: [],
+      splitModelOutputs: [],
+      modelReady: true,
+      directmlSessionReady: true,
+      directmlSessionError: null,
+      onnxRuntimeBuild: "ORT Build Info: Qwen DirectML test build",
+      modelInputs: ["qwen conv input_features: Tensor<f32>(batch, n_frames, 128)", "qwen decoder input_ids: Tensor<i64>(batch, seq_len)"],
+      modelOutputs: ["qwen decoder logits: Tensor<f32>(batch, seq_len, vocab)"],
+      modelId: "qwen3-asr-0.6b",
+      modelName: "Qwen3-ASR 0.6B",
+      modelDir: "C:\\models\\qwen3-asr-0.6b",
+      missingFiles: [],
+      adapters: [
+        {
+          name: "NVIDIA GeForce RTX 3060",
+          driverVersion: "31.0.15.8195",
+          adapterRamMb: 4096,
+          status: "OK",
+        },
+      ],
+      elapsedMs: 88,
+      message: "DirectML Qwen3-ASR 0.6B conv->encoder->decoder smoke completed; logits shape: 1x1x151936",
+      nextStep: "DirectML Qwen3-ASR 0.6B chain loads, but keep the stable Sherpa path until feature parity, decoded text quality, and decoder speed are proven on real samples.",
+    });
+    const settings = { ...initialSettings, modelDir: "C:\\models\\qwen3-asr-0.6b" };
+    render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={settings} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /DirectML PoC probe/ }));
+
+    await waitFor(() => {
+      expect(runDirectMlProbe).toHaveBeenCalledWith(settings);
+    });
+    expect(await screen.findByText("Qwen DirectML chain")).toBeTruthy();
+    expect(screen.getByText(/Conv, encoder, and decoder single-step warmup completed/)).toBeTruthy();
+    expect(screen.getByText("Qwen3-ASR 0.6B")).toBeTruthy();
+    expect(screen.getByText("Qwen chain inputs")).toBeTruthy();
+    expect(screen.getByText(/qwen decoder input_ids/)).toBeTruthy();
+  });
   it("runs the CPU smoke test with the current settings", async () => {
     const settings = { ...initialSettings, modelDir: "C:\\models\\demo" };
     render(<DiagnosticsPage items={initialDiagnostics} modelReady={true} settings={settings} />);

@@ -10,8 +10,6 @@ describe("model presets", () => {
         "sensevoice-small",
         "qwen3-asr-0.6b",
         "sherpa-funasr-nano",
-        "whisper-base",
-        "sherpa-zipformer-zh",
       ]),
     );
 
@@ -29,25 +27,25 @@ describe("model presets", () => {
     }
   });
 
-  it("uses the current k2-fsa Zipformer package", () => {
-    const zipformer = modelPresets.find((model) => model.id === "sherpa-zipformer-zh");
+  it("uses measured Qwen3-ASR defaults", () => {
+    const qwen = modelPresets.find((model) => model.id === "qwen3-asr-0.6b");
 
-    expect(zipformer?.downloadUrl).toBe(
-      "https://huggingface.co/k2-fsa/sherpa-onnx-streaming-zipformer-multi-zh-hans-2023-12-12",
-    );
-    expect(zipformer?.modelFiles?.map((file) => file.path)).toEqual(
-      expect.arrayContaining([
-        "encoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        "decoder-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        "joiner-epoch-20-avg-1-chunk-16-left-128.int8.onnx",
-        "tokens.txt",
-      ]),
-    );
-    expect(zipformer?.sherpaArgs).toContain("--model-type=zipformer");
+    expect(qwen?.sherpaArgs).toContain("--num-threads=6");
+    expect(qwen?.sherpaArgs).toContain("--qwen3-asr-max-new-tokens=128");
+  });
+  it("does not expose superseded Whisper Base or Zipformer presets", () => {
+    expect(modelPresets.map((model) => model.id)).not.toContain("whisper-base");
+    expect(modelPresets.map((model) => model.id)).not.toContain("sherpa-zipformer-zh");
+  });
+  it("exposes Faster-Whisper only as an external engine", () => {
+    const fasterWhisper = modelPresets.find((model) => model.id === "faster-whisper");
+
+    expect(fasterWhisper?.installKind).toBe("engineRequired");
+    expect(fasterWhisper?.downloadUrl).toContain("github.com/SYSTRAN/faster-whisper");
+    expect(fasterWhisper?.modelFiles).toBeUndefined();
   });
 
   it("does not expose Qwen3-ASR 1.7B until a supported local engine exists", () => {
     expect(modelPresets.map((model) => model.id)).not.toContain("qwen3-asr-1.7b");
-    expect(modelPresets.filter((model) => model.installKind === "engineRequired")).toEqual([]);
   });
 });

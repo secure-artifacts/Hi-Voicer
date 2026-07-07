@@ -732,6 +732,18 @@ textarea:focus-visible {
   text-align: right;
 }
 
+.task-row__actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.task-row__actions .icon-button {
+  width: 32px;
+  height: 32px;
+}
 .task-row > div:first-child {
   min-width: 0;
   flex: 1;

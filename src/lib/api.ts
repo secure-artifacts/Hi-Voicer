@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import type {
   AccelerationStatus,
@@ -127,16 +126,6 @@ export async function saveSettings(settings: UserSettings): Promise<UserSettings
 export async function selectDirectory(): Promise<string | null> {
   try {
     return await invoke<string | null>("select_directory");
-  } catch {
-    // Fall through to the browser/Tauri plugin path.
-  }
-
-  try {
-    const selected = await openDialog({
-      directory: true,
-      multiple: false,
-    });
-    return typeof selected === "string" ? selected : null;
   } catch {
     const typed = window.prompt("请输入文件夹路径");
     return typed?.trim() || null;
@@ -436,6 +425,13 @@ export async function getNativeAudioDiagnostics(): Promise<NativeAudioDiagnostic
   }
 }
 
+export async function cancelTranscription(taskId: string): Promise<void> {
+  await invoke<void>("cancel_transcription", {
+    request: {
+      taskId,
+    },
+  });
+}
 export async function transcribeFile(
   audioPath: string,
   settings: UserSettings,

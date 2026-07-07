@@ -1,8 +1,9 @@
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { Clock, Download, FileAudio, FolderOpen, Gauge, Subtitles, Trash2, Upload } from "lucide-react";
+import { Clock, Download, FileAudio, FolderOpen, Gauge, Square, Subtitles, Trash2, Upload } from "lucide-react";
 import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useState } from "react";
 import {
+  cancelTranscription,
   listenTranscriptionProgress,
   saveExistingFile,
   selectAudioFiles,
@@ -43,6 +44,11 @@ function directoryFromPath(path: string | undefined) {
 
   const index = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
   return index >= 0 ? path.slice(0, index) : "";
+}
+
+function isCancellationError(error: unknown) {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return message.toLowerCase().includes("cancel");
 }
 
 function errorMessage(error: unknown, fallback: string) {
@@ -138,10 +144,11 @@ export function TranscriptionPage({
       });
     } catch (error) {
       const finishedAt = new Date().toISOString();
+      const cancelled = isCancellationError(error);
       updateTask(task.id, {
-        status: "failed",
-        progress: 100,
-        message: errorMessage(error, "转录失败"),
+        status: cancelled ? "cancelled" : "failed",
+        progress: cancelled ? task.progress : 100,
+        message: cancelled ? "已停止转录。" : errorMessage(error, "转录失败"),
         finishedAt,
         elapsedMs: Date.parse(finishedAt) - Date.parse(startedAt),
       });
@@ -185,6 +192,18 @@ export function TranscriptionPage({
     }
   }
 
+  async function handleCancelTask(task: TranscriptTask) {
+    if (task.status !== "running") {
+      return;
+    }
+
+    updateTask(task.id, { message: "正在停止转录..." });
+    try {
+      await cancelTranscription(task.id);
+    } catch (error) {
+      updateTask(task.id, { message: errorMessage(error, "停止请求失败") });
+    }
+  }
   async function handleSelectFiles() {
     const files = await selectAudioFiles();
     await transcribePaths(files);
@@ -436,7 +455,20 @@ export function TranscriptionPage({
                   )}
                   {task.outputPath && <small>临时结果已准备好，点击上方格式会保存到原音频所在文件夹。</small>}
                 </div>
-                <span>{task.progress}%</span>
+                <div className="task-row__actions">
+                  <span>{task.progress}%</span>
+                  {task.status === "running" && (
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="停止转录"
+                      aria-label={`停止 ${task.fileName}`}
+                      onClick={() => void handleCancelTask(task)}
+                    >
+                      <Square size={15} />
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>

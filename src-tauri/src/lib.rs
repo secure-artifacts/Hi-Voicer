@@ -6,7 +6,7 @@ use config::{HotwordRule, UserSettings};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::DefaultHasher, VecDeque},
+    collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     fs,
     fs::File,
     hash::{Hash, Hasher},
@@ -27,12 +27,16 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent, ShortcutState};
 
 const SHERPA_DAEMON_PORT: u16 = 6127;
-const SHERPA_WEBSOCKET_DAEMON_ENABLED: bool = false;
+const SHERPA_WEBSOCKET_DAEMON_ENABLED: bool = true;
 const SHERPA_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const DAVINCI_TIMECODE_FPS: u64 = 25;
 const LONG_AUDIO_CHUNK_SECONDS: u32 = 60;
 const LONG_AUDIO_THRESHOLD_SECONDS: f64 = 300.0;
 const LLM_ASR_CHUNK_SECONDS: u32 = 20;
+const QWEN_ASR_CHUNK_SECONDS: u32 = 20;
+const QWEN_ASR_MAX_NEW_TOKENS: usize = 128;
+const QWEN_SILENT_CHUNK_RMS_THRESHOLD: f64 = 0.0008;
+const QWEN_SILENT_CHUNK_PEAK_THRESHOLD: f64 = 0.006;
 const MIN_RECORDING_SECONDS: f64 = 0.05;
 const SHERPA_RUNTIME_TAG: &str = "v1.13.2";
 const SHERPA_CPU_RUNTIME_NAME: &str = "sherpa-onnx-v1.13.2-win-x64-static-MT-Release-no-tts";
@@ -44,7 +48,9 @@ struct RuntimeState {
     settings: Mutex<UserSettings>,
     recording: Mutex<Option<RecordingSession>>,
     sherpa_daemon: Mutex<Option<SherpaDaemon>>,
+    directml_sensevoice: Mutex<Option<DirectMlSenseVoiceRuntime>>,
     sherpa_runtime_install: Mutex<()>,
+    transcription_cancellations: Mutex<HashSet<String>>,
 }
 
 struct RecordingSession {
@@ -70,6 +76,15 @@ struct SherpaDaemon {
     child: Child,
     model_dir: String,
     executable: String,
+}
+
+struct DirectMlSenseVoiceRuntime {
+    encoder_path: PathBuf,
+    ctc_path: PathBuf,
+    tokenizer_path: PathBuf,
+    pieces: Vec<String>,
+    encoder_session: ort::session::Session,
+    ctc_session: ort::session::Session,
 }
 
 impl Drop for SherpaDaemon {
@@ -259,6 +274,57 @@ struct TranscribeFileRequest {
     save_output: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelTranscriptionRequest {
+    task_id: String,
+}
+
+fn mark_transcription_cancelled(app: &AppHandle, task_id: &str) -> Result<(), String> {
+    let state = app.state::<RuntimeState>();
+    let mut cancellations = state
+        .transcription_cancellations
+        .lock()
+        .map_err(|error| error.to_string())?;
+    cancellations.insert(task_id.to_string());
+    Ok(())
+}
+
+fn clear_transcription_cancelled(app: &AppHandle, task_id: Option<&str>) -> Result<(), String> {
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
+    let state = app.state::<RuntimeState>();
+    let mut cancellations = state
+        .transcription_cancellations
+        .lock()
+        .map_err(|error| error.to_string())?;
+    cancellations.remove(task_id);
+    Ok(())
+}
+
+fn transcription_cancelled(app: &AppHandle, task_id: Option<&str>) -> bool {
+    let Some(task_id) = task_id else {
+        return false;
+    };
+    let state = app.state::<RuntimeState>();
+    state
+        .transcription_cancellations
+        .lock()
+        .map(|cancellations| cancellations.contains(task_id))
+        .unwrap_or(false)
+}
+
+fn ensure_transcription_not_cancelled(
+    app: &AppHandle,
+    task_id: Option<&str>,
+) -> Result<(), String> {
+    if transcription_cancelled(app, task_id) {
+        Err("Transcription cancelled.".to_string())
+    } else {
+        Ok(())
+    }
+}
 fn default_save_output() -> bool {
     true
 }
@@ -320,6 +386,27 @@ fn performance_for_acceleration(
     _acceleration_mode: &str,
 ) -> TranscriptionPerformance {
     performance
+}
+
+fn performance_for_model_and_acceleration(
+    performance: TranscriptionPerformance,
+    engine: &InstalledEngineConfig,
+    acceleration_mode: &str,
+) -> TranscriptionPerformance {
+    let mut performance = performance_for_acceleration(performance, acceleration_mode);
+    if engine.model_id == "qwen3-asr-0.6b" {
+        if performance.file_workers <= 1 && performance.chunk_workers <= 1 {
+            performance.sherpa_threads = 6;
+        } else if performance.chunk_workers <= 2 {
+            performance.sherpa_threads = 3;
+        } else {
+            performance.sherpa_threads = 2;
+        }
+    }
+    performance
+}
+fn directml_transcription_supported_for_model(engine: &InstalledEngineConfig) -> bool {
+    engine.model_id == "sensevoice-small"
 }
 
 #[derive(Debug, Deserialize)]
@@ -1584,7 +1671,7 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         }
     };
 
-    if engine.engine != "sherpa-onnx" {
+    if !matches!(engine.engine.as_str(), "sherpa-onnx" | "faster-whisper") {
         return ModelValidationResult {
             valid: false,
             model_name: engine.model_name,
@@ -1593,12 +1680,17 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
     }
 
     if !PathBuf::from(&engine.executable).exists() {
+        let runtime_name = if engine.engine == "faster-whisper" {
+            "Faster-Whisper worker"
+        } else {
+            "Sherpa-ONNX executable"
+        };
         return ModelValidationResult {
             valid: false,
             model_name: engine.model_name,
-            message:
-                "The Sherpa-ONNX executable does not exist. Download and configure the model again."
-                    .to_string(),
+            message: format!(
+                "The {runtime_name} does not exist. Download and configure the model again."
+            ),
         };
     }
 
@@ -1712,6 +1804,22 @@ fn sherpa_args_for_runtime(
     Ok(parsed)
 }
 
+fn sherpa_args_for_engine_runtime(
+    engine: &InstalledEngineConfig,
+    threads: Option<usize>,
+    runtime_mode: &str,
+) -> Result<Vec<String>, String> {
+    let mut parsed = sherpa_args_for_runtime(&engine.args, threads, runtime_mode)?;
+    if engine.model_id == "qwen3-asr-0.6b" {
+        set_sherpa_arg_value(
+            &mut parsed,
+            "--qwen3-asr-max-new-tokens",
+            &QWEN_ASR_MAX_NEW_TOKENS.to_string(),
+            true,
+        );
+    }
+    Ok(parsed)
+}
 fn text_from_sherpa_json_value(value: &serde_json::Value) -> Option<String> {
     let text = value.get("text").and_then(|text| text.as_str())?.trim();
     if text.is_empty() {
@@ -2004,7 +2112,7 @@ fn acceleration_status_for_app(
             cpu_runtime_installed,
             cuda_runtime_installed: false,
             cuda_disabled_reason: None,
-            message: "DirectML experimental mode is selected; use the diagnostics page to verify the GPU adapter and split SenseVoice model.".to_string(),
+            message: "DirectML experimental mode is selected. Production transcription currently supports split SenseVoice; Qwen3-ASR uses optimized Sherpa CPU while its DirectML chain remains diagnostic-only.".to_string(),
         });
     }
 
@@ -2046,18 +2154,58 @@ fn is_sherpa_streaming_cli_model(engine: &InstalledEngineConfig) -> bool {
 
 fn sherpa_max_single_pass_seconds(engine: &InstalledEngineConfig) -> f64 {
     match engine.model_id.as_str() {
-        "qwen3-asr-0.6b" | "sherpa-funasr-nano" => LLM_ASR_CHUNK_SECONDS as f64,
+        "qwen3-asr-0.6b" => QWEN_ASR_CHUNK_SECONDS as f64,
+        "sherpa-funasr-nano" => LLM_ASR_CHUNK_SECONDS as f64,
         _ => LONG_AUDIO_THRESHOLD_SECONDS,
     }
 }
 
 fn sherpa_chunk_seconds(engine: &InstalledEngineConfig) -> u32 {
     match engine.model_id.as_str() {
-        "qwen3-asr-0.6b" | "sherpa-funasr-nano" => LLM_ASR_CHUNK_SECONDS,
+        "qwen3-asr-0.6b" => QWEN_ASR_CHUNK_SECONDS,
+        "sherpa-funasr-nano" => LLM_ASR_CHUNK_SECONDS,
         _ => LONG_AUDIO_CHUNK_SECONDS,
     }
 }
 
+#[cfg(test)]
+fn is_cjk_text_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+            | '\u{2A700}'..='\u{2B73F}'
+            | '\u{2B740}'..='\u{2B81F}'
+            | '\u{2B820}'..='\u{2CEAF}'
+            | '\u{30000}'..='\u{3134F}'
+    )
+}
+
+#[cfg(test)]
+fn looks_like_qwen_latin_language_drift(text: &str) -> bool {
+    let cjk_count = text.chars().filter(|ch| is_cjk_text_char(*ch)).count();
+    if cjk_count > 0 {
+        return false;
+    }
+
+    let alphabetic_count = text.chars().filter(|ch| ch.is_alphabetic()).count();
+    let word_count = text
+        .split(|ch: char| !ch.is_alphabetic())
+        .filter(|word| word.chars().count() >= 2)
+        .count();
+
+    alphabetic_count >= 32 && word_count >= 6
+}
+
+#[cfg(test)]
+fn should_keep_sherpa_chunk_text(engine: &InstalledEngineConfig, text: &str) -> bool {
+    if engine.model_id != "qwen3-asr-0.6b" {
+        return true;
+    }
+    !looks_like_qwen_latin_language_drift(text)
+}
 fn sherpa_cli_executable_for_engine(
     engine: &InstalledEngineConfig,
     runtime_executable: &Path,
@@ -2087,6 +2235,9 @@ fn sherpa_websocket_server_path(engine: &InstalledEngineConfig, executable: &Pat
             "sherpa-onnx-offline-websocket-server"
         })
     }
+}
+fn sherpa_daemon_supported_for_model(engine: &InstalledEngineConfig) -> bool {
+    engine.model_id == "qwen3-asr-0.6b"
 }
 
 fn ensure_sherpa_daemon_running(
@@ -2127,7 +2278,7 @@ fn ensure_sherpa_daemon_running(
     *daemon = None;
 
     let mut command = Command::new(&server_exe);
-    command.args(sherpa_args_for_runtime(&engine.args, None, runtime_mode)?);
+    command.args(sherpa_args_for_engine_runtime(engine, None, runtime_mode)?);
     command.arg(format!("--port={SHERPA_DAEMON_PORT}"));
     if let Some(parent) = server_exe.parent() {
         command.current_dir(parent);
@@ -2197,6 +2348,15 @@ fn websocket_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     frame
 }
 
+fn decode_sherpa_websocket_text(bytes: &[u8]) -> String {
+    match String::from_utf8(bytes.to_vec()) {
+        Ok(text) => text,
+        Err(_) => {
+            let (text, _, _) = encoding_rs::GBK.decode(bytes);
+            text.into_owned()
+        }
+    }
+}
 fn read_websocket_message(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     let mut message = Vec::new();
 
@@ -2301,14 +2461,15 @@ fn transcribe_sherpa_wav_websocket(wav_path: &Path) -> Result<String, String> {
                     ));
                 }
 
-                stream
-                    .write_all(&websocket_frame(0x2, &payload))
-                    .map_err(|error| error.to_string())?;
-                stream
-                    .write_all(&websocket_frame(0x1, b"Done"))
-                    .map_err(|error| error.to_string())?;
+                for chunk in payload.chunks(10_240) {
+                    stream
+                        .write_all(&websocket_frame(0x2, chunk))
+                        .map_err(|error| error.to_string())?;
+                }
                 let response = read_websocket_message(&mut stream)?;
-                let text = extract_transcription_text(&String::from_utf8_lossy(&response));
+                let _ = stream.write_all(&websocket_frame(0x1, b"Done"));
+                let response_text = decode_sherpa_websocket_text(&response);
+                let text = extract_transcription_text(&response_text);
                 return Ok(text);
             }
             Err(error) => {
@@ -2334,6 +2495,30 @@ fn wav_duration_seconds(wav_path: &Path) -> Result<f64, String> {
     Ok(reader.duration() as f64 / spec.sample_rate as f64 / channel_count as f64)
 }
 
+fn wav_likely_silent_for_qwen(wav_path: &Path) -> Result<bool, String> {
+    let mut reader = hound::WavReader::open(wav_path).map_err(|error| error.to_string())?;
+    let spec = reader.spec();
+    if spec.bits_per_sample != 16 || spec.sample_format != hound::SampleFormat::Int {
+        return Ok(false);
+    }
+
+    let mut sample_count = 0usize;
+    let mut square_sum = 0.0f64;
+    let mut peak = 0.0f64;
+    for sample in reader.samples::<i16>() {
+        let value = f64::from(sample.map_err(|error| error.to_string())?) / f64::from(i16::MAX);
+        sample_count += 1;
+        square_sum += value * value;
+        peak = peak.max(value.abs());
+    }
+
+    if sample_count == 0 {
+        return Ok(true);
+    }
+
+    let rms = (square_sum / sample_count as f64).sqrt();
+    Ok(rms < QWEN_SILENT_CHUNK_RMS_THRESHOLD && peak < QWEN_SILENT_CHUNK_PEAK_THRESHOLD)
+}
 fn split_wav_into_chunks_in_dir(
     wav_path: &Path,
     chunk_dir: &Path,
@@ -2502,6 +2687,61 @@ struct TranscriptTextChunk {
     text: String,
     start: f64,
     end: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FasterWhisperWorkerOutput {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    segments: Vec<FasterWhisperWorkerSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FasterWhisperWorkerSegment {
+    start: f64,
+    end: f64,
+    text: String,
+}
+
+fn parse_faster_whisper_worker_output(
+    raw: &str,
+    fallback_duration: f64,
+) -> Result<Vec<TranscriptTextChunk>, String> {
+    let output: FasterWhisperWorkerOutput = serde_json::from_str(raw)
+        .map_err(|error| format!("Invalid Faster-Whisper JSON: {error}"))?;
+
+    let chunks = output
+        .segments
+        .into_iter()
+        .filter_map(|segment| {
+            let text = segment.text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(TranscriptTextChunk {
+                    text: text.to_string(),
+                    start: segment.start.max(0.0),
+                    end: segment.end.max(segment.start.max(0.0) + 0.1),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !chunks.is_empty() {
+        return Ok(chunks);
+    }
+
+    let text = output.text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(vec![TranscriptTextChunk {
+        text: text.to_string(),
+        start: 0.0,
+        end: fallback_duration.max(0.1),
+    }])
 }
 
 fn is_primary_sentence_break(character: char) -> bool {
@@ -2853,6 +3093,94 @@ fn emit_transcription_progress(
     );
 }
 
+fn faster_whisper_args_for_engine(
+    engine: &InstalledEngineConfig,
+    wav_path: &Path,
+    output_json_path: &Path,
+) -> Result<Vec<String>, String> {
+    let mut args = split_command_args(&engine.args)?
+        .into_iter()
+        .map(|arg| {
+            arg.replace("{modelDir}", &engine.model_dir)
+                .replace("{audioPath}", &wav_path.to_string_lossy())
+                .replace("{outputJson}", &output_json_path.to_string_lossy())
+        })
+        .collect::<Vec<_>>();
+
+    args.push("--audio".to_string());
+    args.push(wav_path.to_string_lossy().to_string());
+    args.push("--model-dir".to_string());
+    args.push(engine.model_dir.clone());
+    args.push("--output-json".to_string());
+    args.push(output_json_path.to_string_lossy().to_string());
+    Ok(args)
+}
+
+fn transcribe_faster_whisper_wav(
+    app: &AppHandle,
+    engine: &InstalledEngineConfig,
+    wav_path: &Path,
+    task_id: Option<&str>,
+    started_at: Instant,
+) -> Result<Vec<TranscriptTextChunk>, String> {
+    let executable = PathBuf::from(&engine.executable);
+    if !executable.exists() {
+        return Err("Faster-Whisper worker executable does not exist.".to_string());
+    }
+
+    emit_transcription_progress(
+        app,
+        task_id,
+        started_at,
+        "transcribing",
+        19,
+        "Actual acceleration path: Faster-Whisper worker".to_string(),
+        0,
+        0,
+    );
+
+    let output_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("faster-whisper");
+    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let output_json_path =
+        output_dir.join(format!("faster-whisper-{}.json", unix_timestamp_millis()?));
+
+    let mut command = Command::new(&executable);
+    command.args(faster_whisper_args_for_engine(
+        engine,
+        wav_path,
+        &output_json_path,
+    )?);
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    suppress_command_window(&mut command);
+
+    let duration = wav_duration_seconds(wav_path).unwrap_or(60.0);
+    let timeout = Duration::from_secs(((duration * 6.0) as u64 + 180).clamp(180, 21_600));
+    let output = run_command_with_timeout(&mut command, timeout, "Faster-Whisper transcription")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "Faster-Whisper worker failed: {}",
+            format!("{stdout}\n{stderr}").trim()
+        ));
+    }
+
+    let raw_json = if output_json_path.exists() {
+        fs::read_to_string(&output_json_path).map_err(|error| error.to_string())?
+    } else {
+        stdout.trim().to_string()
+    };
+    let _ = fs::remove_file(&output_json_path);
+
+    parse_faster_whisper_worker_output(&raw_json, duration)
+}
+
 fn transcribe_sherpa_wav_cli(
     executable: &Path,
     engine: &InstalledEngineConfig,
@@ -2861,8 +3189,8 @@ fn transcribe_sherpa_wav_cli(
     runtime_mode: &str,
 ) -> Result<String, String> {
     let mut command = Command::new(executable);
-    command.args(sherpa_args_for_runtime(
-        &engine.args,
+    command.args(sherpa_args_for_engine_runtime(
+        engine,
         Some(sherpa_threads),
         runtime_mode,
     )?);
@@ -2920,6 +3248,7 @@ fn transcribe_sherpa_wav(
     started_at: Instant,
     runtime_mode: &str,
 ) -> Result<Vec<TranscriptTextChunk>, String> {
+    ensure_transcription_not_cancelled(app, task_id)?;
     let duration = wav_duration_seconds(wav_path)?;
     let max_single_pass_seconds = sherpa_max_single_pass_seconds(engine);
     if duration <= max_single_pass_seconds {
@@ -2942,9 +3271,10 @@ fn transcribe_sherpa_wav(
             executable,
             wav_path,
             performance,
-            false,
+            sherpa_daemon_supported_for_model(engine),
             runtime_mode,
         )?;
+        ensure_transcription_not_cancelled(app, task_id)?;
         emit_transcription_progress(
             app,
             task_id,
@@ -2987,13 +3317,19 @@ fn transcribe_sherpa_wav(
     let (sender, receiver) = mpsc::channel::<(usize, Result<TranscriptTextChunk, String>)>();
 
     let mut handles = Vec::new();
+    let task_id_owned = task_id.map(str::to_string);
     for _ in 0..worker_count {
+        let app = app.clone();
         let queue = Arc::clone(&queue);
         let sender = sender.clone();
         let engine = engine.clone();
         let executable = executable.to_path_buf();
         let runtime_mode = runtime_mode.to_string();
+        let task_id = task_id_owned.clone();
         handles.push(thread::spawn(move || loop {
+            if transcription_cancelled(&app, task_id.as_deref()) {
+                return;
+            }
             let next = {
                 let Ok(mut queue) = queue.lock() else {
                     return;
@@ -3003,18 +3339,32 @@ fn transcribe_sherpa_wav(
             let Some((index, chunk)) = next else {
                 return;
             };
-            let result = transcribe_sherpa_wav_cli(
-                &executable,
-                &engine,
-                &chunk.path,
-                performance.sherpa_threads,
-                &runtime_mode,
-            )
-            .map(|text| TranscriptTextChunk {
-                text,
-                start: chunk.start,
-                end: chunk.end,
-            });
+            let result = if transcription_cancelled(&app, task_id.as_deref()) {
+                Err("Transcription cancelled.".to_string())
+            } else if engine.model_id == "qwen3-asr-0.6b"
+                && matches!(wav_likely_silent_for_qwen(&chunk.path), Ok(true))
+            {
+                Ok(TranscriptTextChunk {
+                    text: String::new(),
+                    start: chunk.start,
+                    end: chunk.end,
+                })
+            } else {
+                transcribe_sherpa_wav_once(
+                    &app,
+                    &engine,
+                    &executable,
+                    &chunk.path,
+                    performance,
+                    sherpa_daemon_supported_for_model(&engine),
+                    &runtime_mode,
+                )
+                .map(|text| TranscriptTextChunk {
+                    text,
+                    start: chunk.start,
+                    end: chunk.end,
+                })
+            };
             let _ = sender.send((index, result));
         }));
     }
@@ -3043,6 +3393,7 @@ fn transcribe_sherpa_wav(
     }
     let _ = fs::remove_dir_all(&chunk_dir);
 
+    ensure_transcription_not_cancelled(app, task_id)?;
     let mut transcript_chunks = Vec::new();
     let mut errors = Vec::new();
     for (index, result) in results.into_iter().enumerate() {
@@ -3549,6 +3900,216 @@ fn fft_radix2_in_place(real: &mut [f32], imag: &mut [f32]) {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QwenFbankFeatures {
+    frames: usize,
+    values: Vec<f32>,
+}
+
+fn qwen_hz_to_mel(freq: f32) -> f32 {
+    const F_MIN: f32 = 0.0;
+    const F_SP: f32 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f32 = 1000.0;
+    const MIN_LOG_MEL: f32 = (MIN_LOG_HZ - F_MIN) / F_SP;
+    const LOG_STEP: f32 = 1.856_297_990_365_626_3 / 27.0;
+
+    if freq >= MIN_LOG_HZ {
+        MIN_LOG_MEL + (freq / MIN_LOG_HZ).ln() / LOG_STEP
+    } else {
+        (freq - F_MIN) / F_SP
+    }
+}
+
+fn qwen_mel_to_hz(mel: f32) -> f32 {
+    const F_MIN: f32 = 0.0;
+    const F_SP: f32 = 200.0 / 3.0;
+    const MIN_LOG_HZ: f32 = 1000.0;
+    const MIN_LOG_MEL: f32 = (MIN_LOG_HZ - F_MIN) / F_SP;
+    const LOG_STEP: f32 = 1.856_297_990_365_626_3 / 27.0;
+
+    if mel >= MIN_LOG_MEL {
+        MIN_LOG_HZ * ((mel - MIN_LOG_MEL) * LOG_STEP).exp()
+    } else {
+        F_MIN + F_SP * mel
+    }
+}
+
+fn qwen_mel_filters(sr: usize, n_fft: usize, n_mels: usize, f_min: f32, f_max: f32) -> Vec<f32> {
+    let bins = n_fft / 2 + 1;
+    let mel_min = qwen_hz_to_mel(f_min);
+    let mel_max = qwen_hz_to_mel(f_max);
+    let mel_points = (0..(n_mels + 2))
+        .map(|index| mel_min + (mel_max - mel_min) * index as f32 / (n_mels + 1) as f32)
+        .map(qwen_mel_to_hz)
+        .collect::<Vec<_>>();
+    let diffs = mel_points
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let mut filters = vec![0.0f32; bins * n_mels];
+
+    for bin in 0..bins {
+        let freq = bin as f32 * (sr as f32 / 2.0) / (bins - 1) as f32;
+        for mel in 0..n_mels {
+            let down = if diffs[mel].abs() > f32::EPSILON {
+                (freq - mel_points[mel]) / diffs[mel]
+            } else {
+                0.0
+            };
+            let up = if diffs[mel + 1].abs() > f32::EPSILON {
+                (mel_points[mel + 2] - freq) / diffs[mel + 1]
+            } else {
+                0.0
+            };
+            let norm = if (mel_points[mel + 2] - mel_points[mel]).abs() > f32::EPSILON {
+                2.0 / (mel_points[mel + 2] - mel_points[mel])
+            } else {
+                1.0
+            };
+            filters[bin * n_mels + mel] = down.min(up).max(0.0) * norm;
+        }
+    }
+
+    filters
+}
+
+fn reflected_audio_sample(audio: &[f32], index: isize) -> f32 {
+    if audio.is_empty() {
+        return 0.0;
+    }
+
+    let mut index = index;
+    let len = audio.len() as isize;
+    while index < 0 || index >= len {
+        if index < 0 {
+            index = -index - 1;
+        } else {
+            index = 2 * len - 1 - index;
+        }
+    }
+
+    audio[index as usize]
+}
+
+#[cfg(test)]
+fn real_dft_power_spectrum(frame: &[f32]) -> Vec<f32> {
+    let n_fft = frame.len();
+    let bins = n_fft / 2 + 1;
+    let mut power = vec![0.0f32; bins];
+    for (bin, value) in power.iter_mut().enumerate() {
+        let mut real = 0.0f32;
+        let mut imag = 0.0f32;
+        for (n, sample) in frame.iter().enumerate() {
+            let angle = -2.0 * std::f32::consts::PI * bin as f32 * n as f32 / n_fft as f32;
+            real += sample * angle.cos();
+            imag += sample * angle.sin();
+        }
+        *value = real * real + imag * imag;
+    }
+    power
+}
+
+fn whisper_fft_complex(input: &[f32]) -> Vec<(f32, f32)> {
+    let n = input.len();
+    if n == 1 {
+        return vec![(input[0], 0.0)];
+    }
+    if n % 2 == 1 {
+        let mut output = vec![(0.0f32, 0.0f32); n];
+        for (k, value) in output.iter_mut().enumerate() {
+            let mut real = 0.0f32;
+            let mut imag = 0.0f32;
+            for (sample_index, sample) in input.iter().enumerate() {
+                let angle = 2.0 * std::f32::consts::PI * k as f32 * sample_index as f32 / n as f32;
+                real += sample * angle.cos();
+                imag -= sample * angle.sin();
+            }
+            *value = (real, imag);
+        }
+        return output;
+    }
+
+    let even = input.iter().step_by(2).copied().collect::<Vec<_>>();
+    let odd = input.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+    let even_fft = whisper_fft_complex(&even);
+    let odd_fft = whisper_fft_complex(&odd);
+    let mut output = vec![(0.0f32, 0.0f32); n];
+
+    for k in 0..(n / 2) {
+        let theta = 2.0 * std::f32::consts::PI * k as f32 / n as f32;
+        let twiddle_real = theta.cos();
+        let twiddle_imag = -theta.sin();
+        let (odd_real, odd_imag) = odd_fft[k];
+        let transformed_real = twiddle_real * odd_real - twiddle_imag * odd_imag;
+        let transformed_imag = twiddle_real * odd_imag + twiddle_imag * odd_real;
+        let (even_real, even_imag) = even_fft[k];
+
+        output[k] = (even_real + transformed_real, even_imag + transformed_imag);
+        output[k + n / 2] = (even_real - transformed_real, even_imag - transformed_imag);
+    }
+
+    output
+}
+
+fn whisper_fft_power_spectrum(frame: &[f32]) -> Vec<f32> {
+    let spectrum = whisper_fft_complex(frame);
+    spectrum
+        .iter()
+        .take(frame.len() / 2 + 1)
+        .map(|(real, imag)| real * real + imag * imag)
+        .collect()
+}
+
+fn extract_qwen_fbank_features(audio: &[f32]) -> QwenFbankFeatures {
+    const SAMPLE_RATE: usize = 16_000;
+    const N_FFT: usize = 400;
+    const HOP_LENGTH: usize = 160;
+    const N_MELS: usize = 128;
+
+    let source = if audio.is_empty() {
+        &[0.0f32][..]
+    } else {
+        audio
+    };
+    let frame_count = ((source.len() + HOP_LENGTH / 2) / HOP_LENGTH).max(1);
+    let filters = qwen_mel_filters(SAMPLE_RATE, N_FFT, N_MELS, 0.0, 8000.0);
+    let window = (0..N_FFT)
+        .map(|index| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / N_FFT as f32).cos())
+        .collect::<Vec<_>>();
+    let bins = N_FFT / 2 + 1;
+    let mut values = vec![0.0f32; frame_count * N_MELS];
+    let mut max_log = f32::NEG_INFINITY;
+
+    for frame_index in 0..frame_count {
+        let frame_start = frame_index as isize * HOP_LENGTH as isize + HOP_LENGTH as isize / 2
+            - N_FFT as isize / 2;
+        let mut frame = vec![0.0f32; N_FFT];
+        for index in 0..N_FFT {
+            frame[index] =
+                reflected_audio_sample(source, frame_start + index as isize) * window[index];
+        }
+        let magnitudes = whisper_fft_power_spectrum(&frame);
+        for mel in 0..N_MELS {
+            let mut energy = 0.0f32;
+            for bin in 0..bins {
+                energy += magnitudes[bin] * filters[bin * N_MELS + mel];
+            }
+            let log_value = energy.max(1.0e-10).log10();
+            max_log = max_log.max(log_value);
+            values[frame_index * N_MELS + mel] = log_value;
+        }
+    }
+
+    let floor = max_log - 8.0;
+    for value in &mut values {
+        *value = (value.max(floor) + 4.0) / 4.0;
+    }
+
+    QwenFbankFeatures {
+        frames: frame_count,
+        values,
+    }
+}
 fn extract_sensevoice_lfr_features(audio: &[f32]) -> SenseVoiceLfrFeatures {
     const SAMPLE_RATE: usize = 16_000;
     const WINDOW_LENGTH: usize = 400;
@@ -3751,6 +4312,26 @@ fn directml_session_builder() -> Result<ort::session::builder::SessionBuilder, S
         .map_err(|error| format!("Failed to set ONNX Runtime execution mode: {error}"))
 }
 
+fn cpu_session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
+    ort::session::Session::builder()
+        .map_err(|error| format!("ONNX Runtime CPU session builder failed: {error}"))?
+        .with_no_environment_execution_providers()
+        .map_err(|error| format!("Failed to isolate execution providers: {error}"))?
+        .with_intra_threads(1)
+        .map_err(|error| format!("Failed to set ONNX Runtime thread count: {error}"))?
+        .with_parallel_execution(false)
+        .map_err(|error| format!("Failed to set ONNX Runtime execution mode: {error}"))
+}
+
+fn qwen_smoke_session_builder(
+    use_directml: bool,
+) -> Result<ort::session::builder::SessionBuilder, String> {
+    if use_directml {
+        directml_session_builder()
+    } else {
+        cpu_session_builder()
+    }
+}
 fn create_directml_session_from_file(
     model_path: &Path,
     label: &str,
@@ -4321,6 +4902,127 @@ pub fn run_cli_mode() -> bool {
                 &PathBuf::from(tokenizer_path),
             )
         }
+        "--hi-voicer-directml-qwen-chain-smoke" => {
+            suppress_windows_fault_dialogs();
+            let Some(conv_frontend_path) = args.next() else {
+                eprintln!("missing conv_frontend path");
+                std::process::exit(2);
+            };
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(decoder_path) = args.next() else {
+                eprintln!("missing decoder path");
+                std::process::exit(2);
+            };
+            create_directml_qwen_chain_smoke_session(
+                &PathBuf::from(conv_frontend_path),
+                &PathBuf::from(encoder_path),
+                &PathBuf::from(decoder_path),
+            )
+        }
+        "--hi-voicer-directml-qwen-wav-smoke" => {
+            suppress_windows_fault_dialogs();
+            let Some(conv_frontend_path) = args.next() else {
+                eprintln!("missing conv_frontend path");
+                std::process::exit(2);
+            };
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(decoder_path) = args.next() else {
+                eprintln!("missing decoder path");
+                std::process::exit(2);
+            };
+            let Some(wav_path) = args.next() else {
+                eprintln!("missing wav path");
+                std::process::exit(2);
+            };
+            create_directml_qwen_wav_smoke_session(
+                &PathBuf::from(conv_frontend_path),
+                &PathBuf::from(encoder_path),
+                &PathBuf::from(decoder_path),
+                &PathBuf::from(wav_path),
+            )
+        }
+        "--hi-voicer-directml-qwen-greedy-wav-smoke" => {
+            suppress_windows_fault_dialogs();
+            let Some(conv_frontend_path) = args.next() else {
+                eprintln!("missing conv_frontend path");
+                std::process::exit(2);
+            };
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(decoder_path) = args.next() else {
+                eprintln!("missing decoder path");
+                std::process::exit(2);
+            };
+            let Some(wav_path) = args.next() else {
+                eprintln!("missing wav path");
+                std::process::exit(2);
+            };
+            let max_new_tokens = match args.next() {
+                Some(value) => match value.to_string_lossy().parse::<usize>() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(error) => Err(format!(
+                        "invalid max_new_tokens for Qwen greedy smoke: {error}"
+                    )),
+                },
+                None => Ok(None),
+            };
+            match max_new_tokens {
+                Ok(max_new_tokens) => create_directml_qwen_greedy_wav_smoke_session(
+                    &PathBuf::from(conv_frontend_path),
+                    &PathBuf::from(encoder_path),
+                    &PathBuf::from(decoder_path),
+                    &PathBuf::from(wav_path),
+                    max_new_tokens.unwrap_or(8),
+                ),
+                Err(error) => Err(error),
+            }
+        }
+        "--hi-voicer-cpu-qwen-greedy-wav-smoke" => {
+            suppress_windows_fault_dialogs();
+            let Some(conv_frontend_path) = args.next() else {
+                eprintln!("missing conv_frontend path");
+                std::process::exit(2);
+            };
+            let Some(encoder_path) = args.next() else {
+                eprintln!("missing encoder path");
+                std::process::exit(2);
+            };
+            let Some(decoder_path) = args.next() else {
+                eprintln!("missing decoder path");
+                std::process::exit(2);
+            };
+            let Some(wav_path) = args.next() else {
+                eprintln!("missing wav path");
+                std::process::exit(2);
+            };
+            let max_new_tokens = match args.next() {
+                Some(value) => match value.to_string_lossy().parse::<usize>() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(error) => Err(format!(
+                        "invalid max_new_tokens for Qwen greedy smoke: {error}"
+                    )),
+                },
+                None => Ok(None),
+            };
+            match max_new_tokens {
+                Ok(max_new_tokens) => create_cpu_qwen_greedy_wav_smoke_session(
+                    &PathBuf::from(conv_frontend_path),
+                    &PathBuf::from(encoder_path),
+                    &PathBuf::from(decoder_path),
+                    &PathBuf::from(wav_path),
+                    max_new_tokens.unwrap_or(8),
+                ),
+                Err(error) => Err(error),
+            }
+        }
         _ => return false,
     };
 
@@ -4448,6 +5150,1232 @@ fn select_directml_split_sensevoice_candidate(
         })
 }
 
+#[derive(Debug, Clone)]
+struct DirectMlQwenCandidate {
+    conv_frontend: PathBuf,
+    encoder: PathBuf,
+    decoder: PathBuf,
+    tokenizer_dir: PathBuf,
+}
+
+fn qwen_candidate_for_dir(model_dir: &Path) -> DirectMlQwenCandidate {
+    DirectMlQwenCandidate {
+        conv_frontend: model_dir.join("conv_frontend.onnx"),
+        encoder: model_dir.join("encoder.int8.onnx"),
+        decoder: model_dir.join("decoder.int8.onnx"),
+        tokenizer_dir: model_dir.join("tokenizer"),
+    }
+}
+
+fn qwen_missing_files(candidate: &DirectMlQwenCandidate) -> Vec<String> {
+    let required = [
+        ("conv_frontend.onnx", &candidate.conv_frontend),
+        ("encoder.int8.onnx", &candidate.encoder),
+        ("decoder.int8.onnx", &candidate.decoder),
+        (
+            "tokenizer/merges.txt",
+            &candidate.tokenizer_dir.join("merges.txt"),
+        ),
+        (
+            "tokenizer/tokenizer_config.json",
+            &candidate.tokenizer_dir.join("tokenizer_config.json"),
+        ),
+        (
+            "tokenizer/vocab.json",
+            &candidate.tokenizer_dir.join("vocab.json"),
+        ),
+    ];
+    required
+        .iter()
+        .filter_map(|(name, path)| (!path.exists()).then(|| (*name).to_string()))
+        .collect()
+}
+
+fn directml_qwen_ready(model_path: &Path) -> bool {
+    qwen_missing_files(&qwen_candidate_for_dir(model_path)).is_empty()
+}
+
+fn is_qwen_model_layout(model_path: &Path, missing_files: &[String]) -> bool {
+    let dir_name_matches = model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("qwen3-asr-0.6b"))
+        .unwrap_or(false);
+    dir_name_matches || missing_files.is_empty()
+}
+
+fn create_directml_qwen_chain_smoke_session(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    let input_frames = 120usize;
+    let input_features = vec![0.0f32; input_frames * 128];
+    create_directml_qwen_chain_smoke_session_with_features(
+        conv_frontend_path,
+        encoder_path,
+        decoder_path,
+        input_frames,
+        input_features,
+        "zero fbank",
+    )
+}
+
+fn create_directml_qwen_wav_smoke_session(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+    wav_path: &Path,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    let feature_started_at = Instant::now();
+    let audio = read_wav_mono_16k_f32(wav_path)?;
+    let features = extract_qwen_fbank_features(&audio);
+    let feature_ms = feature_started_at.elapsed().as_millis();
+    let mut result = create_directml_qwen_chain_smoke_session_with_features(
+        conv_frontend_path,
+        encoder_path,
+        decoder_path,
+        features.frames,
+        features.values,
+        "wav fbank",
+    )?;
+    result.message = format!(
+        "{}; wav samples: {}; feature extraction: {} ms",
+        result.message,
+        audio.len(),
+        feature_ms
+    );
+    Ok(result)
+}
+
+fn load_qwen_token_ids(tokenizer_dir: &Path) -> Result<HashMap<String, i64>, String> {
+    let vocab_path = tokenizer_dir.join("vocab.json");
+    let config_path = tokenizer_dir.join("tokenizer_config.json");
+    let vocab_text = fs::read_to_string(&vocab_path).map_err(|error| {
+        format!(
+            "Failed to read Qwen vocab {}: {error}",
+            vocab_path.display()
+        )
+    })?;
+    let config_text = fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "Failed to read Qwen tokenizer config {}: {error}",
+            config_path.display()
+        )
+    })?;
+    let vocab_json: serde_json::Value = serde_json::from_str(&vocab_text)
+        .map_err(|error| format!("Failed to parse Qwen vocab JSON: {error}"))?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_text)
+        .map_err(|error| format!("Failed to parse Qwen tokenizer config JSON: {error}"))?;
+    let mut ids = HashMap::new();
+
+    if let Some(vocab) = vocab_json.as_object() {
+        for (token, value) in vocab {
+            if let Some(id) = value.as_i64() {
+                ids.insert(token.clone(), id);
+            }
+        }
+    }
+    if let Some(added) = config_json
+        .get("added_tokens_decoder")
+        .and_then(|value| value.as_object())
+    {
+        for (key, value) in added {
+            let Some(token) = value.get("content").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            let id = value
+                .get("id")
+                .and_then(|item| item.as_i64())
+                .or_else(|| key.parse::<i64>().ok());
+            if let Some(id) = id {
+                ids.insert(token.to_string(), id);
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
+fn qwen_required_token_id(ids: &HashMap<String, i64>, token: &str) -> Result<i64, String> {
+    ids.get(token)
+        .copied()
+        .ok_or_else(|| format!("Qwen tokenizer is missing required token: {token}"))
+}
+
+fn qwen_utf8_encode(code_point: u32) -> String {
+    char::from_u32(code_point)
+        .unwrap_or(char::REPLACEMENT_CHARACTER)
+        .to_string()
+}
+
+fn qwen_byte_to_unicode() -> Vec<String> {
+    let mut used = [false; 256];
+    let mut bytes = Vec::with_capacity(256);
+    let mut code_points = Vec::with_capacity(256);
+
+    for byte in 33u16..=126 {
+        bytes.push(byte as u8);
+        used[byte as usize] = true;
+    }
+    for byte in 161u16..=172 {
+        bytes.push(byte as u8);
+        used[byte as usize] = true;
+    }
+    for byte in 174u16..=255 {
+        bytes.push(byte as u8);
+        used[byte as usize] = true;
+    }
+    for byte in &bytes {
+        code_points.push(*byte as u32);
+    }
+
+    let mut n = 0u32;
+    for byte in 0u16..=255 {
+        if !used[byte as usize] {
+            bytes.push(byte as u8);
+            code_points.push(256 + n);
+            n += 1;
+        }
+    }
+
+    let mut table = vec![String::new(); 256];
+    for (byte, code_point) in bytes.into_iter().zip(code_points.into_iter()) {
+        table[byte as usize] = qwen_utf8_encode(code_point);
+    }
+    table
+}
+
+fn qwen_unicode_to_byte() -> HashMap<String, u8> {
+    qwen_byte_to_unicode()
+        .into_iter()
+        .enumerate()
+        .map(|(byte, piece)| (piece, byte as u8))
+        .collect()
+}
+
+fn is_qwen_special_token(token: &str) -> bool {
+    token.starts_with("<|") && token.ends_with("|>")
+}
+
+fn is_qwen_skippable_special_token(token: &str) -> bool {
+    matches!(token, "<|im_start|>" | "<|im_end|>")
+}
+
+fn decode_qwen_byte_level_piece(piece: &str, unicode_to_byte: &HashMap<String, u8>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for ch in piece.chars() {
+        let item = ch.to_string();
+        if let Some(byte) = unicode_to_byte.get(&item) {
+            bytes.push(*byte);
+        } else {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    bytes
+}
+
+fn load_qwen_id_to_token(tokenizer_dir: &Path) -> Result<Vec<String>, String> {
+    let ids = load_qwen_token_ids(tokenizer_dir)?;
+    let max_id = ids
+        .values()
+        .copied()
+        .filter(|id| *id >= 0)
+        .max()
+        .unwrap_or(0) as usize;
+    let mut id_to_token = vec![String::new(); max_id + 1];
+    for (token, id) in ids {
+        if id >= 0 {
+            let index = id as usize;
+            if index >= id_to_token.len() {
+                id_to_token.resize(index + 1, String::new());
+            }
+            id_to_token[index] = token;
+        }
+    }
+    Ok(id_to_token)
+}
+
+fn decode_qwen_token_ids(tokenizer_dir: &Path, token_ids: &[i64]) -> Result<String, String> {
+    let id_to_token = load_qwen_id_to_token(tokenizer_dir)?;
+    let unicode_to_byte = qwen_unicode_to_byte();
+    let mut output = String::new();
+    let mut pending = Vec::new();
+
+    for id in token_ids {
+        if *id < 0 {
+            continue;
+        }
+        let Some(token) = id_to_token.get(*id as usize) else {
+            continue;
+        };
+        if token.is_empty() {
+            continue;
+        }
+        if is_qwen_special_token(token) {
+            if !pending.is_empty() {
+                output.push_str(&String::from_utf8_lossy(&pending));
+                pending.clear();
+            }
+            if !is_qwen_skippable_special_token(token) {
+                output.push_str(token);
+            }
+        } else {
+            pending.extend(decode_qwen_byte_level_piece(token, &unicode_to_byte));
+        }
+    }
+
+    if !pending.is_empty() {
+        output.push_str(&String::from_utf8_lossy(&pending));
+    }
+
+    Ok(output.replace(char::REPLACEMENT_CHARACTER, ""))
+}
+
+fn clean_qwen_generated_text(
+    tokenizer_dir: &Path,
+    generated_ids: &[i64],
+) -> Result<String, String> {
+    let ids = load_qwen_token_ids(tokenizer_dir)?;
+    let asr_text_id = ids.get("<asr_text>").copied();
+    let mut cleaned_ids = generated_ids.to_vec();
+
+    if let Some(asr_text_id) = asr_text_id {
+        let prefix_window = cleaned_ids.len().min(16);
+        if let Some(position) = cleaned_ids
+            .iter()
+            .take(prefix_window)
+            .position(|id| *id == asr_text_id)
+        {
+            if position > 0 {
+                let prefix = decode_qwen_token_ids(tokenizer_dir, &cleaned_ids[..=position])?;
+                if prefix.starts_with("language ") && prefix.ends_with("<asr_text>") {
+                    cleaned_ids = cleaned_ids[position + 1..].to_vec();
+                }
+            }
+        }
+    }
+
+    let mut text = decode_qwen_token_ids(tokenizer_dir, &cleaned_ids)?;
+    if let Some(position) = text.find("<asr_text>") {
+        text = text[position + "<asr_text>".len()..].to_string();
+    }
+    Ok(text)
+}
+fn build_qwen_default_source_ids(
+    tokenizer_dir: &Path,
+    audio_token_len: usize,
+) -> Result<Vec<i64>, String> {
+    let ids = load_qwen_token_ids(tokenizer_dir)?;
+    let newline = char::from_u32(0x010A)
+        .ok_or_else(|| "Failed to construct Qwen byte-level newline token.".to_string())?
+        .to_string();
+    let im_start = qwen_required_token_id(&ids, "<|im_start|>")?;
+    let im_end = qwen_required_token_id(&ids, "<|im_end|>")?;
+    let audio_start = qwen_required_token_id(&ids, "<|audio_start|>")?;
+    let audio_pad = qwen_required_token_id(&ids, "<|audio_pad|>")?;
+    let audio_end = qwen_required_token_id(&ids, "<|audio_end|>")?;
+    let system = qwen_required_token_id(&ids, "system")?;
+    let user = qwen_required_token_id(&ids, "user")?;
+    let assistant = qwen_required_token_id(&ids, "assistant")?;
+    let nl = qwen_required_token_id(&ids, &newline)?;
+
+    let mut source_ids = Vec::with_capacity(16 + audio_token_len);
+    source_ids.extend([
+        im_start,
+        system,
+        nl,
+        im_end,
+        nl,
+        im_start,
+        user,
+        nl,
+        audio_start,
+    ]);
+    source_ids.extend(std::iter::repeat(audio_pad).take(audio_token_len));
+    source_ids.extend([audio_end, im_end, nl, im_start, assistant, nl]);
+    Ok(source_ids)
+}
+
+fn qwen_argmax_token_from_logits(
+    logits: &[f32],
+    logits_shape: &[i64],
+    time_index: usize,
+) -> Result<i64, String> {
+    if logits_shape.len() < 3 {
+        return Err("Qwen decoder logits tensor must be at least 3-D.".to_string());
+    }
+    let time_dim = usize::try_from(logits_shape[1])
+        .map_err(|_| format!("Invalid Qwen logits time dimension: {}", logits_shape[1]))?;
+    let vocab_size = usize::try_from(logits_shape[2])
+        .map_err(|_| format!("Invalid Qwen logits vocab dimension: {}", logits_shape[2]))?;
+    if time_index >= time_dim || vocab_size == 0 {
+        return Err(format!(
+            "Qwen decoder logits index is invalid: time_index {time_index}, shape {:?}",
+            logits_shape
+        ));
+    }
+    let start = time_index
+        .checked_mul(vocab_size)
+        .ok_or_else(|| "Qwen logits offset overflowed.".to_string())?;
+    let end = start
+        .checked_add(vocab_size)
+        .ok_or_else(|| "Qwen logits end offset overflowed.".to_string())?;
+    let row = logits
+        .get(start..end)
+        .ok_or_else(|| "Qwen logits tensor is shorter than its shape.".to_string())?;
+
+    row.iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index as i64)
+        .ok_or_else(|| "Qwen decoder logits row has no finite values.".to_string())
+}
+
+fn copy_qwen_cache_delta(target: &mut [f32], start_position: usize, delta: &[f32], seq_len: usize) {
+    const QWEN_KV_WIDTH: usize = 8 * 128;
+    let target_start = start_position.saturating_mul(QWEN_KV_WIDTH);
+    let copy_len = seq_len
+        .saturating_mul(QWEN_KV_WIDTH)
+        .min(delta.len())
+        .min(target.len().saturating_sub(target_start));
+    if copy_len > 0 {
+        target[target_start..target_start + copy_len].copy_from_slice(&delta[..copy_len]);
+    }
+}
+
+fn qwen_feat_to_audio_tokens_len(feat_len: usize, chunk_size: usize) -> usize {
+    if feat_len == 0 || chunk_size == 0 {
+        return 0;
+    }
+
+    fn conv_out_len_3x_stride2(mut n: usize) -> usize {
+        n = (n + 1) / 2;
+        n = (n + 1) / 2;
+        (n + 1) / 2
+    }
+
+    fn after_cnn(mut n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        n = (n - 1) / 2 + 1;
+        n = (n - 1) / 2 + 1;
+        (n - 1) / 2 + 1
+    }
+
+    let full = feat_len / chunk_size;
+    let rem = feat_len % chunk_size;
+    let mut out = full * conv_out_len_3x_stride2(chunk_size);
+    if rem > 0 {
+        out += after_cnn(rem);
+    }
+    out
+}
+
+fn qwen_valid_audio_tokens(feat_frames: usize, conv_frames: usize) -> usize {
+    qwen_feat_to_audio_tokens_len(feat_frames, 100).min(conv_frames)
+}
+
+fn trim_qwen_audio_features(shape: &mut Vec<usize>, data: &mut Vec<f32>) -> usize {
+    if shape.len() != 3 || shape[0] != 1 || shape[1] == 0 || shape[2] == 0 {
+        return shape.get(1).copied().unwrap_or(0);
+    }
+
+    let frames = shape[1];
+    let hidden = shape[2];
+    let mut valid_frames = frames;
+    while valid_frames > 0 {
+        let start = (valid_frames - 1) * hidden;
+        let end = start + hidden;
+        let max_abs = data[start..end]
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max);
+        if max_abs > 1e-6 {
+            break;
+        }
+        valid_frames -= 1;
+    }
+
+    truncate_qwen_audio_features(shape, data, valid_frames)
+}
+
+fn truncate_qwen_audio_features(
+    shape: &mut Vec<usize>,
+    data: &mut Vec<f32>,
+    keep_frames: usize,
+) -> usize {
+    if shape.len() != 3 || shape[0] != 1 || shape[1] == 0 || shape[2] == 0 {
+        return shape.get(1).copied().unwrap_or(0);
+    }
+
+    let frames = shape[1];
+    let hidden = shape[2];
+    let keep_frames = keep_frames.min(frames);
+    if keep_frames > 0 && keep_frames < frames {
+        data.truncate(keep_frames * hidden);
+        shape[1] = keep_frames;
+    }
+
+    shape[1]
+}
+fn create_directml_qwen_greedy_wav_smoke_session(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+    wav_path: &Path,
+    max_new_tokens: usize,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    create_qwen_greedy_wav_smoke_session(
+        conv_frontend_path,
+        encoder_path,
+        decoder_path,
+        wav_path,
+        max_new_tokens,
+        true,
+    )
+}
+
+fn create_cpu_qwen_greedy_wav_smoke_session(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+    wav_path: &Path,
+    max_new_tokens: usize,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    create_qwen_greedy_wav_smoke_session(
+        conv_frontend_path,
+        encoder_path,
+        decoder_path,
+        wav_path,
+        max_new_tokens,
+        false,
+    )
+}
+fn create_qwen_greedy_wav_smoke_session(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+    wav_path: &Path,
+    max_new_tokens: usize,
+    use_directml: bool,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if use_directml && !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+
+    use ort::{
+        inputs,
+        value::{Tensor, TensorRef},
+    };
+
+    let provider_label = if use_directml { "DirectML" } else { "CPU" };
+    let total_started_at = Instant::now();
+    let feature_started_at = Instant::now();
+    let audio = read_wav_mono_16k_f32(wav_path)?;
+    let features = extract_qwen_fbank_features(&audio);
+    let feature_ms = feature_started_at.elapsed().as_millis();
+
+    let mut conv_session = qwen_smoke_session_builder(use_directml)?
+        .commit_from_file(conv_frontend_path)
+        .map_err(|error| {
+            format!("Failed to create {provider_label} Qwen conv_frontend session: {error}")
+        })?;
+    let conv_inputs_summary = ort_outlet_summaries(conv_session.inputs());
+    let conv_outputs_summary = ort_outlet_summaries(conv_session.outputs());
+    let conv_started_at = Instant::now();
+    let input_features =
+        Tensor::<f32>::from_array(([1usize, features.frames, 128], features.values))
+            .map_err(|error| format!("Failed to create Qwen input_features tensor: {error}"))?;
+    let conv_outputs = conv_session
+        .run(inputs!["input_features" => input_features])
+        .map_err(|error| format!("{provider_label} Qwen conv_frontend run failed: {error}"))?;
+    let conv_ms = conv_started_at.elapsed().as_millis();
+    let (conv_shape, conv_data) = conv_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen conv output tensor: {error}"))?;
+    let conv_shape_usize = conv_shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| format!("Invalid Qwen conv output dim: {dim}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let conv_frames = conv_shape_usize.get(1).copied().unwrap_or(0).max(1);
+    let valid_audio_tokens = qwen_valid_audio_tokens(features.frames, conv_frames);
+    let conv_data = conv_data.to_vec();
+    drop(conv_outputs);
+    drop(conv_session);
+
+    let mut encoder_session = qwen_smoke_session_builder(use_directml)?
+        .commit_from_file(encoder_path)
+        .map_err(|error| {
+            format!("Failed to create {provider_label} Qwen encoder session: {error}")
+        })?;
+    let encoder_inputs_summary = ort_outlet_summaries(encoder_session.inputs());
+    let encoder_outputs_summary = ort_outlet_summaries(encoder_session.outputs());
+    let encoder_features = Tensor::<f32>::from_array((conv_shape_usize, conv_data))
+        .map_err(|error| format!("Failed to create Qwen encoder input_features tensor: {error}"))?;
+    let mut feature_attention_mask_values = vec![false; conv_frames];
+    for value in feature_attention_mask_values
+        .iter_mut()
+        .take(valid_audio_tokens.min(conv_frames))
+    {
+        *value = true;
+    }
+    let feature_attention_mask =
+        Tensor::<bool>::from_array(([1usize, conv_frames], feature_attention_mask_values))
+            .map_err(|error| {
+                format!("Failed to create Qwen feature_attention_mask tensor: {error}")
+            })?;
+    let encoder_started_at = Instant::now();
+    let encoder_outputs = encoder_session
+        .run(inputs![
+            "input_features" => encoder_features,
+            "feature_attention_mask" => feature_attention_mask,
+        ])
+        .map_err(|error| format!("{provider_label} Qwen encoder run failed: {error}"))?;
+    let encoder_ms = encoder_started_at.elapsed().as_millis();
+    let (audio_shape, audio_data) = encoder_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen encoder output tensor: {error}"))?;
+    let audio_shape_usize = audio_shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| format!("Invalid Qwen audio feature dim: {dim}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut audio_shape_usize = audio_shape_usize;
+    let mut audio_data = audio_data.to_vec();
+    let trimmed_audio_frames = trim_qwen_audio_features(&mut audio_shape_usize, &mut audio_data);
+    let audio_tokens = valid_audio_tokens.min(trimmed_audio_frames).max(1);
+    let audio_feature_frames =
+        truncate_qwen_audio_features(&mut audio_shape_usize, &mut audio_data, audio_tokens);
+    drop(encoder_outputs);
+    drop(encoder_session);
+
+    let mut decoder_session = qwen_smoke_session_builder(use_directml)?
+        .commit_from_file(decoder_path)
+        .map_err(|error| {
+            format!("Failed to create {provider_label} Qwen decoder session: {error}")
+        })?;
+    let decoder_inputs_summary = ort_outlet_summaries(decoder_session.inputs());
+    let decoder_outputs_summary = ort_outlet_summaries(decoder_session.outputs());
+
+    let tokenizer_dir = decoder_path
+        .parent()
+        .ok_or_else(|| "Qwen decoder path does not have a parent directory.".to_string())?
+        .join("tokenizer");
+    let prompt_ids = build_qwen_default_source_ids(&tokenizer_dir, audio_tokens)?;
+    let context_len = prompt_ids.len();
+    let max_total_len = 512usize.max(context_len + max_new_tokens + 8);
+    let cache_values_per_layer = max_total_len * 8 * 128;
+    let mut cache_keys = vec![vec![0.0f32; cache_values_per_layer]; 28];
+    let mut cache_values = vec![vec![0.0f32; cache_values_per_layer]; 28];
+    let mut generated = Vec::new();
+    let mut step_timings = Vec::new();
+    let mut total_steps = 0usize;
+
+    let mut prefill_inputs: Vec<(String, ort::session::SessionInputValue)> = Vec::new();
+    prefill_inputs.push((
+        "input_ids".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array(([1usize, context_len], prompt_ids.clone()))
+                .map_err(|error| {
+                    format!("Failed to create Qwen prefill input_ids tensor: {error}")
+                })?
+                .into_dyn(),
+        ),
+    ));
+    prefill_inputs.push((
+        "audio_features".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<f32>::from_array((audio_shape_usize.clone(), audio_data.clone()))
+                .map_err(|error| {
+                    format!("Failed to create Qwen prefill audio_features tensor: {error}")
+                })?
+                .into_dyn(),
+        ),
+    ));
+    prefill_inputs.push((
+        "attention_mask".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array(([1usize, context_len], vec![1i64; context_len]))
+                .map_err(|error| {
+                    format!("Failed to create Qwen prefill attention_mask tensor: {error}")
+                })?
+                .into_dyn(),
+        ),
+    ));
+    prefill_inputs.push((
+        "cache_position".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array((
+                [context_len],
+                (0..context_len)
+                    .map(|value| value as i64)
+                    .collect::<Vec<_>>(),
+            ))
+            .map_err(|error| {
+                format!("Failed to create Qwen prefill cache_position tensor: {error}")
+            })?
+            .into_dyn(),
+        ),
+    ));
+    for layer in 0..28usize {
+        let shape = [1usize, max_total_len, 8usize, 128usize];
+        prefill_inputs.push((
+            format!("cache_key_{layer}"),
+            ort::session::SessionInputValue::from(
+                TensorRef::<f32>::from_array_view((shape, &cache_keys[layer][..])).map_err(
+                    |error| {
+                        format!("Failed to create Qwen prefill cache_key_{layer} tensor: {error}")
+                    },
+                )?,
+            ),
+        ));
+        prefill_inputs.push((
+            format!("cache_value_{layer}"),
+            ort::session::SessionInputValue::from(
+                TensorRef::<f32>::from_array_view((shape, &cache_values[layer][..])).map_err(
+                    |error| {
+                        format!("Failed to create Qwen prefill cache_value_{layer} tensor: {error}")
+                    },
+                )?,
+            ),
+        ));
+    }
+
+    let prefill_started_at = Instant::now();
+    let prefill_outputs = decoder_session
+        .run(prefill_inputs)
+        .map_err(|error| format!("{provider_label} Qwen greedy decoder prefill failed: {error}"))?;
+    let prefill_ms = prefill_started_at.elapsed().as_millis();
+    step_timings.push(prefill_ms);
+    let (logits_shape, logits) = prefill_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen prefill logits tensor: {error}"))?;
+    let mut next_token = qwen_argmax_token_from_logits(&logits, logits_shape, context_len - 1)?;
+    for layer in 0..28usize {
+        let key_index = 1 + layer * 2;
+        let value_index = key_index + 1;
+        let (key_shape, key_delta) = prefill_outputs[key_index]
+            .try_extract_tensor::<f32>()
+            .map_err(|error| {
+                format!("Failed to extract Qwen prefill key_delta_{layer}: {error}")
+            })?;
+        let key_seq_len = key_shape
+            .get(1)
+            .and_then(|value| usize::try_from(*value).ok())
+            .unwrap_or(context_len);
+        copy_qwen_cache_delta(&mut cache_keys[layer], 0, &key_delta, key_seq_len);
+        let (value_shape, value_delta) = prefill_outputs[value_index]
+            .try_extract_tensor::<f32>()
+            .map_err(|error| {
+            format!("Failed to extract Qwen prefill value_delta_{layer}: {error}")
+        })?;
+        let value_seq_len = value_shape
+            .get(1)
+            .and_then(|value| usize::try_from(*value).ok())
+            .unwrap_or(context_len);
+        copy_qwen_cache_delta(&mut cache_values[layer], 0, &value_delta, value_seq_len);
+    }
+    drop(prefill_outputs);
+    total_steps += 1;
+
+    let im_end_id = load_qwen_token_ids(&tokenizer_dir)?
+        .get("<|im_end|>")
+        .copied()
+        .unwrap_or(151645);
+    let endoftext_id = load_qwen_token_ids(&tokenizer_dir)?
+        .get("<|endoftext|>")
+        .copied()
+        .unwrap_or(151643);
+
+    if next_token != im_end_id && next_token != endoftext_id {
+        generated.push(next_token);
+    }
+
+    let mut cur_len = context_len;
+    for step in 1..max_new_tokens {
+        if next_token == im_end_id || next_token == endoftext_id || cur_len >= max_total_len {
+            break;
+        }
+
+        let mut named_inputs: Vec<(String, ort::session::SessionInputValue)> = Vec::new();
+        named_inputs.push((
+            "input_ids".to_string(),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<i64>::from_array(([1usize, 1usize], vec![next_token]))
+                    .map_err(|error| format!("Failed to create Qwen input_ids tensor: {error}"))?
+                    .into_dyn(),
+            ),
+        ));
+        named_inputs.push((
+            "audio_features".to_string(),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<f32>::from_array((audio_shape_usize.clone(), audio_data.clone()))
+                    .map_err(|error| {
+                        format!("Failed to create Qwen decoder audio_features tensor: {error}")
+                    })?
+                    .into_dyn(),
+            ),
+        ));
+        named_inputs.push((
+            "attention_mask".to_string(),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<i64>::from_array(([1usize, 1usize], vec![1i64]))
+                    .map_err(|error| {
+                        format!("Failed to create Qwen attention_mask tensor: {error}")
+                    })?
+                    .into_dyn(),
+            ),
+        ));
+        named_inputs.push((
+            "cache_position".to_string(),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<i64>::from_array(([1usize], vec![cur_len as i64]))
+                    .map_err(|error| {
+                        format!("Failed to create Qwen cache_position tensor: {error}")
+                    })?
+                    .into_dyn(),
+            ),
+        ));
+        for layer in 0..28usize {
+            let shape = [1usize, max_total_len, 8usize, 128usize];
+            named_inputs.push((
+                format!("cache_key_{layer}"),
+                ort::session::SessionInputValue::from(
+                    TensorRef::<f32>::from_array_view((shape, &cache_keys[layer][..])).map_err(
+                        |error| format!("Failed to create Qwen cache_key_{layer} tensor: {error}"),
+                    )?,
+                ),
+            ));
+            named_inputs.push((
+                format!("cache_value_{layer}"),
+                ort::session::SessionInputValue::from(
+                    TensorRef::<f32>::from_array_view((shape, &cache_values[layer][..])).map_err(
+                        |error| {
+                            format!("Failed to create Qwen cache_value_{layer} tensor: {error}")
+                        },
+                    )?,
+                ),
+            ));
+        }
+
+        let decode_started_at = Instant::now();
+        let decoder_outputs = decoder_session.run(named_inputs).map_err(|error| {
+            format!("{provider_label} Qwen greedy decoder step {step} failed: {error}")
+        })?;
+        let step_ms = decode_started_at.elapsed().as_millis();
+        step_timings.push(step_ms);
+        let (logits_shape, logits) = decoder_outputs[0]
+            .try_extract_tensor::<f32>()
+            .map_err(|error| format!("Failed to extract Qwen decoder logits tensor: {error}"))?;
+        let last_time_index = logits_shape
+            .get(1)
+            .and_then(|value| usize::try_from(*value).ok())
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| format!("Invalid Qwen decoder logits shape: {:?}", logits_shape))?;
+        next_token = qwen_argmax_token_from_logits(&logits, logits_shape, last_time_index)?;
+
+        for layer in 0..28usize {
+            let key_index = 1 + layer * 2;
+            let value_index = key_index + 1;
+            let (key_shape, key_delta) = decoder_outputs[key_index]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| format!("Failed to extract Qwen key_delta_{layer}: {error}"))?;
+            let key_seq_len = key_shape
+                .get(1)
+                .and_then(|value| usize::try_from(*value).ok())
+                .unwrap_or(1);
+            copy_qwen_cache_delta(&mut cache_keys[layer], cur_len, &key_delta, key_seq_len);
+            let (value_shape, value_delta) = decoder_outputs[value_index]
+                .try_extract_tensor::<f32>()
+                .map_err(|error| format!("Failed to extract Qwen value_delta_{layer}: {error}"))?;
+            let value_seq_len = value_shape
+                .get(1)
+                .and_then(|value| usize::try_from(*value).ok())
+                .unwrap_or(1);
+            copy_qwen_cache_delta(
+                &mut cache_values[layer],
+                cur_len,
+                &value_delta,
+                value_seq_len,
+            );
+        }
+        drop(decoder_outputs);
+        total_steps += 1;
+        cur_len += 1;
+
+        if next_token == im_end_id || next_token == endoftext_id {
+            break;
+        }
+        generated.push(next_token);
+    }
+    let mut model_inputs = Vec::new();
+    model_inputs.extend(
+        conv_inputs_summary
+            .iter()
+            .map(|item| format!("qwen conv {item}")),
+    );
+    model_inputs.extend(
+        encoder_inputs_summary
+            .iter()
+            .map(|item| format!("qwen encoder {item}")),
+    );
+    model_inputs.extend(
+        decoder_inputs_summary
+            .iter()
+            .map(|item| format!("qwen decoder {item}")),
+    );
+
+    let mut model_outputs = Vec::new();
+    model_outputs.extend(
+        conv_outputs_summary
+            .iter()
+            .map(|item| format!("qwen conv {item}")),
+    );
+    model_outputs.extend(
+        encoder_outputs_summary
+            .iter()
+            .map(|item| format!("qwen encoder {item}")),
+    );
+    model_outputs.extend(
+        decoder_outputs_summary
+            .iter()
+            .map(|item| format!("qwen decoder {item}")),
+    );
+
+    let decoded_text = decode_qwen_token_ids(&tokenizer_dir, &generated)?;
+    let cleaned_text = clean_qwen_generated_text(&tokenizer_dir, &generated)?;
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!(
+            "{provider_label} Qwen3-ASR 0.6B greedy wav smoke completed; wav frames: {}; audio tokens: {audio_tokens}; audio feature frames: {audio_feature_frames}; prompt tokens: {}; generated ids: {}; decoded text: {}; cleaned text: {}; steps: {total_steps}; feature {feature_ms} ms; conv {conv_ms} ms; encoder {encoder_ms} ms; decoder steps ms: {}; total {} ms",
+            audio.len(),
+            prompt_ids.len(),
+            generated.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", "),
+            decoded_text,
+            cleaned_text,
+            step_timings.iter().map(|ms| ms.to_string()).collect::<Vec<_>>().join(", "),
+            total_started_at.elapsed().as_millis()
+        ),
+        model_inputs,
+        model_outputs,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+fn create_directml_qwen_chain_smoke_session_with_features(
+    conv_frontend_path: &Path,
+    encoder_path: &Path,
+    decoder_path: &Path,
+    input_frames: usize,
+    input_feature_values: Vec<f32>,
+    input_kind: &str,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    if !cfg!(windows) {
+        return Err("DirectML is only available on Windows.".to_string());
+    }
+    if input_frames == 0 || input_feature_values.len() != input_frames * 128 {
+        return Err(format!(
+            "Qwen fbank feature shape is invalid: frames {}, values {}",
+            input_frames,
+            input_feature_values.len()
+        ));
+    }
+
+    use ort::{inputs, value::Tensor};
+
+    let total_started_at = Instant::now();
+    let mut conv_session = directml_session_builder()?
+        .commit_from_file(conv_frontend_path)
+        .map_err(|error| {
+            format!("Failed to create DirectML Qwen conv_frontend session: {error}")
+        })?;
+    let conv_inputs_summary = ort_outlet_summaries(conv_session.inputs());
+    let conv_outputs_summary = ort_outlet_summaries(conv_session.outputs());
+
+    let conv_started_at = Instant::now();
+    let input_features =
+        Tensor::<f32>::from_array(([1usize, input_frames, 128], input_feature_values))
+            .map_err(|error| format!("Failed to create Qwen input_features tensor: {error}"))?;
+    let conv_outputs = conv_session
+        .run(inputs!["input_features" => input_features])
+        .map_err(|error| format!("DirectML Qwen conv_frontend run failed: {error}"))?;
+    let conv_ms = conv_started_at.elapsed().as_millis();
+    let (conv_shape, conv_data) = conv_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen conv output tensor: {error}"))?;
+    let conv_shape_usize = conv_shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| format!("Invalid Qwen conv output dim: {dim}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let conv_frames = conv_shape_usize.get(1).copied().unwrap_or(0).max(1);
+    let valid_audio_tokens = qwen_valid_audio_tokens(input_frames, conv_frames);
+    let conv_data = conv_data.to_vec();
+    drop(conv_outputs);
+    drop(conv_session);
+
+    let mut encoder_session = directml_session_builder()?
+        .commit_from_file(encoder_path)
+        .map_err(|error| format!("Failed to create DirectML Qwen encoder session: {error}"))?;
+    let encoder_inputs_summary = ort_outlet_summaries(encoder_session.inputs());
+    let encoder_outputs_summary = ort_outlet_summaries(encoder_session.outputs());
+    let encoder_features = Tensor::<f32>::from_array((conv_shape_usize, conv_data))
+        .map_err(|error| format!("Failed to create Qwen encoder input_features tensor: {error}"))?;
+    let mut feature_attention_mask_values = vec![false; conv_frames];
+    for value in feature_attention_mask_values
+        .iter_mut()
+        .take(valid_audio_tokens.min(conv_frames))
+    {
+        *value = true;
+    }
+    let feature_attention_mask =
+        Tensor::<bool>::from_array(([1usize, conv_frames], feature_attention_mask_values))
+            .map_err(|error| {
+                format!("Failed to create Qwen feature_attention_mask tensor: {error}")
+            })?;
+    let encoder_started_at = Instant::now();
+    let encoder_outputs = encoder_session
+        .run(inputs![
+            "input_features" => encoder_features,
+            "feature_attention_mask" => feature_attention_mask,
+        ])
+        .map_err(|error| format!("DirectML Qwen encoder run failed: {error}"))?;
+    let encoder_ms = encoder_started_at.elapsed().as_millis();
+    let (audio_shape, audio_data) = encoder_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen encoder output tensor: {error}"))?;
+    let audio_shape_usize = audio_shape
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| format!("Invalid Qwen audio feature dim: {dim}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut audio_shape_usize = audio_shape_usize;
+    let mut audio_data = audio_data.to_vec();
+    let trimmed_audio_frames = trim_qwen_audio_features(&mut audio_shape_usize, &mut audio_data);
+    let audio_tokens = valid_audio_tokens.min(trimmed_audio_frames).max(1);
+    let audio_feature_frames =
+        truncate_qwen_audio_features(&mut audio_shape_usize, &mut audio_data, audio_tokens);
+    drop(encoder_outputs);
+    drop(encoder_session);
+
+    let mut decoder_session = directml_session_builder()?
+        .commit_from_file(decoder_path)
+        .map_err(|error| format!("Failed to create DirectML Qwen decoder session: {error}"))?;
+    let decoder_inputs_summary = ort_outlet_summaries(decoder_session.inputs());
+    let decoder_outputs_summary = ort_outlet_summaries(decoder_session.outputs());
+
+    let mut named_inputs: Vec<(String, ort::session::SessionInputValue)> = Vec::new();
+    named_inputs.push((
+        "input_ids".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array(([1usize, 1usize], vec![151644i64]))
+                .map_err(|error| format!("Failed to create Qwen input_ids tensor: {error}"))?
+                .into_dyn(),
+        ),
+    ));
+    named_inputs.push((
+        "audio_features".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<f32>::from_array((audio_shape_usize, audio_data))
+                .map_err(|error| {
+                    format!("Failed to create Qwen decoder audio_features tensor: {error}")
+                })?
+                .into_dyn(),
+        ),
+    ));
+    named_inputs.push((
+        "attention_mask".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array(([1usize, 1usize], vec![1i64]))
+                .map_err(|error| format!("Failed to create Qwen attention_mask tensor: {error}"))?
+                .into_dyn(),
+        ),
+    ));
+    named_inputs.push((
+        "cache_position".to_string(),
+        ort::session::SessionInputValue::Owned(
+            Tensor::<i64>::from_array(([1usize], vec![0i64]))
+                .map_err(|error| format!("Failed to create Qwen cache_position tensor: {error}"))?
+                .into_dyn(),
+        ),
+    ));
+    let max_total_len = 512usize.max(audio_tokens + 8);
+    for layer in 0..28usize {
+        let shape = [1usize, max_total_len, 8usize, 128usize];
+        let zeros = vec![0.0f32; max_total_len * 8 * 128];
+        named_inputs.push((
+            format!("cache_key_{layer}"),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<f32>::from_array((shape, zeros.clone()))
+                    .map_err(|error| {
+                        format!("Failed to create Qwen cache_key_{layer} tensor: {error}")
+                    })?
+                    .into_dyn(),
+            ),
+        ));
+        named_inputs.push((
+            format!("cache_value_{layer}"),
+            ort::session::SessionInputValue::Owned(
+                Tensor::<f32>::from_array((shape, zeros.clone()))
+                    .map_err(|error| {
+                        format!("Failed to create Qwen cache_value_{layer} tensor: {error}")
+                    })?
+                    .into_dyn(),
+            ),
+        ));
+    }
+
+    let decoder_started_at = Instant::now();
+    let decoder_outputs = decoder_session
+        .run(named_inputs)
+        .map_err(|error| format!("DirectML Qwen decoder single-step run failed: {error}"))?;
+    let decoder_ms = decoder_started_at.elapsed().as_millis();
+    let (logits_shape, _logits) = decoder_outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|error| format!("Failed to extract Qwen decoder logits tensor: {error}"))?;
+    let logits_shape = logits_shape
+        .iter()
+        .map(|dim| dim.to_string())
+        .collect::<Vec<_>>()
+        .join("x");
+    drop(decoder_outputs);
+    drop(decoder_session);
+
+    let mut model_inputs = Vec::new();
+    model_inputs.extend(
+        conv_inputs_summary
+            .iter()
+            .map(|item| format!("qwen conv {item}")),
+    );
+    model_inputs.extend(
+        encoder_inputs_summary
+            .iter()
+            .map(|item| format!("qwen encoder {item}")),
+    );
+    model_inputs.extend(
+        decoder_inputs_summary
+            .iter()
+            .map(|item| format!("qwen decoder {item}")),
+    );
+
+    let mut model_outputs = Vec::new();
+    model_outputs.extend(
+        conv_outputs_summary
+            .iter()
+            .map(|item| format!("qwen conv {item}")),
+    );
+    model_outputs.extend(
+        encoder_outputs_summary
+            .iter()
+            .map(|item| format!("qwen encoder {item}")),
+    );
+    model_outputs.extend(
+        decoder_outputs_summary
+            .iter()
+            .map(|item| format!("qwen decoder {item}")),
+    );
+
+    Ok(DirectMlSessionProbeCliResult {
+        ok: true,
+        message: format!(
+            "DirectML Qwen3-ASR 0.6B conv->encoder->decoder smoke completed; input kind: {input_kind}; input frames: {input_frames}; conv frames: {conv_frames}; audio tokens: {audio_tokens}; audio feature frames: {audio_feature_frames}; logits shape: {logits_shape}; conv {conv_ms} ms; encoder {encoder_ms} ms; decoder {decoder_ms} ms; total {} ms",
+            total_started_at.elapsed().as_millis()
+        ),
+        model_inputs,
+        model_outputs,
+        onnx_runtime_build: Some(ort::info().to_string()),
+    })
+}
+fn with_directml_sensevoice_runtime<T>(
+    app: &AppHandle,
+    candidate: &DirectMlSplitSenseVoiceCandidate,
+    task_id: Option<&str>,
+    started_at: Instant,
+    action: impl FnOnce(&mut DirectMlSenseVoiceRuntime) -> Result<T, String>,
+) -> Result<T, String> {
+    let state = app.state::<RuntimeState>();
+    let mut cached = state
+        .directml_sensevoice
+        .lock()
+        .map_err(|error| error.to_string())?;
+
+    let cache_matches = cached.as_ref().is_some_and(|runtime| {
+        runtime.encoder_path == candidate.encoder
+            && runtime.ctc_path == candidate.ctc
+            && runtime.tokenizer_path == candidate.tokenizer
+    });
+
+    if !cache_matches {
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            18,
+            "Loading DirectML split SenseVoice sessions".to_string(),
+            0,
+            0,
+        );
+        let load_started_at = Instant::now();
+        let pieces = load_sentencepiece_pieces(&candidate.tokenizer)?;
+        let encoder_session = directml_session_builder()?
+            .commit_from_file(&candidate.encoder)
+            .map_err(|error| {
+                format!("Failed to create DirectML split SenseVoice encoder session: {error}")
+            })?;
+        let ctc_session = directml_session_builder()?
+            .commit_from_file(&candidate.ctc)
+            .map_err(|error| {
+                format!("Failed to create DirectML split SenseVoice CTC session: {error}")
+            })?;
+        *cached = Some(DirectMlSenseVoiceRuntime {
+            encoder_path: candidate.encoder.clone(),
+            ctc_path: candidate.ctc.clone(),
+            tokenizer_path: candidate.tokenizer.clone(),
+            pieces,
+            encoder_session,
+            ctc_session,
+        });
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            19,
+            format!(
+                "DirectML SenseVoice sessions cached in {} ms",
+                load_started_at.elapsed().as_millis()
+            ),
+            0,
+            0,
+        );
+    } else {
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            19,
+            "Reusing cached DirectML SenseVoice sessions".to_string(),
+            0,
+            0,
+        );
+    }
+
+    let runtime = cached
+        .as_mut()
+        .ok_or_else(|| "DirectML SenseVoice runtime cache was not initialized.".to_string())?;
+    action(runtime)
+}
 fn transcribe_directml_sensevoice_wav(
     app: &AppHandle,
     candidate: &DirectMlSplitSenseVoiceCandidate,
@@ -4466,92 +6394,73 @@ fn transcribe_directml_sensevoice_wav(
         ));
     }
 
-    emit_transcription_progress(
-        app,
-        task_id,
-        started_at,
-        "transcribing",
-        18,
-        "Loading DirectML split SenseVoice sessions".to_string(),
-        0,
-        0,
-    );
-
-    let pieces = load_sentencepiece_pieces(&candidate.tokenizer)?;
-    let mut encoder_session = directml_session_builder()?
-        .commit_from_file(&candidate.encoder)
-        .map_err(|error| {
-            format!("Failed to create DirectML split SenseVoice encoder session: {error}")
-        })?;
-    let mut ctc_session = directml_session_builder()?
-        .commit_from_file(&candidate.ctc)
-        .map_err(|error| {
-            format!("Failed to create DirectML split SenseVoice CTC session: {error}")
-        })?;
-
     let audio = read_wav_mono_16k_f32(wav_path)?;
     let chunk_samples = 30usize * 16_000;
     let total_chunks = audio.len().div_ceil(chunk_samples).max(1);
+    ensure_transcription_not_cancelled(app, task_id)?;
     let mut transcript_chunks = Vec::new();
     let mut total_feature_ms = 0u128;
     let mut total_inference_ms = 0u128;
 
-    for (chunk_index, chunk_audio) in audio.chunks(chunk_samples).enumerate() {
-        let start = chunk_index as f64 * 30.0;
-        let end = start + chunk_audio.len() as f64 / 16_000.0;
-        let progress = 20 + ((chunk_index as u32 * 70) / total_chunks as u32).min(70) as u8;
-        emit_transcription_progress(
-            app,
-            task_id,
-            started_at,
-            "transcribing",
-            progress,
-            format!(
-                "DirectML SenseVoice chunk {}/{}",
-                chunk_index + 1,
-                total_chunks
-            ),
-            chunk_index,
-            total_chunks,
-        );
+    with_directml_sensevoice_runtime(app, candidate, task_id, started_at, |runtime| {
+        for (chunk_index, chunk_audio) in audio.chunks(chunk_samples).enumerate() {
+            let start = chunk_index as f64 * 30.0;
+            let end = start + chunk_audio.len() as f64 / 16_000.0;
+            let progress = 20 + ((chunk_index as u32 * 70) / total_chunks as u32).min(70) as u8;
+            emit_transcription_progress(
+                app,
+                task_id,
+                started_at,
+                "transcribing",
+                progress,
+                format!(
+                    "DirectML SenseVoice chunk {}/{}",
+                    chunk_index + 1,
+                    total_chunks
+                ),
+                chunk_index,
+                total_chunks,
+            );
 
-        let feature_started_at = Instant::now();
-        let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
-        let feature_ms = feature_started_at.elapsed().as_millis();
-        total_feature_ms += feature_ms;
+            let feature_started_at = Instant::now();
+            let lfr_features = extract_sensevoice_lfr_features(chunk_audio);
+            let feature_ms = feature_started_at.elapsed().as_millis();
+            total_feature_ms += feature_ms;
 
-        let inference_started_at = Instant::now();
-        let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
-            &mut encoder_session,
-            &mut ctc_session,
-            &pieces,
-            &lfr_features,
-        )?;
-        let inference_ms = inference_started_at.elapsed().as_millis();
-        total_inference_ms += inference_ms;
+            let inference_started_at = Instant::now();
+            let (text, _collapsed_ids, _valid_frames) = run_directml_sensevoice_lfr_chunk(
+                &mut runtime.encoder_session,
+                &mut runtime.ctc_session,
+                &runtime.pieces,
+                &lfr_features,
+            )?;
+            let inference_ms = inference_started_at.elapsed().as_millis();
+            total_inference_ms += inference_ms;
 
-        emit_transcription_progress(
-            app,
-            task_id,
-            started_at,
-            "transcribing",
-            progress,
-            format!(
-                "DirectML SenseVoice chunk {}/{} finished; feature {} ms, inference {} ms",
+            emit_transcription_progress(
+                app,
+                task_id,
+                started_at,
+                "transcribing",
+                progress,
+                format!(
+                    "DirectML SenseVoice chunk {}/{} finished; feature {} ms, inference {} ms",
+                    chunk_index + 1,
+                    total_chunks,
+                    feature_ms,
+                    inference_ms
+                ),
                 chunk_index + 1,
                 total_chunks,
-                feature_ms,
-                inference_ms
-            ),
-            chunk_index + 1,
-            total_chunks,
-        );
+            );
 
-        let text = clean_subtitle_text_one_line(&text);
-        if !text.is_empty() {
-            transcript_chunks.push(TranscriptTextChunk { text, start, end });
+            let text = clean_subtitle_text_one_line(&text);
+            if !text.is_empty() {
+                transcript_chunks.push(TranscriptTextChunk { text, start, end });
+            }
         }
-    }
+        Ok(())
+    })?;
 
     emit_transcription_progress(
         app,
@@ -4593,11 +6502,14 @@ fn directml_probe_candidate_dirs(
     let mut candidates = Vec::new();
     candidates.push(requested.clone());
     candidates.push(requested.join("sensevoice-small"));
+    candidates.push(requested.join("qwen3-asr-0.6b"));
     if let Some(parent) = requested.parent() {
         candidates.push(parent.join("sensevoice-small"));
+        candidates.push(parent.join("qwen3-asr-0.6b"));
     }
     if let Some(models_dir) = app_models_dir {
         candidates.push(models_dir.join("sensevoice-small"));
+        candidates.push(models_dir.join("qwen3-asr-0.6b"));
     }
 
     let mut unique = Vec::new();
@@ -4619,11 +6531,25 @@ fn select_directml_probe_model_dir(
     let candidates = directml_probe_candidate_dirs(requested_model_dir, app_models_dir);
     candidates
         .iter()
-        .find(|candidate| directml_sensevoice_ready(candidate))
+        .find(|candidate| directml_sensevoice_ready(candidate) || directml_qwen_ready(candidate))
         .cloned()
         .unwrap_or_else(|| PathBuf::from(requested_model_dir))
 }
 
+fn create_directml_qwen_sessions_in_child(
+    candidate: &DirectMlQwenCandidate,
+) -> Result<DirectMlSessionProbeCliResult, String> {
+    create_directml_session_in_child_with_args(
+        "--hi-voicer-directml-qwen-chain-smoke",
+        &[
+            &candidate.conv_frontend,
+            &candidate.encoder,
+            &candidate.decoder,
+        ],
+        Duration::from_secs(90),
+        "DirectML Qwen3-ASR 0.6B conv-to-decoder child probe",
+    )
+}
 fn directml_probe_for_model_dir(
     model_dir: &str,
     app_models_dir: Option<PathBuf>,
@@ -4631,25 +6557,43 @@ fn directml_probe_for_model_dir(
     let started_at = Instant::now();
     let model_path = select_directml_probe_model_dir(model_dir, app_models_dir.clone());
     let split_candidate = select_directml_split_sensevoice_candidate(model_dir, app_models_dir);
+    let qwen_candidate = qwen_candidate_for_dir(&model_path);
     let engine = read_sherpa_engine(&model_path).ok();
+    let qwen_missing_files = qwen_missing_files(&qwen_candidate);
+    let qwen_layout_detected = is_qwen_model_layout(&model_path, &qwen_missing_files);
     let mut missing_files = Vec::new();
 
-    let model_id = engine.as_ref().map(|engine| engine.model_id.clone());
-    let model_name = engine.as_ref().map(|engine| engine.model_name.clone());
+    let model_id = engine
+        .as_ref()
+        .map(|engine| engine.model_id.clone())
+        .or_else(|| qwen_layout_detected.then(|| "qwen3-asr-0.6b".to_string()));
+    let model_name = engine
+        .as_ref()
+        .map(|engine| engine.model_name.clone())
+        .or_else(|| qwen_layout_detected.then(|| "Qwen3-ASR 0.6B".to_string()));
     let is_sensevoice = model_id.as_deref() == Some("sensevoice-small");
+    let is_qwen = model_id.as_deref() == Some("qwen3-asr-0.6b");
 
     if !model_path.exists() {
         missing_files.push("model directory".to_string());
     }
-    for required in ["engine.json", "model.int8.onnx", "tokens.txt"] {
-        if !model_path.join(required).exists() {
-            missing_files.push(required.to_string());
+    if is_sensevoice {
+        for required in ["engine.json", "model.int8.onnx", "tokens.txt"] {
+            if !model_path.join(required).exists() {
+                missing_files.push(required.to_string());
+            }
         }
+    } else if is_qwen {
+        missing_files.extend(qwen_missing_files);
+    } else if engine.is_none() {
+        missing_files.push("engine.json".to_string());
+    } else {
+        missing_files.push("unsupported DirectML model family".to_string());
     }
 
     let adapters = query_directml_candidate_adapters();
     let directml_candidate = adapters.iter().any(is_directml_candidate_adapter);
-    let model_ready = is_sensevoice && missing_files.is_empty();
+    let model_ready = (is_sensevoice || is_qwen) && missing_files.is_empty();
     let provider_session_result = if directml_candidate {
         create_directml_provider_session_in_child()
     } else {
@@ -4664,41 +6608,57 @@ fn directml_probe_for_model_dir(
         .unwrap_or(false);
     let provider_session_error = provider_session_result.as_ref().err().cloned();
 
-    let split_model_missing_files = split_sensevoice_missing_files(&split_candidate);
-    let split_model_ready = split_model_missing_files.is_empty();
+    let split_model_missing_files = if is_sensevoice {
+        split_sensevoice_missing_files(&split_candidate)
+    } else {
+        Vec::new()
+    };
+    let split_model_ready = is_sensevoice && split_model_missing_files.is_empty();
     let split_model_session_result = if split_model_ready && provider_session_ready {
         create_directml_split_sensevoice_sessions_in_child(&split_candidate)
-    } else if !provider_session_ready {
+    } else if is_sensevoice && !provider_session_ready {
         Err(
             "Split SenseVoice session check skipped because the DirectML provider probe failed."
                 .to_string(),
         )
-    } else {
+    } else if is_sensevoice {
         Err("Split SenseVoice files are incomplete.".to_string())
+    } else {
+        Err(
+            "Split SenseVoice check skipped because the selected model is not SenseVoiceSmall."
+                .to_string(),
+        )
     };
     let split_model_session_ready = split_model_session_result
         .as_ref()
         .map(|result| result.ok)
         .unwrap_or(false);
-    let split_model_session_error = split_model_session_result.as_ref().err().cloned();
+    let split_model_session_error = if is_sensevoice {
+        split_model_session_result.as_ref().err().cloned()
+    } else {
+        None
+    };
     let split_model_inputs = split_model_session_result
         .as_ref()
+        .ok()
+        .filter(|_| is_sensevoice)
         .map(|result| result.model_inputs.clone())
         .unwrap_or_default();
     let split_model_outputs = split_model_session_result
         .as_ref()
+        .ok()
+        .filter(|_| is_sensevoice)
         .map(|result| result.model_outputs.clone())
         .unwrap_or_default();
 
-    let directml_session_result = if split_model_session_ready {
+    let directml_session_result = if is_qwen && model_ready && provider_session_ready {
+        create_directml_qwen_sessions_in_child(&qwen_candidate)
+    } else if split_model_session_ready {
         split_model_session_result.clone()
-    } else if model_ready && provider_session_ready {
+    } else if is_sensevoice && model_ready && provider_session_ready {
         create_directml_sensevoice_session_in_child(&model_path.join("model.int8.onnx"))
     } else if !provider_session_ready {
-        Err(
-            "SenseVoice session check skipped because the DirectML provider probe failed."
-                .to_string(),
-        )
+        Err("DirectML session check skipped because the provider probe failed.".to_string())
     } else {
         Err("DirectML session check skipped because prerequisites are incomplete.".to_string())
     };
@@ -4725,11 +6685,9 @@ fn directml_probe_for_model_dir(
         session_result.message.clone()
     } else if let Err(provider_error) = &provider_session_result {
         provider_error.clone()
-    } else if !is_sensevoice {
-        "DirectML PoC currently only targets SenseVoiceSmall.".to_string()
     } else if !missing_files.is_empty() {
         format!(
-            "SenseVoiceSmall files are incomplete: {}",
+            "DirectML model files are incomplete: {}",
             missing_files.join(", ")
         )
     } else if !directml_candidate {
@@ -4737,28 +6695,35 @@ fn directml_probe_for_model_dir(
     } else {
         directml_session_error
             .clone()
-            .unwrap_or_else(|| "DirectML SenseVoice session check failed.".to_string())
+            .unwrap_or_else(|| "DirectML model session check failed.".to_string())
     };
-    let next_step = if split_model_session_ready {
+    let next_step = if is_qwen && directml_session_ready {
+        "DirectML Qwen3-ASR 0.6B chain loads, but keep the stable Sherpa path until feature parity, decoded text quality, and decoder speed are proven on real samples.".to_string()
+    } else if is_qwen && provider_session_ready && model_ready {
+        "DirectML provider works, but Qwen chain smoke failed; inspect decoder cache shapes or unsupported operators.".to_string()
+    } else if split_model_session_ready {
         "DirectML SenseVoice is ready for experimental transcription; compare timing and output quality with CPU before making it the default path.".to_string()
     } else if directml_session_ready {
         "DirectML SenseVoice is ready for experimental transcription; run a real audio/video transcription to compare timing and output quality.".to_string()
     } else if provider_session_ready && split_model_ready {
         "DirectML provider works, but split SenseVoice session creation failed; inspect unsupported operators or try another ONNX Runtime version.".to_string()
     } else if provider_session_ready && model_ready {
-        "DirectML provider works, but Sherpa SenseVoiceSmall session creation failed; use a DirectML-friendly split model before enabling transcription.".to_string()
+        "DirectML provider works, but model session creation failed; use a DirectML-friendly model before enabling transcription.".to_string()
     } else if provider_session_ready {
-        "DirectML provider works; place split SenseVoice files under models\\sensevoice-directml or CapsWriter-style models\\SenseVoice-Small\\Sensevoice-Small-ONNX.".to_string()
+        "DirectML provider works; select a supported SenseVoiceSmall or Qwen3-ASR 0.6B model directory before probing model acceleration.".to_string()
     } else {
         "Keep using the stable CPU/Sherpa path; DirectML provider session is not reliable on this machine.".to_string()
     };
-
     DirectMlProbeResult {
         directml_candidate,
         provider_session_ready,
         provider_session_error,
         split_model_ready,
-        split_model_dir: Some(split_candidate.model_dir.to_string_lossy().to_string()),
+        split_model_dir: if is_sensevoice {
+            Some(split_candidate.model_dir.to_string_lossy().to_string())
+        } else {
+            None
+        },
         split_model_missing_files,
         split_model_session_ready,
         split_model_session_error,
@@ -4811,7 +6776,11 @@ fn run_acceleration_smoke_test_inner(
 
     let runtime = resolve_sherpa_runtime(&app, &engine, requested_mode);
     let fallback_reason = runtime.fallback_reason.clone();
-    let performance = transcription_performance("stable");
+    let performance = performance_for_model_and_acceleration(
+        transcription_performance("stable"),
+        &engine,
+        &runtime.mode,
+    );
     let first_result = transcribe_sherpa_wav_once(
         &app,
         &engine,
@@ -4955,6 +6924,7 @@ fn finish_transcription_result(
         return Err(empty_error.to_string());
     }
 
+    ensure_transcription_not_cancelled(app, request.task_id.as_deref())?;
     let duration = wav_duration_seconds(sherpa_audio_path)?.max(1.0);
     let review_audio_path = persist_review_audio(app, source_audio_path, sherpa_audio_path)?;
     let segments = if transcript_chunks.is_empty() {
@@ -5039,6 +7009,8 @@ fn transcribe_file_with_sherpa(
     app: AppHandle,
     request: TranscribeFileRequest,
 ) -> Result<TranscribeFileResult, String> {
+    clear_transcription_cancelled(&app, request.task_id.as_deref())?;
+    ensure_transcription_not_cancelled(&app, request.task_id.as_deref())?;
     let started_at = Instant::now();
     let performance = transcription_performance(&request.performance_mode);
     let _ = performance.file_workers;
@@ -5057,6 +7029,7 @@ fn transcribe_file_with_sherpa(
         return Err("Audio file does not exist.".to_string());
     }
     let sherpa_audio_path = media_to_sherpa_wav(&app, &audio_path)?;
+    ensure_transcription_not_cancelled(&app, request.task_id.as_deref())?;
     emit_transcription_progress(
         &app,
         request.task_id.as_deref(),
@@ -5068,7 +7041,50 @@ fn transcribe_file_with_sherpa(
         0,
     );
 
-    if request.acceleration_mode == "directml" {
+    let model_dir = PathBuf::from(&request.model_dir);
+    let engine = read_sherpa_engine(&model_dir)?;
+    ensure_transcription_not_cancelled(&app, request.task_id.as_deref())?;
+
+    if engine.engine == "faster-whisper" {
+        let chunks = match transcribe_faster_whisper_wav(
+            &app,
+            &engine,
+            &sherpa_audio_path,
+            request.task_id.as_deref(),
+            started_at,
+        ) {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                if sherpa_audio_path != audio_path {
+                    let _ = fs::remove_file(&sherpa_audio_path);
+                }
+                return Err(error);
+            }
+        };
+        let result = finish_transcription_result(
+            &app,
+            &request,
+            started_at,
+            &audio_path,
+            &sherpa_audio_path,
+            chunks,
+            "Faster-Whisper worker ran, but no transcription text was parsed.",
+            if request.acceleration_mode == "directml" {
+                "none"
+            } else {
+                &request.acceleration_mode
+            },
+            request.acceleration_mode == "directml",
+        );
+        if sherpa_audio_path != audio_path {
+            let _ = fs::remove_file(&sherpa_audio_path);
+        }
+        return result;
+    }
+
+    if request.acceleration_mode == "directml"
+        && directml_transcription_supported_for_model(&engine)
+    {
         emit_transcription_progress(
             &app,
             request.task_id.as_deref(),
@@ -5124,10 +7140,21 @@ fn transcribe_file_with_sherpa(
                 );
             }
         }
+    } else if request.acceleration_mode == "directml" {
+        emit_transcription_progress(
+            &app,
+            request.task_id.as_deref(),
+            started_at,
+            "transcribing",
+            18,
+            format!(
+                "DirectML transcription is not enabled for {}; using optimized Sherpa CPU.",
+                engine.model_name
+            ),
+            0,
+            0,
+        );
     }
-
-    let model_dir = PathBuf::from(&request.model_dir);
-    let engine = read_sherpa_engine(&model_dir)?;
 
     let cpu_executable = PathBuf::from(&engine.executable);
     if !cpu_executable.exists() {
@@ -5148,7 +7175,8 @@ fn transcribe_file_with_sherpa(
         0,
         0,
     );
-    let runtime_performance = performance_for_acceleration(performance, &runtime.mode);
+    let runtime_performance =
+        performance_for_model_and_acceleration(performance, &engine, &runtime.mode);
     if let Some(reason) = runtime.fallback_reason.as_ref() {
         emit_transcription_progress(
             &app,
@@ -7159,9 +9187,19 @@ async fn transcribe_file(
     app: AppHandle,
     request: TranscribeFileRequest,
 ) -> Result<TranscribeFileResult, String> {
-    tauri::async_runtime::spawn_blocking(move || transcribe_file_with_sherpa(app, request))
-        .await
-        .map_err(|error| error.to_string())?
+    let cleanup_app = app.clone();
+    let cleanup_task_id = request.task_id.clone();
+    let result =
+        tauri::async_runtime::spawn_blocking(move || transcribe_file_with_sherpa(app, request))
+            .await
+            .map_err(|error| error.to_string())?;
+    let _ = clear_transcription_cancelled(&cleanup_app, cleanup_task_id.as_deref());
+    result
+}
+
+#[tauri::command]
+fn cancel_transcription(app: AppHandle, request: CancelTranscriptionRequest) -> Result<(), String> {
+    mark_transcription_cancelled(&app, &request.task_id)
 }
 
 #[tauri::command]
@@ -7244,14 +9282,15 @@ async fn stop_recording(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .manage(RuntimeState {
             settings: Mutex::new(UserSettings::default()),
             recording: Mutex::new(None),
             sherpa_daemon: Mutex::new(None),
+            directml_sensevoice: Mutex::new(None),
             sherpa_runtime_install: Mutex::new(()),
+            transcription_cancellations: Mutex::new(HashSet::new()),
         })
         .setup(|app| {
             let settings = read_settings(&app.handle()).unwrap_or_else(|_| UserSettings::default());
@@ -7296,6 +9335,7 @@ pub fn run() {
             list_audio_files_in_directory,
             process_audio_file,
             transcribe_file,
+            cancel_transcription,
             validate_model_dir,
             get_acceleration_status,
             prepare_acceleration_runtime,
@@ -7323,7 +9363,6 @@ mod tests {
         fs::create_dir_all(&root).expect("create test root");
         root
     }
-
 
     fn write_installed_model(models_dir: &Path, model_id: &str, executable: &Path) -> PathBuf {
         let model_dir = models_dir.join(model_id);
@@ -7481,6 +9520,78 @@ mod tests {
     }
 
     #[test]
+    fn directml_production_transcription_is_limited_to_sensevoice() {
+        let sensevoice = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "sensevoice-small".to_string(),
+            model_name: "SenseVoiceSmall".to_string(),
+            model_dir: String::new(),
+            executable: String::new(),
+            args: String::new(),
+            required_files: Vec::new(),
+        };
+        let qwen = InstalledEngineConfig {
+            model_id: "qwen3-asr-0.6b".to_string(),
+            model_name: "Qwen3-ASR 0.6B".to_string(),
+            ..sensevoice.clone()
+        };
+
+        assert!(directml_transcription_supported_for_model(&sensevoice));
+        assert!(!directml_transcription_supported_for_model(&qwen));
+        assert!(!sherpa_daemon_supported_for_model(&sensevoice));
+        assert!(sherpa_daemon_supported_for_model(&qwen));
+    }
+    #[test]
+    fn qwen_sherpa_uses_measured_thread_profile() {
+        let qwen = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "qwen3-asr-0.6b".to_string(),
+            model_name: "Qwen3-ASR 0.6B".to_string(),
+            model_dir: String::new(),
+            executable: String::new(),
+            args: String::new(),
+            required_files: Vec::new(),
+        };
+        let paraformer = InstalledEngineConfig {
+            model_id: "sherpa-paraformer-zh".to_string(),
+            model_name: "Paraformer".to_string(),
+            ..qwen.clone()
+        };
+
+        assert_eq!(
+            performance_for_model_and_acceleration(
+                transcription_performance("stable"),
+                &qwen,
+                "cpu"
+            )
+            .sherpa_threads,
+            6
+        );
+        assert_eq!(
+            performance_for_model_and_acceleration(
+                transcription_performance("balanced"),
+                &qwen,
+                "cpu"
+            )
+            .sherpa_threads,
+            3
+        );
+        assert_eq!(
+            performance_for_model_and_acceleration(transcription_performance("fast"), &qwen, "cpu")
+                .sherpa_threads,
+            2
+        );
+        assert_eq!(
+            performance_for_model_and_acceleration(
+                transcription_performance("stable"),
+                &paraformer,
+                "cpu"
+            )
+            .sherpa_threads,
+            transcription_performance("stable").sherpa_threads
+        );
+    }
+    #[test]
     fn acceleration_status_keeps_cpu_effective_when_cuda_is_unavailable() {
         let status =
             acceleration_status_from_parts("cuda", false, None, None, true, false, None, None);
@@ -7601,6 +9712,34 @@ mod tests {
         assert!(features.values.iter().all(|value| value.is_finite()));
     }
 
+    #[test]
+    fn qwen_whisper_fft_matches_reference_dft_power() {
+        let frame = (0..400)
+            .map(|index| {
+                let t = index as f32 / 400.0;
+                (2.0 * std::f32::consts::PI * 7.0 * t).sin()
+                    + 0.25 * (2.0 * std::f32::consts::PI * 19.0 * t).cos()
+            })
+            .collect::<Vec<_>>();
+        let expected = real_dft_power_spectrum(&frame);
+        let actual = whisper_fft_power_spectrum(&frame);
+
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected.iter()) {
+            let tolerance = 1.0e-3 * right.abs().max(1.0);
+            assert!((left - right).abs() < tolerance, "{left} vs {right}");
+        }
+    }
+
+    #[test]
+    fn qwen_fbank_features_have_expected_shape_for_half_second_audio() {
+        let audio = vec![0.0f32; 8_000];
+        let features = extract_qwen_fbank_features(&audio);
+
+        assert_eq!(features.frames, 50);
+        assert_eq!(features.values.len(), features.frames * 128);
+        assert!(features.values.iter().all(|value| value.is_finite()));
+    }
     #[test]
     fn sensevoice_lfr_features_handle_short_audio() {
         let audio = vec![0.0f32; 400];
@@ -7733,6 +9872,165 @@ mod tests {
     }
 
     #[test]
+    fn qwen_candidate_detects_ready_model_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-voicer-qwen-directml-test-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis().unwrap_or(0)
+        ));
+        let tokenizer_dir = root.join("tokenizer");
+        fs::create_dir_all(&tokenizer_dir).expect("create tokenizer dir");
+        for file in [
+            "conv_frontend.onnx",
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+        ] {
+            fs::write(root.join(file), b"placeholder").expect("write qwen onnx file");
+        }
+        for file in ["merges.txt", "tokenizer_config.json", "vocab.json"] {
+            fs::write(tokenizer_dir.join(file), b"placeholder").expect("write tokenizer file");
+        }
+
+        let candidate = qwen_candidate_for_dir(&root);
+
+        let missing = qwen_missing_files(&candidate);
+
+        assert!(missing.is_empty());
+        assert!(directml_qwen_ready(&root));
+        assert!(is_qwen_model_layout(&root, &missing));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn qwen_audio_token_len_matches_sherpa_chunk_formula() {
+        assert_eq!(qwen_feat_to_audio_tokens_len(0, 100), 0);
+        assert_eq!(qwen_feat_to_audio_tokens_len(100, 100), 13);
+        assert_eq!(qwen_feat_to_audio_tokens_len(2076, 100), 270);
+        assert_eq!(qwen_valid_audio_tokens(2076, 273), 270);
+    }
+
+    #[test]
+    fn qwen_audio_features_trim_trailing_zero_frames() {
+        let mut shape = vec![1, 3, 2];
+        let mut data = vec![0.1, -0.2, 0.3, 0.4, 0.0, 0.0];
+
+        let valid = trim_qwen_audio_features(&mut shape, &mut data);
+
+        assert_eq!(valid, 2);
+        assert_eq!(shape, vec![1, 2, 2]);
+        assert_eq!(data, vec![0.1, -0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn qwen_audio_features_can_be_truncated_to_prompt_tokens() {
+        let mut shape = vec![1, 3, 2];
+        let mut data = vec![0.1, -0.2, 0.3, 0.4, 0.5, 0.6];
+
+        let valid = truncate_qwen_audio_features(&mut shape, &mut data, 2);
+
+        assert_eq!(valid, 2);
+        assert_eq!(shape, vec![1, 2, 2]);
+        assert_eq!(data, vec![0.1, -0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn qwen_default_source_ids_follow_sherpa_prompt_scaffold() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-voicer-qwen-tokenizer-test-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis().unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).expect("create tokenizer dir");
+        fs::write(
+            root.join("vocab.json"),
+            r#"{"system":8948,"user":872,"assistant":77091,"Ċ":198}"#,
+        )
+        .expect("write qwen vocab");
+        fs::write(root.join("merges.txt"), b"").expect("write qwen merges");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"151644":{"content":"<|im_start|>"},"151645":{"content":"<|im_end|>"},"151669":{"content":"<|audio_start|>"},"151676":{"content":"<|audio_pad|>"},"151670":{"content":"<|audio_end|>"},"151643":{"content":"<|endoftext|>"}}}"#,
+        )
+        .expect("write qwen tokenizer config");
+
+        let ids = build_qwen_default_source_ids(&root, 2).expect("build source ids");
+
+        assert_eq!(
+            ids,
+            vec![
+                151644, 8948, 198, 151645, 198, 151644, 872, 198, 151669, 151676, 151676, 151670,
+                151645, 198, 151644, 77091, 198,
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn qwen_decode_token_ids_restores_byte_level_text_and_specials() {
+        let root = std::env::temp_dir().join(format!(
+            "hi-voicer-qwen-decode-test-{}-{}",
+            std::process::id(),
+            unix_timestamp_millis().unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).expect("create tokenizer dir");
+        fs::write(
+            root.join("vocab.json"),
+            r#"{"ä½ł":11528,"å¥½":2240,"Ċ":198}"#,
+        )
+        .expect("write qwen vocab");
+        fs::write(root.join("merges.txt"), b"").expect("write qwen merges");
+        fs::write(
+            root.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{"151644":{"content":"<|im_start|>"},"151645":{"content":"<|im_end|>"},"151704":{"content":"<asr_text>"}}}"#,
+        )
+        .expect("write qwen tokenizer config");
+
+        let decoded =
+            decode_qwen_token_ids(&root, &[11528, 2240, 198, 151704]).expect("decode qwen ids");
+        let cleaned =
+            clean_qwen_generated_text(&root, &[151704, 11528, 2240]).expect("clean qwen ids");
+
+        assert_eq!(decoded, "你好\n<asr_text>");
+        assert_eq!(cleaned, "你好");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn qwen_layout_can_be_inferred_from_directory_name_without_engine_json() {
+        let root = std::env::temp_dir()
+            .join(format!("hi-voicer-qwen-name-test-{}", std::process::id()))
+            .join("qwen3-asr-0.6b");
+        let tokenizer_dir = root.join("tokenizer");
+        fs::create_dir_all(&tokenizer_dir).expect("create tokenizer dir");
+        for file in [
+            "conv_frontend.onnx",
+            "encoder.int8.onnx",
+            "decoder.int8.onnx",
+        ] {
+            fs::write(root.join(file), b"placeholder").expect("write qwen onnx file");
+        }
+        for file in ["merges.txt", "tokenizer_config.json", "vocab.json"] {
+            fs::write(tokenizer_dir.join(file), b"placeholder").expect("write tokenizer file");
+        }
+
+        let missing = qwen_missing_files(&qwen_candidate_for_dir(&root));
+
+        assert!(is_qwen_model_layout(&root, &missing));
+        let _ = fs::remove_dir_all(root.parent().unwrap_or(&root));
+    }
+
+    #[test]
+    fn directml_probe_candidates_include_app_qwen_model() {
+        let app_models_dir =
+            PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer\models");
+        let candidates = directml_probe_candidate_dirs(
+            r"C:\Portable\Hi-Voicer\models",
+            Some(app_models_dir.clone()),
+        );
+
+        assert!(candidates.contains(&app_models_dir.join("qwen3-asr-0.6b")));
+    }
+    #[test]
     fn directml_probe_candidates_include_sibling_sensevoice_model() {
         let candidates = directml_probe_candidate_dirs(r"C:\Models\sherpa-paraformer-zh", None);
 
@@ -7855,11 +10153,11 @@ mod tests {
             ..qwen.clone()
         };
 
-        assert_eq!(sherpa_chunk_seconds(&qwen), LLM_ASR_CHUNK_SECONDS);
+        assert_eq!(sherpa_chunk_seconds(&qwen), QWEN_ASR_CHUNK_SECONDS);
         assert_eq!(sherpa_chunk_seconds(&funasr), LLM_ASR_CHUNK_SECONDS);
         assert_eq!(
             sherpa_max_single_pass_seconds(&qwen),
-            LLM_ASR_CHUNK_SECONDS as f64
+            QWEN_ASR_CHUNK_SECONDS as f64
         );
         assert_eq!(sherpa_chunk_seconds(&paraformer), LONG_AUDIO_CHUNK_SECONDS);
         assert_eq!(
@@ -7868,6 +10166,129 @@ mod tests {
         );
     }
 
+    #[test]
+    fn faster_whisper_engine_config_validates() {
+        let root = test_root("faster-whisper-engine-config-validates");
+        let worker = root.join(if cfg!(windows) {
+            "worker.exe"
+        } else {
+            "worker"
+        });
+        fs::write(&worker, b"worker").expect("write worker");
+        fs::write(root.join("model.bin"), b"model").expect("write model");
+        let config = InstalledEngineConfig {
+            engine: "faster-whisper".to_string(),
+            model_id: "faster-whisper".to_string(),
+            model_name: "Faster-Whisper".to_string(),
+            model_dir: root.to_string_lossy().to_string(),
+            executable: worker.to_string_lossy().to_string(),
+            args: "--device cpu --compute-type int8".to_string(),
+            required_files: vec!["model.bin".to_string()],
+        };
+        fs::write(
+            root.join("engine.json"),
+            serde_json::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let validation = validate_model_dir_path(&root.to_string_lossy());
+
+        assert!(validation.valid, "{}", validation.message);
+        assert_eq!(validation.model_name, "Faster-Whisper");
+    }
+
+    #[test]
+    fn parses_faster_whisper_worker_segments() {
+        let raw = r#"{
+            "text":"ignored when segments exist",
+            "segments":[
+                {"start":0.0,"end":1.2,"text":" 第一段 "},
+                {"start":1.2,"end":2.4,"text":"第二段"},
+                {"start":2.4,"end":2.6,"text":"   "}
+            ]
+        }"#;
+
+        let chunks = parse_faster_whisper_worker_output(raw, 5.0).expect("parse output");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "第一段");
+        assert_eq!(chunks[1].start, 1.2);
+    }
+
+    #[test]
+    fn builds_faster_whisper_worker_args() {
+        let engine = InstalledEngineConfig {
+            engine: "faster-whisper".to_string(),
+            model_id: "faster-whisper".to_string(),
+            model_name: "Faster-Whisper".to_string(),
+            model_dir: r"C:\Models\fw".to_string(),
+            executable: r"C:\Engines\fw-worker.exe".to_string(),
+            args: "--device cuda --compute-type int8_float16 --model {modelDir}".to_string(),
+            required_files: Vec::new(),
+        };
+        let wav_path = PathBuf::from(r"C:\Audio\sample.wav");
+        let output_path = PathBuf::from(r"C:\Temp\out.json");
+
+        let args = faster_whisper_args_for_engine(&engine, &wav_path, &output_path).expect("args");
+
+        assert!(args.contains(&"--device".to_string()));
+        assert!(args.contains(&"cuda".to_string()));
+        assert!(args.contains(&r"C:\Models\fw".to_string()));
+        assert!(args.contains(&"--audio".to_string()));
+        assert!(args.contains(&wav_path.to_string_lossy().to_string()));
+        assert!(args.contains(&"--output-json".to_string()));
+        assert!(args.contains(&output_path.to_string_lossy().to_string()));
+    }
+    #[test]
+    fn qwen_runtime_args_force_conservative_generation_limit() {
+        let qwen = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "qwen3-asr-0.6b".to_string(),
+            model_name: "Qwen3-ASR 0.6B".to_string(),
+            model_dir: String::new(),
+            executable: String::new(),
+            args: "--qwen3-asr-max-new-tokens=128 --num-threads=6".to_string(),
+            required_files: Vec::new(),
+        };
+
+        let args = sherpa_args_for_engine_runtime(&qwen, Some(3), "cpu").expect("args");
+
+        assert!(args.contains(&format!(
+            "--qwen3-asr-max-new-tokens={QWEN_ASR_MAX_NEW_TOKENS}"
+        )));
+        assert!(args.contains(&"--num-threads=3".to_string()));
+    }
+
+    #[test]
+    fn qwen_latin_language_drift_can_be_detected_for_diagnostics() {
+        let qwen = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "qwen3-asr-0.6b".to_string(),
+            model_name: "Qwen3-ASR 0.6B".to_string(),
+            model_dir: String::new(),
+            executable: String::new(),
+            args: String::new(),
+            required_files: Vec::new(),
+        };
+        let paraformer = InstalledEngineConfig {
+            model_id: "sherpa-paraformer-zh".to_string(),
+            model_name: "Sherpa Paraformer".to_string(),
+            ..qwen.clone()
+        };
+
+        assert!(!should_keep_sherpa_chunk_text(
+            &qwen,
+            "Un craciun obtinut in jurul ora si jumatate a fost actionat de explozie"
+        ));
+        assert!(should_keep_sherpa_chunk_text(
+            &qwen,
+            "\u{5E7F}\u{897F}\u{58EE}\u{65CF}\u{81EA}\u{6CBB}\u{533A} news report"
+        ));
+        assert!(should_keep_sherpa_chunk_text(
+            &paraformer,
+            "Un craciun obtinut in jurul ora si jumatate a fost actionat de explozie"
+        ));
+    }
     #[test]
     fn command_timeout_kills_hung_processes() {
         let mut command = Command::new("powershell");
@@ -8002,6 +10423,13 @@ Elapsed seconds: 0.16
         assert_eq!(extract_transcription_text(output), "");
     }
 
+    #[test]
+    fn decodes_gbk_sherpa_websocket_json_text() {
+        let bytes = b"{\"text\":\"\xB9\xE3\xCE\xF7\"}";
+        let decoded = decode_sherpa_websocket_text(bytes);
+
+        assert_eq!(extract_transcription_text(&decoded), "广西");
+    }
     #[test]
     fn builds_masked_websocket_binary_frame() {
         let frame = websocket_frame(0x2, b"abc");
@@ -8594,6 +11022,17 @@ Elapsed seconds: 0.16
     }
 
     #[test]
+    fn qwen_silent_chunk_detection_is_conservative() {
+        let root = test_root("qwen-silent-chunk-detection-is-conservative");
+        let silent_path = root.join("silent.wav");
+        let quiet_voice_path = root.join("quiet-voice.wav");
+        write_test_wav_seconds(&silent_path, 1);
+        write_test_wav_with_sample(&quiet_voice_path, 1, 320);
+
+        assert!(wav_likely_silent_for_qwen(&silent_path).expect("silent wav"));
+        assert!(!wav_likely_silent_for_qwen(&quiet_voice_path).expect("quiet voice wav"));
+    }
+    #[test]
     fn recording_output_validation_accepts_usable_wav() {
         let root = test_root("recording-output-validation-accepts-usable-wav");
         let wav_path = root.join("voice.wav");
@@ -8618,6 +11057,20 @@ Elapsed seconds: 0.16
         write_test_wav_seconds(path, 1);
     }
 
+    fn write_test_wav_with_sample(path: &Path, seconds: usize, sample: i16) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+        for index in 0..(16000 * seconds) {
+            let value = if index % 2 == 0 { sample } else { -sample };
+            writer.write_sample(value).expect("write sample");
+        }
+        writer.finalize().expect("finalize wav");
+    }
     fn write_test_wav_seconds(path: &Path, seconds: usize) {
         let spec = hound::WavSpec {
             channels: 1,

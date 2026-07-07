@@ -34,7 +34,7 @@ export interface TranscriptTask {
   id: string;
   fileName: string;
   filePath?: string;
-  status: "queued" | "running" | "done" | "failed";
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress: number;
   outputFormats: Array<"txt" | "timelineTxt" | "srt" | "json" | "edl">;
   message: string;

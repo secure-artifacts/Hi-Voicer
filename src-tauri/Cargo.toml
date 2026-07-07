@@ -1,6 +1,6 @@
 [package]
 name = "hi-voicer"
-version = "1.0.10"
+version = "1.1.0"
 description = "Offline Chinese voice input and transcription desktop app"
 authors = ["Hi-Voicer"]
 edition = "2021"
@@ -15,15 +15,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 arboard = "3"
 cpal = "0.15"
+encoding_rs = "0.8"
 hound = "3.5"
 half = "2"
 ort = { version = "2.0.0-rc.12", features = ["directml", "half"] }
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
-rfd = "0.16"
+rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
-tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-shell = "2"
 windows = { version = "0.54", features = ["Win32_Foundation", "Win32_System_Diagnostics_Debug", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
