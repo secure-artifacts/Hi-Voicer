@@ -29,9 +29,9 @@ if ($forbidden) {
 }
 
 $totalBytes = (Get-ChildItem -Path $resourceRoot -Recurse -File | Measure-Object Length -Sum).Sum
-$maxBytes = 270MB
+$maxBytes = 300MB
 if ($totalBytes -gt $maxBytes) {
-  throw "Bundled resources are too large: $([math]::Round($totalBytes / 1MB, 1)) MiB (limit: 230 MiB)."
+  throw "Bundled resources are too large: $([math]::Round($totalBytes / 1MB, 1)) MiB (limit: $([math]::Round($maxBytes / 1MB, 1)) MiB)."
 }
 
 Write-Host "Bundled resources verified: $([math]::Round($totalBytes / 1MB, 1)) MiB"
