@@ -1,6 +1,6 @@
 [package]
 name = "hi-voicer"
-version = "1.1.1"
+version = "1.2.0"
 description = "Offline Chinese voice input and transcription desktop app"
 authors = ["Hi-Voicer"]
 edition = "2021"
@@ -14,15 +14,17 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 arboard = "3"
+base64 = "0.22"
 cpal = "0.15"
 encoding_rs = "0.8"
 hound = "3.5"
 half = "2"
 ort = { version = "2.0.0-rc.12", features = ["directml", "half"] }
-reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-shell = "2"

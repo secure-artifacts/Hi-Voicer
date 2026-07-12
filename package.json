@@ -1,6 +1,6 @@
 {
   "name": "hi-voicer",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "packageManager": "npm@11.6.2",
@@ -10,6 +10,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:resources": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-bundled-resources.ps1",
+    "prepare:llama": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-llama-runtime.ps1",
+    "prepare:sherpa": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-sherpa-runtime.ps1",
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri"

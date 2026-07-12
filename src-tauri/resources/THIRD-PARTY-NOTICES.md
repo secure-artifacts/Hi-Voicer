@@ -1,6 +1,6 @@
 # Third-Party Runtime Notices
 
-Hi-Voicer currently ships without a bundled GPU runtime. Local transcription models and the Sherpa-ONNX CPU runtime are prepared through the normal model setup flow.
+Hi-Voicer ships CPU-only local inference components and no bundled GPU runtime.
 
 CUDA support has been removed from the public product path because it requires NVIDIA-specific CUDA Toolkit and cuDNN dependencies that are difficult to distribute reliably for ordinary Windows users.
 
@@ -13,3 +13,11 @@ Hi-Voicer release packages include `ffmpeg.exe` and `ffprobe.exe` from the FFmpe
 FFmpeg is a third-party multimedia framework. The bundled Gyan Windows builds are 64-bit static builds licensed as GPLv3. FFmpeg source code is available from https://github.com/FFmpeg/FFmpeg and project information is available at https://ffmpeg.org/.
 
 Hi-Voicer does not modify FFmpeg. `ffplay.exe` is not bundled.
+
+## llama.cpp
+
+Hi-Voicer includes the official `b9964` Windows CPU x64 runtime from llama.cpp for local Qwen3-ASR GGUF inference. llama.cpp is licensed under the MIT License. Project source and license information are available at https://github.com/ggml-org/llama.cpp.
+
+## Sherpa-ONNX
+
+Hi-Voicer includes two static CPU executables from the official Sherpa-ONNX `v1.13.2` Windows release: `sherpa-onnx-offline.exe` and `sherpa-onnx-offline-websocket-server.exe`. Sherpa-ONNX is licensed under the Apache License 2.0. Project source and license information are available at https://github.com/k2-fsa/sherpa-onnx.

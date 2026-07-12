@@ -2,17 +2,19 @@ mod app_state;
 mod config;
 
 use app_state::AppSnapshot;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use config::{HotwordRule, UserSettings};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{hash_map::DefaultHasher, HashMap, HashSet, VecDeque},
     fs,
-    fs::File,
+    fs::{File, OpenOptions},
     hash::{Hash, Hasher},
     io::BufWriter,
     io::{self, Read, Write},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::{mpsc, Arc, Mutex},
@@ -27,6 +29,13 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutEvent, ShortcutState};
 
 const SHERPA_DAEMON_PORT: u16 = 6127;
+const LLAMA_RUNTIME_TAG: &str = "b9964";
+const LLAMA_SERVER_IDLE_SECONDS: u64 = 300;
+const LLAMA_SERVER_START_TIMEOUT_SECONDS: u64 = 30;
+const LLAMA_ASR_CHUNK_SECONDS: u32 = 60;
+const LLAMA_ASR_MAX_TOKENS: usize = 512;
+const QWEN_GGUF_MODEL_FILE: &str = "Qwen3-ASR-0.6B-Q8_0.gguf";
+const QWEN_GGUF_MMPROJ_FILE: &str = "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf";
 const SHERPA_WEBSOCKET_DAEMON_ENABLED: bool = true;
 const SHERPA_WEBSOCKET_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const DAVINCI_TIMECODE_FPS: u64 = 25;
@@ -48,6 +57,7 @@ struct RuntimeState {
     settings: Mutex<UserSettings>,
     recording: Mutex<Option<RecordingSession>>,
     sherpa_daemon: Mutex<Option<SherpaDaemon>>,
+    llama_daemon: Mutex<Option<LlamaDaemon>>,
     directml_sensevoice: Mutex<Option<DirectMlSenseVoiceRuntime>>,
     sherpa_runtime_install: Mutex<()>,
     transcription_cancellations: Mutex<HashSet<String>>,
@@ -76,6 +86,17 @@ struct SherpaDaemon {
     child: Child,
     model_dir: String,
     executable: String,
+    sherpa_threads: usize,
+    runtime_mode: String,
+}
+
+struct LlamaDaemon {
+    child: Child,
+    model_dir: String,
+    executable: String,
+    port: u16,
+    last_used: Instant,
+    active_requests: usize,
 }
 
 struct DirectMlSenseVoiceRuntime {
@@ -88,6 +109,13 @@ struct DirectMlSenseVoiceRuntime {
 }
 
 impl Drop for SherpaDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for LlamaDaemon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -232,6 +260,8 @@ struct ModelInstallRequest {
 struct ModelFileRequest {
     url: String,
     path: String,
+    size: Option<u64>,
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -792,6 +822,7 @@ fn discover_installed_model_in_models_dir(
 ) -> Option<(String, String)> {
     const PREFERRED_MODELS: &[&str] = &[
         "sensevoice-small",
+        "qwen3-asr-0.6b-gguf",
         "qwen3-asr-0.6b",
         "sherpa-funasr-nano",
         "whisper-base",
@@ -1157,6 +1188,183 @@ fn download_file(url: &str, destination: &Path) -> Result<(), String> {
     Err(format!("download failed after 3 attempts: {last_error}"))
 }
 
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn verified_file_matches(
+    path: &Path,
+    expected_size: Option<u64>,
+    expected_sha256: Option<&str>,
+) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if let Some(size) = expected_size {
+        if path.metadata().map_err(|error| error.to_string())?.len() != size {
+            return Ok(false);
+        }
+    }
+    if let Some(expected) = expected_sha256 {
+        if !sha256_file(path)?.eq_ignore_ascii_case(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn partial_download_path(destination: &Path) -> PathBuf {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    destination.with_file_name(format!("{file_name}.part"))
+}
+
+fn download_verified_model_file_once(
+    app: &AppHandle,
+    model_id: &str,
+    url: &str,
+    destination: &Path,
+    expected_size: Option<u64>,
+    expected_sha256: Option<&str>,
+    completed: usize,
+    total: usize,
+) -> Result<(), String> {
+    if verified_file_matches(destination, expected_size, expected_sha256)? {
+        return Ok(());
+    }
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let partial = partial_download_path(destination);
+    let mut offset = partial
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if expected_size.is_some_and(|size| offset == size) {
+        if verified_file_matches(&partial, expected_size, expected_sha256)? {
+            fs::rename(&partial, destination).map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        offset = 0;
+    }
+    if expected_size.is_some_and(|size| offset > size) {
+        fs::remove_file(&partial).map_err(|error| error.to_string())?;
+        offset = 0;
+    }
+
+    let client = http_client()?;
+    let mut request = client.get(url);
+    if offset > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+    }
+    let mut response = request.send().map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("download failed: {url} ({})", response.status()));
+    }
+
+    let resumed = offset > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if offset > 0 && !resumed {
+        offset = 0;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(&partial)
+        .map_err(|error| error.to_string())?;
+    let mut downloaded = offset;
+    let mut next_progress = downloaded.saturating_add(16 * 1024 * 1024);
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+        downloaded = downloaded.saturating_add(read as u64);
+        if downloaded >= next_progress {
+            let downloaded_mb = downloaded as f64 / 1024.0 / 1024.0;
+            let message = match expected_size {
+                Some(size) => format!(
+                    "Downloading {}: {:.0}/{:.0} MiB",
+                    destination
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("model"),
+                    downloaded_mb,
+                    size as f64 / 1024.0 / 1024.0
+                ),
+                None => format!("Downloading model: {downloaded_mb:.0} MiB"),
+            };
+            emit_model_install_progress(app, model_id, message, completed, total);
+            next_progress = downloaded.saturating_add(16 * 1024 * 1024);
+        }
+    }
+    file.flush().map_err(|error| error.to_string())?;
+    drop(file);
+
+    if !verified_file_matches(&partial, expected_size, expected_sha256)? {
+        return Err(format!(
+            "download verification failed for {}",
+            destination.display()
+        ));
+    }
+    fs::rename(&partial, destination).map_err(|error| error.to_string())
+}
+
+fn download_verified_model_file(
+    app: &AppHandle,
+    model_id: &str,
+    model_file: &ModelFileRequest,
+    destination: &Path,
+    completed: usize,
+    total: usize,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=3 {
+        match download_verified_model_file_once(
+            app,
+            model_id,
+            &model_file.url,
+            destination,
+            model_file.size,
+            model_file.sha256.as_deref(),
+            completed,
+            total,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                if attempt < 3 {
+                    thread::sleep(Duration::from_secs(attempt));
+                }
+            }
+        }
+    }
+    Err(format!("download failed after 3 attempts: {last_error}"))
+}
+
 fn sherpa_runtime_relative_executable(runtime_name: &str) -> PathBuf {
     PathBuf::from("engines")
         .join("sherpa")
@@ -1185,6 +1393,61 @@ fn sherpa_runtime_dir_from_executable(executable: &Path) -> Result<PathBuf, Stri
                 executable.to_string_lossy()
             )
         })
+}
+
+fn sherpa_cpu_runtime_search_paths(
+    data_dir: Option<&Path>,
+    resource_dir: Option<&Path>,
+    executable_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let relative = sherpa_runtime_relative_executable(SHERPA_CPU_RUNTIME_NAME);
+    let mut paths = Vec::new();
+    if let Some(data_dir) = data_dir {
+        paths.push(data_dir.join(&relative));
+    }
+    if let Some(resource_dir) = resource_dir {
+        paths.push(resource_dir.join(&relative));
+    }
+    if let Some(executable_dir) = executable_dir {
+        paths.push(executable_dir.join(&relative));
+        paths.push(executable_dir.join("resources").join(&relative));
+    }
+    if let Some(current_dir) = current_dir {
+        paths.push(
+            current_dir
+                .join("src-tauri")
+                .join("resources")
+                .join(&relative),
+        );
+        paths.push(current_dir.join("resources").join(&relative));
+    }
+    paths
+}
+
+fn resolve_sherpa_cpu_runtime(
+    app: &AppHandle,
+    persisted_executable: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(executable) = persisted_executable.filter(|path| path.exists()) {
+        return Ok(executable.to_path_buf());
+    }
+    let data_dir = app.path().app_local_data_dir().ok();
+    let resource_dir = app.path().resource_dir().ok();
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let current_dir = std::env::current_dir().ok();
+    let paths = sherpa_cpu_runtime_search_paths(
+        data_dir.as_deref(),
+        resource_dir.as_deref(),
+        executable_dir.as_deref(),
+        current_dir.as_deref(),
+    );
+    paths.into_iter().find(|path| path.exists()).ok_or_else(|| {
+        "Sherpa-ONNX CPU runtime was not found in the application package or local app data."
+            .to_string()
+    })
 }
 
 fn install_sherpa_runtime_archive(
@@ -1431,6 +1694,86 @@ fn installed_ffmpeg_runtime(app: &AppHandle) -> Result<Option<PathBuf>, String> 
     Ok(system_ffmpeg_path())
 }
 
+fn llama_runtime_search_roots(
+    resource_dir: Option<&Path>,
+    executable_dir: Option<&Path>,
+    current_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        roots.push(
+            resource_dir
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG),
+        );
+    }
+    if let Some(executable_dir) = executable_dir {
+        roots.push(
+            executable_dir
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG),
+        );
+        roots.push(
+            executable_dir
+                .join("resources")
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG),
+        );
+    }
+    if let Some(current_dir) = current_dir {
+        roots.push(
+            current_dir
+                .join("src-tauri")
+                .join("resources")
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG),
+        );
+        roots.push(
+            current_dir
+                .join("resources")
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG),
+        );
+    }
+    roots
+}
+
+fn resolve_llama_server_runtime(app: &AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app.path().resource_dir().ok();
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let current_dir = std::env::current_dir().ok();
+    let roots = llama_runtime_search_roots(
+        resource_dir.as_deref(),
+        executable_dir.as_deref(),
+        current_dir.as_deref(),
+    );
+    for root in &roots {
+        let executable = root.join(if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        });
+        if executable.exists() {
+            return Ok(executable);
+        }
+    }
+    Err(format!(
+        "Bundled llama.cpp runtime was not found. Expected llama-server under: {}",
+        roots
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    ))
+}
+
 fn system_ffprobe_path() -> Option<PathBuf> {
     #[cfg(windows)]
     let mut command = {
@@ -1490,7 +1833,8 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
         0,
         total_steps,
     );
-    let executable = install_sherpa_runtime(&app)?;
+    let executable =
+        resolve_sherpa_cpu_runtime(&app, None).or_else(|_| install_sherpa_runtime(&app))?;
     emit_model_install_progress(
         &app,
         &model.id,
@@ -1561,6 +1905,94 @@ fn install_sherpa_model(app: AppHandle, model: ModelInstallRequest) -> Result<St
         total_steps,
     );
 
+    Ok(model_dir_text)
+}
+
+fn install_qwen_gguf_model(app: AppHandle, model: ModelInstallRequest) -> Result<String, String> {
+    if model.id != "qwen3-asr-0.6b-gguf" {
+        return Err("Unsupported GGUF model recipe.".to_string());
+    }
+    let expected_files = [QWEN_GGUF_MODEL_FILE, QWEN_GGUF_MMPROJ_FILE];
+    if model.model_files.len() != expected_files.len()
+        || !expected_files.iter().all(|expected| {
+            model
+                .model_files
+                .iter()
+                .any(|file| file.path == *expected && file.size.is_some() && file.sha256.is_some())
+        })
+    {
+        return Err(format!(
+            "{} has an incomplete or unverifiable GGUF install recipe.",
+            model.name
+        ));
+    }
+
+    let total_steps = model.model_files.len() + 2;
+    emit_model_install_progress(
+        &app,
+        &model.id,
+        "Checking bundled llama.cpp runtime...".to_string(),
+        0,
+        total_steps,
+    );
+    resolve_llama_server_runtime(&app)?;
+
+    let data_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())?;
+    let model_dir = data_dir.join("models").join(&model.id);
+    fs::create_dir_all(&model_dir).map_err(|error| error.to_string())?;
+
+    for (index, model_file) in model.model_files.iter().enumerate() {
+        let step = index + 1;
+        emit_model_install_progress(
+            &app,
+            &model.id,
+            format!(
+                "Downloading and verifying model file {}/{}: {}",
+                step,
+                model.model_files.len(),
+                model_file.path
+            ),
+            step,
+            total_steps,
+        );
+        let relative_path = ensure_relative_file_path(&model_file.path)?;
+        download_verified_model_file(
+            &app,
+            &model.id,
+            model_file,
+            &model_dir.join(relative_path),
+            step,
+            total_steps,
+        )?;
+    }
+
+    let model_dir_text = model_dir.to_string_lossy().to_string();
+    let config = InstalledEngineConfig {
+        engine: "llama-server".to_string(),
+        model_id: model.id.clone(),
+        model_name: model.name.clone(),
+        model_dir: model_dir_text.clone(),
+        executable: String::new(),
+        args: String::new(),
+        required_files: model
+            .model_files
+            .iter()
+            .map(|model_file| model_file.path.clone())
+            .collect(),
+    };
+    let raw = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    fs::write(model_dir.join("engine.json"), raw).map_err(|error| error.to_string())?;
+
+    emit_model_install_progress(
+        &app,
+        &model.id,
+        format!("{} has been installed.", model.name),
+        total_steps,
+        total_steps,
+    );
     Ok(model_dir_text)
 }
 
@@ -1671,7 +2103,10 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         }
     };
 
-    if !matches!(engine.engine.as_str(), "sherpa-onnx" | "faster-whisper") {
+    if !matches!(
+        engine.engine.as_str(),
+        "sherpa-onnx" | "faster-whisper" | "llama-server"
+    ) {
         return ModelValidationResult {
             valid: false,
             model_name: engine.model_name,
@@ -1679,7 +2114,9 @@ fn validate_model_dir_path(model_dir: &str) -> ModelValidationResult {
         };
     }
 
-    if !PathBuf::from(&engine.executable).exists() {
+    if !matches!(engine.engine.as_str(), "llama-server" | "sherpa-onnx")
+        && !PathBuf::from(&engine.executable).exists()
+    {
         let runtime_name = if engine.engine == "faster-whisper" {
             "Faster-Whisper worker"
         } else {
@@ -2009,15 +2446,29 @@ fn media_to_sherpa_wav(app: &AppHandle, input_path: &Path) -> Result<PathBuf, St
     Ok(output_path)
 }
 
-fn read_sherpa_engine(model_dir: &Path) -> Result<InstalledEngineConfig, String> {
+fn read_installed_engine(model_dir: &Path) -> Result<InstalledEngineConfig, String> {
     let engine_path = model_dir.join("engine.json");
     if !engine_path.exists() {
-        return Err("engine.json was not found in the model directory. Configure a Sherpa model in Settings first.".to_string());
+        return Err("engine.json was not found in the model directory. Configure an offline model in Settings first.".to_string());
     }
 
     let raw_config = fs::read_to_string(engine_path).map_err(|error| error.to_string())?;
-    let engine: InstalledEngineConfig =
+    let mut engine: InstalledEngineConfig =
         serde_json::from_str(&raw_config).map_err(|error| error.to_string())?;
+    if matches!(engine.engine.as_str(), "llama-server" | "sherpa-onnx") {
+        let configured_model_dir = engine.model_dir.clone();
+        engine.model_dir = model_dir.to_string_lossy().to_string();
+        if engine.engine == "sherpa-onnx" && configured_model_dir != engine.model_dir {
+            engine.args = engine
+                .args
+                .replace(&configured_model_dir, &engine.model_dir);
+        }
+    }
+    Ok(engine)
+}
+
+fn read_sherpa_engine(model_dir: &Path) -> Result<InstalledEngineConfig, String> {
+    let engine = read_installed_engine(model_dir)?;
     if engine.engine != "sherpa-onnx" {
         return Err(format!("Unsupported engine: {}", engine.engine));
     }
@@ -2099,8 +2550,7 @@ fn acceleration_status_for_app(
     app: &AppHandle,
     _requested_mode: &str,
 ) -> Result<AccelerationStatus, String> {
-    let cpu_runtime_installed =
-        sherpa_runtime_executable_path(app, SHERPA_CPU_RUNTIME_NAME)?.exists();
+    let cpu_runtime_installed = resolve_sherpa_cpu_runtime(app, None).is_ok();
 
     if _requested_mode == "directml" {
         return Ok(AccelerationStatus {
@@ -2136,17 +2586,24 @@ fn prepare_acceleration_runtime_for_app(
 }
 
 fn resolve_sherpa_runtime(
-    _app: &AppHandle,
+    app: &AppHandle,
     engine: &InstalledEngineConfig,
     _requested_mode: &str,
-) -> ResolvedSherpaRuntime {
-    let cpu_runtime_executable = PathBuf::from(&engine.executable);
+) -> Result<ResolvedSherpaRuntime, String> {
+    let persisted_executable = PathBuf::from(&engine.executable);
+    let cpu_runtime_executable = resolve_sherpa_cpu_runtime(app, Some(&persisted_executable))?;
     let cpu_executable = sherpa_cli_executable_for_engine(engine, &cpu_runtime_executable);
-    ResolvedSherpaRuntime {
+    if !cpu_executable.exists() {
+        return Err(format!(
+            "Sherpa-ONNX executable does not exist: {}",
+            cpu_executable.display()
+        ));
+    }
+    Ok(ResolvedSherpaRuntime {
         executable: cpu_executable,
         mode: "cpu".to_string(),
         fallback_reason: None,
-    }
+    })
 }
 fn is_sherpa_streaming_cli_model(engine: &InstalledEngineConfig) -> bool {
     matches!(engine.model_id.as_str(), "sherpa-zipformer-zh")
@@ -2240,10 +2697,22 @@ fn sherpa_daemon_supported_for_model(engine: &InstalledEngineConfig) -> bool {
     engine.model_id == "qwen3-asr-0.6b"
 }
 
+fn sherpa_daemon_args(
+    engine: &InstalledEngineConfig,
+    sherpa_threads: usize,
+    runtime_mode: &str,
+) -> Result<Vec<String>, String> {
+    let mut args =
+        sherpa_args_for_engine_runtime(engine, Some(sherpa_threads.max(1)), runtime_mode)?;
+    args.push(format!("--port={SHERPA_DAEMON_PORT}"));
+    Ok(args)
+}
+
 fn ensure_sherpa_daemon_running(
     app: &AppHandle,
     engine: &InstalledEngineConfig,
     executable: &Path,
+    sherpa_threads: usize,
     runtime_mode: &str,
 ) -> Result<(), String> {
     let server_exe = sherpa_websocket_server_path(engine, executable);
@@ -2270,6 +2739,8 @@ fn ensure_sherpa_daemon_running(
         if still_running
             && existing.model_dir == engine.model_dir
             && existing.executable == server_exe_text
+            && existing.sherpa_threads == sherpa_threads.max(1)
+            && existing.runtime_mode == runtime_mode
         {
             return Ok(());
         }
@@ -2278,8 +2749,7 @@ fn ensure_sherpa_daemon_running(
     *daemon = None;
 
     let mut command = Command::new(&server_exe);
-    command.args(sherpa_args_for_engine_runtime(engine, None, runtime_mode)?);
-    command.arg(format!("--port={SHERPA_DAEMON_PORT}"));
+    command.args(sherpa_daemon_args(engine, sherpa_threads, runtime_mode)?);
     if let Some(parent) = server_exe.parent() {
         command.current_dir(parent);
     }
@@ -2294,9 +2764,237 @@ fn ensure_sherpa_daemon_running(
         child,
         model_dir: engine.model_dir.clone(),
         executable: server_exe.to_string_lossy().to_string(),
+        sherpa_threads: sherpa_threads.max(1),
+        runtime_mode: runtime_mode.to_string(),
     });
 
     Ok(())
+}
+
+fn llama_threads() -> usize {
+    thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(4)
+        .clamp(1, 12)
+}
+
+fn qwen_gguf_model_paths(model_dir: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let model = model_dir.join(QWEN_GGUF_MODEL_FILE);
+    let mmproj = model_dir.join(QWEN_GGUF_MMPROJ_FILE);
+    if !model.exists() {
+        return Err(format!("Missing GGUF model file: {}", model.display()));
+    }
+    if !mmproj.exists() {
+        return Err(format!(
+            "Missing GGUF audio projector: {}",
+            mmproj.display()
+        ));
+    }
+    Ok((model, mmproj))
+}
+
+fn available_loopback_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|error| error.to_string())?;
+    listener
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| error.to_string())
+}
+
+fn ensure_llama_daemon_running(
+    app: &AppHandle,
+    engine: &InstalledEngineConfig,
+) -> Result<u16, String> {
+    let executable = resolve_llama_server_runtime(app)?;
+    let executable_text = executable.to_string_lossy().to_string();
+    let state = app.state::<RuntimeState>();
+
+    {
+        let mut daemon = state
+            .llama_daemon
+            .lock()
+            .map_err(|error| error.to_string())?;
+        if let Some(existing) = daemon.as_mut() {
+            let still_running = existing
+                .child
+                .try_wait()
+                .map_err(|error| error.to_string())?
+                .is_none();
+            if still_running
+                && existing.model_dir == engine.model_dir
+                && existing.executable == executable_text
+            {
+                existing.last_used = Instant::now();
+                return Ok(existing.port);
+            }
+        }
+        *daemon = None;
+    }
+
+    let model_dir = PathBuf::from(&engine.model_dir);
+    let (model, mmproj) = qwen_gguf_model_paths(&model_dir)?;
+    let port = available_loopback_port()?;
+    let mut command = Command::new(&executable);
+    command
+        .arg("--model")
+        .arg(&model)
+        .arg("--mmproj")
+        .arg(&mmproj)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--threads")
+        .arg(llama_threads().to_string())
+        .arg("--ctx-size")
+        .arg("4096")
+        .arg("--parallel")
+        .arg("1")
+        .arg("--no-webui")
+        .arg("--no-warmup")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(parent) = executable.parent() {
+        command.current_dir(parent);
+    }
+    suppress_command_window(&mut command);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+
+    let health_url = format!("http://127.0.0.1:{port}/health");
+    let client = http_client()?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            return Err(format!(
+                "llama.cpp service exited during startup with status {status}."
+            ));
+        }
+        if client
+            .get(&health_url)
+            .timeout(Duration::from_secs(1))
+            .send()
+            .is_ok_and(|response| response.status().is_success())
+        {
+            break;
+        }
+        if started.elapsed() >= Duration::from_secs(LLAMA_SERVER_START_TIMEOUT_SECONDS) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("llama.cpp service did not become ready in time.".to_string());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+
+    let mut daemon = state
+        .llama_daemon
+        .lock()
+        .map_err(|error| error.to_string())?;
+    *daemon = Some(LlamaDaemon {
+        child,
+        model_dir: engine.model_dir.clone(),
+        executable: executable_text,
+        port,
+        last_used: Instant::now(),
+        active_requests: 0,
+    });
+    Ok(port)
+}
+
+fn parse_llama_asr_content(content: &str) -> String {
+    let text = content
+        .rsplit_once("<asr_text>")
+        .map(|(_, text)| text)
+        .unwrap_or(content)
+        .replace("<|im_end|>", "")
+        .replace("<|endoftext|>", "");
+    text.trim().to_string()
+}
+
+fn transcribe_llama_wav_once(
+    app: &AppHandle,
+    engine: &InstalledEngineConfig,
+    wav_path: &Path,
+) -> Result<String, String> {
+    let audio = fs::read(wav_path).map_err(|error| error.to_string())?;
+    let payload = serde_json::json!({
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {
+                    "data": BASE64_STANDARD.encode(audio),
+                    "format": "wav"
+                }
+            }]
+        }],
+        "temperature": 0,
+        "max_tokens": LLAMA_ASR_MAX_TOKENS,
+        "stream": false
+    });
+    let client = http_client()?;
+    let port = ensure_llama_daemon_running(app, engine)?;
+    {
+        let state = app.state::<RuntimeState>();
+        let mut daemon = state
+            .llama_daemon
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let daemon = daemon
+            .as_mut()
+            .filter(|daemon| daemon.port == port)
+            .ok_or_else(|| "llama.cpp service stopped before transcription began.".to_string())?;
+        daemon.active_requests += 1;
+        daemon.last_used = Instant::now();
+    }
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .timeout(Duration::from_secs(1800))
+        .json(&payload)
+        .send();
+    if let Ok(mut daemon) = app.state::<RuntimeState>().llama_daemon.lock() {
+        if let Some(daemon) = daemon.as_mut().filter(|daemon| daemon.port == port) {
+            daemon.active_requests = daemon.active_requests.saturating_sub(1);
+            daemon.last_used = Instant::now();
+        }
+    }
+    let response =
+        response.map_err(|error| format!("llama.cpp transcription request failed: {error}"))?;
+    let status = response.status();
+    let body = response.text().map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "llama.cpp transcription failed ({status}): {}",
+            body.trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Invalid llama.cpp response: {error}"))?;
+    let content = value
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "llama.cpp response did not contain transcription text.".to_string())?;
+
+    Ok(parse_llama_asr_content(content))
+}
+
+fn start_llama_idle_monitor(app: AppHandle) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        let state = app.state::<RuntimeState>();
+        let Ok(mut daemon) = state.llama_daemon.lock() else {
+            continue;
+        };
+        let should_stop = daemon.as_mut().is_some_and(|daemon| {
+            let exited = daemon.child.try_wait().ok().flatten().is_some();
+            exited
+                || (daemon.active_requests == 0
+                    && daemon.last_used.elapsed() >= Duration::from_secs(LLAMA_SERVER_IDLE_SECONDS))
+        });
+        if should_stop {
+            *daemon = None;
+        }
+    });
 }
 
 fn wav_to_sherpa_websocket_payload(wav_path: &Path) -> Result<Vec<u8>, String> {
@@ -3221,8 +3919,14 @@ fn transcribe_sherpa_wav_once(
     runtime_mode: &str,
 ) -> Result<String, String> {
     if allow_daemon && SHERPA_WEBSOCKET_DAEMON_ENABLED {
-        match ensure_sherpa_daemon_running(app, engine, executable, runtime_mode)
-            .and_then(|_| transcribe_sherpa_wav_websocket(wav_path))
+        match ensure_sherpa_daemon_running(
+            app,
+            engine,
+            executable,
+            performance.sherpa_threads,
+            runtime_mode,
+        )
+        .and_then(|_| transcribe_sherpa_wav_websocket(wav_path))
         {
             Ok(text) if !text.trim().is_empty() => return Ok(text),
             Ok(_) | Err(_) => {}
@@ -3236,6 +3940,98 @@ fn transcribe_sherpa_wav_once(
         performance.sherpa_threads,
         runtime_mode,
     )
+}
+
+fn transcribe_llama_wav(
+    app: &AppHandle,
+    engine: &InstalledEngineConfig,
+    wav_path: &Path,
+    task_id: Option<&str>,
+    started_at: Instant,
+) -> Result<Vec<TranscriptTextChunk>, String> {
+    ensure_transcription_not_cancelled(app, task_id)?;
+    let duration = wav_duration_seconds(wav_path)?;
+    if duration <= LLAMA_ASR_CHUNK_SECONDS as f64 {
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            35,
+            "Running Qwen3-ASR GGUF on CPU".to_string(),
+            0,
+            1,
+        );
+        let text = if wav_likely_silent_for_qwen(wav_path)? {
+            String::new()
+        } else {
+            transcribe_llama_wav_once(app, engine, wav_path)?
+        };
+        ensure_transcription_not_cancelled(app, task_id)?;
+        emit_transcription_progress(
+            app,
+            task_id,
+            started_at,
+            "transcribing",
+            92,
+            "Transcription complete; generating result files".to_string(),
+            1,
+            1,
+        );
+        return Ok(vec![TranscriptTextChunk {
+            text,
+            start: 0.0,
+            end: duration,
+        }]);
+    }
+
+    let (chunks, chunk_dir) = split_wav_into_chunks(app, wav_path, LLAMA_ASR_CHUNK_SECONDS)?;
+    let total_segments = chunks.len();
+    emit_transcription_progress(
+        app,
+        task_id,
+        started_at,
+        "splitting",
+        15,
+        format!("Long audio was split into {total_segments} one-minute GGUF chunks"),
+        0,
+        total_segments,
+    );
+
+    let result = (|| {
+        let mut transcript_chunks = Vec::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            ensure_transcription_not_cancelled(app, task_id)?;
+            let text = if wav_likely_silent_for_qwen(&chunk.path)? {
+                String::new()
+            } else {
+                transcribe_llama_wav_once(app, engine, &chunk.path)?
+            };
+            if !text.trim().is_empty() {
+                transcript_chunks.push(TranscriptTextChunk {
+                    text: text.trim().to_string(),
+                    start: chunk.start,
+                    end: chunk.end,
+                });
+            }
+            let completed = index + 1;
+            let progress =
+                15 + ((completed as f64 / total_segments.max(1) as f64) * 78.0).round() as u8;
+            emit_transcription_progress(
+                app,
+                task_id,
+                started_at,
+                "transcribing",
+                progress,
+                format!("Transcribing GGUF chunk {completed}/{total_segments}"),
+                completed,
+                total_segments,
+            );
+        }
+        Ok(transcript_chunks)
+    })();
+    let _ = fs::remove_dir_all(chunk_dir);
+    result
 }
 
 fn transcribe_sherpa_wav(
@@ -3295,18 +4091,21 @@ fn transcribe_sherpa_wav(
     let chunk_seconds = sherpa_chunk_seconds(engine);
     let (chunks, chunk_dir) = split_wav_into_chunks(app, wav_path, chunk_seconds)?;
     let total_segments = chunks.len();
+    let worker_count = performance.chunk_workers.max(1).min(total_segments.max(1));
     emit_transcription_progress(
         app,
         task_id,
         started_at,
         "splitting",
         15,
-        format!("Long audio was split into {total_segments} chunks"),
+        format!(
+            "Long audio was split into {total_segments} chunks; using {worker_count} workers with {} Sherpa threads each",
+            performance.sherpa_threads
+        ),
         0,
         total_segments,
     );
 
-    let worker_count = performance.chunk_workers.max(1).min(total_segments.max(1));
     let queue = Arc::new(Mutex::new(
         chunks
             .iter()
@@ -6757,14 +7556,7 @@ fn run_acceleration_smoke_test_inner(
         "cpu"
     };
     let model_dir = PathBuf::from(&request.model_dir);
-    let engine = read_sherpa_engine(&model_dir)?;
-    let cpu_executable = PathBuf::from(&engine.executable);
-    if !cpu_executable.exists() {
-        return Err(
-            "Sherpa-ONNX executable does not exist. Configure the model again.".to_string(),
-        );
-    }
-    let _cpu_cli_executable = sherpa_cli_executable_for_engine(&engine, &cpu_executable);
+    let engine = read_installed_engine(&model_dir)?;
 
     let smoke_dir = app
         .path()
@@ -6774,7 +7566,21 @@ fn run_acceleration_smoke_test_inner(
     let smoke_wav = smoke_dir.join(format!("smoke-{}.wav", unix_timestamp_millis()?));
     write_smoke_test_wav(&smoke_wav)?;
 
-    let runtime = resolve_sherpa_runtime(&app, &engine, requested_mode);
+    if engine.engine == "llama-server" {
+        let result = transcribe_llama_wav_once(&app, &engine, &smoke_wav);
+        let _ = fs::remove_file(&smoke_wav);
+        let text = result?;
+        return Ok(AccelerationSmokeTestResult {
+            requested_mode: requested_mode.to_string(),
+            used_mode: "cpu".to_string(),
+            fallback_used: requested_mode != "cpu",
+            elapsed_ms: started_at.elapsed().as_millis(),
+            transcript_preview: text.trim().chars().take(80).collect(),
+            message: "Qwen3-ASR GGUF CPU smoke test completed.".to_string(),
+        });
+    }
+
+    let runtime = resolve_sherpa_runtime(&app, &engine, requested_mode)?;
     let fallback_reason = runtime.fallback_reason.clone();
     let performance = performance_for_model_and_acceleration(
         transcription_performance("stable"),
@@ -7042,8 +7848,88 @@ fn transcribe_file_with_sherpa(
     );
 
     let model_dir = PathBuf::from(&request.model_dir);
-    let engine = read_sherpa_engine(&model_dir)?;
+    let engine = read_installed_engine(&model_dir)?;
     ensure_transcription_not_cancelled(&app, request.task_id.as_deref())?;
+
+    if engine.engine == "llama-server" {
+        emit_transcription_progress(
+            &app,
+            request.task_id.as_deref(),
+            started_at,
+            "transcribing",
+            19,
+            "Actual acceleration path: Qwen3-ASR GGUF CPU".to_string(),
+            0,
+            0,
+        );
+        let mut used_compatibility_fallback = false;
+        let chunks = match transcribe_llama_wav(
+            &app,
+            &engine,
+            &sherpa_audio_path,
+            request.task_id.as_deref(),
+            started_at,
+        ) {
+            Ok(chunks) => chunks,
+            Err(gguf_error) => {
+                let compatibility_dir = app
+                    .path()
+                    .app_local_data_dir()
+                    .map_err(|error| error.to_string())?
+                    .join("models")
+                    .join("qwen3-asr-0.6b");
+                let compatibility_engine = read_sherpa_engine(&compatibility_dir).map_err(|_| {
+                    format!(
+                        "Qwen3-ASR GGUF failed and no compatible ONNX fallback is installed: {gguf_error}"
+                    )
+                })?;
+                used_compatibility_fallback = true;
+                emit_transcription_progress(
+                    &app,
+                    request.task_id.as_deref(),
+                    started_at,
+                    "transcribing",
+                    20,
+                    format!(
+                        "GGUF failed; using the installed ONNX compatibility model: {gguf_error}"
+                    ),
+                    0,
+                    0,
+                );
+                let runtime = resolve_sherpa_runtime(&app, &compatibility_engine, "cpu")?;
+                let fallback_performance = performance_for_model_and_acceleration(
+                    performance,
+                    &compatibility_engine,
+                    &runtime.mode,
+                );
+                transcribe_sherpa_wav(
+                    &app,
+                    &compatibility_engine,
+                    &runtime.executable,
+                    &sherpa_audio_path,
+                    fallback_performance,
+                    request.task_id.as_deref(),
+                    started_at,
+                    &runtime.mode,
+                )?
+            }
+        };
+        let result = finish_transcription_result(
+            &app,
+            &request,
+            started_at,
+            &audio_path,
+            &sherpa_audio_path,
+            chunks,
+            "Qwen3-ASR GGUF ran, but no transcription text was parsed.",
+            "cpu",
+            used_compatibility_fallback,
+        );
+        if sherpa_audio_path != audio_path {
+            let _ = fs::remove_file(&sherpa_audio_path);
+        }
+        return result;
+    }
 
     if engine.engine == "faster-whisper" {
         let chunks = match transcribe_faster_whisper_wav(
@@ -7156,15 +8042,7 @@ fn transcribe_file_with_sherpa(
         );
     }
 
-    let cpu_executable = PathBuf::from(&engine.executable);
-    if !cpu_executable.exists() {
-        return Err(
-            "Sherpa-ONNX executable does not exist. Configure the model again.".to_string(),
-        );
-    }
-    let _cpu_cli_executable = sherpa_cli_executable_for_engine(&engine, &cpu_executable);
-
-    let runtime = resolve_sherpa_runtime(&app, &engine, &request.acceleration_mode);
+    let runtime = resolve_sherpa_runtime(&app, &engine, &request.acceleration_mode)?;
     emit_transcription_progress(
         &app,
         request.task_id.as_deref(),
@@ -7915,6 +8793,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                     if let Ok(mut daemon) = state.sherpa_daemon.lock() {
                         *daemon = None;
                     }
+                    if let Ok(mut daemon) = state.llama_daemon.lock() {
+                        *daemon = None;
+                    }
                 }
                 app.exit(0);
             }
@@ -7947,7 +8828,6 @@ fn get_app_snapshot(state: State<'_, RuntimeState>) -> AppSnapshot {
 #[tauri::command]
 fn load_settings(app: AppHandle, state: State<'_, RuntimeState>) -> Result<UserSettings, String> {
     let settings = read_settings(&app)?;
-    register_global_recording_shortcut(&app, &settings.shortcut)?;
     let mut stored = state.settings.lock().expect("settings mutex poisoned");
     *stored = settings.clone();
     Ok(settings)
@@ -7974,6 +8854,8 @@ async fn install_model(app: AppHandle, model: ModelInstallRequest) -> Result<Str
     tauri::async_runtime::spawn_blocking(move || {
         if model.install_kind == "sherpaOnnx" {
             install_sherpa_model(app, model)
+        } else if model.install_kind == "qwenGguf" {
+            install_qwen_gguf_model(app, model)
         } else {
             install_zip_model(app, model)
         }
@@ -9288,6 +10170,7 @@ pub fn run() {
             settings: Mutex::new(UserSettings::default()),
             recording: Mutex::new(None),
             sherpa_daemon: Mutex::new(None),
+            llama_daemon: Mutex::new(None),
             directml_sensevoice: Mutex::new(None),
             sherpa_runtime_install: Mutex::new(()),
             transcription_cancellations: Mutex::new(HashSet::new()),
@@ -9303,7 +10186,12 @@ pub fn run() {
             apply_mini_window_visibility(&app.handle(), settings.show_mini_window);
             apply_wave_window_visibility(&app.handle(), false);
             setup_tray(app)?;
-            register_global_recording_shortcut(&app.handle(), &settings.shortcut)?;
+            if let Err(error) =
+                register_global_recording_shortcut(&app.handle(), &settings.shortcut)
+            {
+                eprintln!("global shortcut unavailable during startup: {error}");
+            }
+            start_llama_idle_monitor(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -9354,11 +10242,7 @@ mod tests {
     use super::*;
 
     fn test_root(name: &str) -> PathBuf {
-        let root = std::env::current_dir()
-            .expect("current dir")
-            .join("target")
-            .join("hi-voicer-tests")
-            .join(name);
+        let root = std::env::temp_dir().join("hi-voicer-tests").join(name);
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("create test root");
         root
@@ -9385,6 +10269,162 @@ mod tests {
         .expect("write engine config");
 
         model_dir
+    }
+
+    #[test]
+    fn parses_qwen_gguf_asr_marker() {
+        assert_eq!(
+            parse_llama_asr_content("language Chinese<asr_text>这是识别结果<|im_end|>"),
+            "这是识别结果"
+        );
+        assert_eq!(parse_llama_asr_content("plain response"), "plain response");
+    }
+
+    #[test]
+    fn qwen_gguf_paths_require_model_and_projector() {
+        let root = test_root("qwen-gguf-paths-require-model-and-projector");
+        fs::write(root.join(QWEN_GGUF_MODEL_FILE), b"model").expect("write model");
+        assert!(qwen_gguf_model_paths(&root).is_err());
+        fs::write(root.join(QWEN_GGUF_MMPROJ_FILE), b"projector").expect("write projector");
+
+        let (model, projector) = qwen_gguf_model_paths(&root).expect("GGUF paths");
+        assert!(model.ends_with(QWEN_GGUF_MODEL_FILE));
+        assert!(projector.ends_with(QWEN_GGUF_MMPROJ_FILE));
+    }
+
+    #[test]
+    fn llama_runtime_roots_cover_packaged_and_development_layouts() {
+        let resource = PathBuf::from(r"C:\Program Files\Hi-Voicer\resources");
+        let executable = PathBuf::from(r"C:\Program Files\Hi-Voicer");
+        let current = PathBuf::from(r"A:\Gmini\Hi-Voicer");
+        let roots = llama_runtime_search_roots(Some(&resource), Some(&executable), Some(&current));
+
+        assert!(roots.contains(
+            &resource
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG)
+        ));
+        assert!(roots.contains(
+            &current
+                .join("src-tauri")
+                .join("resources")
+                .join("engines")
+                .join("llama")
+                .join(LLAMA_RUNTIME_TAG)
+        ));
+    }
+
+    #[test]
+    fn sherpa_runtime_paths_cover_packaged_and_development_layouts() {
+        let data = PathBuf::from(r"C:\Users\tester\AppData\Local\com.local.hivoicer");
+        let resource = PathBuf::from(r"C:\Program Files\Hi-Voicer");
+        let current = PathBuf::from(r"A:\Gmini\Hi-Voicer");
+        let paths = sherpa_cpu_runtime_search_paths(
+            Some(&data),
+            Some(&resource),
+            Some(&resource),
+            Some(&current),
+        );
+        let relative = sherpa_runtime_relative_executable(SHERPA_CPU_RUNTIME_NAME);
+
+        assert!(paths.contains(&data.join(&relative)));
+        assert!(paths.contains(&resource.join(&relative)));
+        assert!(paths.contains(&current.join("src-tauri").join("resources").join(&relative)));
+    }
+
+    #[test]
+    fn copied_sherpa_config_rebinds_model_directory_and_arguments() {
+        let root = test_root("copied-sherpa-config-rebinds-model-directory");
+        fs::write(root.join("model.int8.onnx"), b"placeholder").expect("write model");
+        let original = r"C:\Users\original-user\models\sensevoice-small";
+        let config = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "sensevoice-small".to_string(),
+            model_name: "SenseVoiceSmall".to_string(),
+            model_dir: original.to_string(),
+            executable: r"C:\Users\original-user\engines\sherpa-onnx-offline.exe".to_string(),
+            args: format!("--sense-voice-model=\"{original}\\model.int8.onnx\""),
+            required_files: vec!["model.int8.onnx".to_string()],
+        };
+        fs::write(
+            root.join("engine.json"),
+            serde_json::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let validation = validate_model_dir_path(&root.to_string_lossy());
+        assert!(validation.valid, "{}", validation.message);
+        let loaded = read_installed_engine(&root).expect("read copied Sherpa config");
+        assert_eq!(loaded.model_dir, root.to_string_lossy());
+        assert!(loaded.args.contains(&root.to_string_lossy().to_string()));
+        assert!(!loaded.args.contains(original));
+    }
+
+    #[test]
+    fn validates_llama_model_without_persisted_runtime_path() {
+        let root = test_root("validates-llama-model-without-persisted-runtime-path");
+        for file in [QWEN_GGUF_MODEL_FILE, QWEN_GGUF_MMPROJ_FILE] {
+            fs::write(root.join(file), b"placeholder").expect("write GGUF file");
+        }
+        let config = InstalledEngineConfig {
+            engine: "llama-server".to_string(),
+            model_id: "qwen3-asr-0.6b-gguf".to_string(),
+            model_name: "Qwen3-ASR 0.6B 高效版".to_string(),
+            model_dir: r"C:\Users\original-user\copied-model".to_string(),
+            executable: String::new(),
+            args: String::new(),
+            required_files: vec![
+                QWEN_GGUF_MODEL_FILE.to_string(),
+                QWEN_GGUF_MMPROJ_FILE.to_string(),
+            ],
+        };
+        fs::write(
+            root.join("engine.json"),
+            serde_json::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
+
+        let result = validate_model_dir_path(&root.to_string_lossy());
+        assert!(result.valid, "{}", result.message);
+        let loaded = read_installed_engine(&root).expect("read copied GGUF config");
+        assert_eq!(loaded.model_dir, root.to_string_lossy());
+    }
+
+    #[test]
+    fn verifies_sha256_and_expected_size() {
+        let root = test_root("verifies-sha256-and-expected-size");
+        let file = root.join("sample.bin");
+        fs::write(&file, b"abc").expect("write sample");
+
+        assert_eq!(
+            sha256_file(&file).expect("hash"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verified_file_matches(
+            &file,
+            Some(3),
+            Some("BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD")
+        )
+        .expect("verify"));
+        assert!(!verified_file_matches(&file, Some(4), None).expect("size mismatch"));
+    }
+
+    #[test]
+    fn qwen_sherpa_daemon_uses_selected_thread_count() {
+        let engine = InstalledEngineConfig {
+            engine: "sherpa-onnx".to_string(),
+            model_id: "qwen3-asr-0.6b".to_string(),
+            model_name: "Qwen3-ASR 0.6B".to_string(),
+            model_dir: String::new(),
+            executable: String::new(),
+            args: "--num-threads=6".to_string(),
+            required_files: Vec::new(),
+        };
+
+        let args = sherpa_daemon_args(&engine, 3, "cpu").expect("daemon args");
+        assert!(args.contains(&"--num-threads=3".to_string()));
+        assert!(args.contains(&format!("--port={SHERPA_DAEMON_PORT}")));
     }
 
     #[test]

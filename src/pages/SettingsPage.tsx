@@ -325,7 +325,13 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
                 </span>
                 <span>{model.memory}</span>
                 <small>{model.recommendedFor}</small>
-                <em>{model.installKind === "sherpaOnnx" ? "可自动配置 Sherpa" : "需要后续接入引擎"}</em>
+                <em>
+                  {model.installKind === "engineRequired"
+                    ? "需要后续接入引擎"
+                    : model.installKind === "qwenGguf"
+                      ? "自动配置高效转录引擎"
+                      : "可自动配置 Sherpa"}
+                </em>
               </button>
             );
           })}
@@ -343,7 +349,9 @@ export function SettingsPage({ settings, onOpenRecordingsFolder, onSettingsChang
             onClick={() => void handleInstallSelectedModel()}
           >
             <Download size={17} />
-            {selectedModel.installKind === "sherpaOnnx" ? `下载并配置 ${selectedModel.name}` : `查看 ${selectedModel.name}`}
+            {selectedModel.installKind === "engineRequired"
+              ? `查看 ${selectedModel.name}`
+              : `下载并配置 ${selectedModel.name}`}
           </button>
         </div>
         <p className="model-message">

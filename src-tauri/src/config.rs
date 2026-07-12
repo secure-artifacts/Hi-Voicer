@@ -81,7 +81,7 @@ impl Default for UserSettings {
             model_dir: String::new(),
             input_model_id: "sensevoice-small".to_string(),
             input_model_dir: String::new(),
-            transcription_model_id: "qwen3-asr-0.6b".to_string(),
+            transcription_model_id: "qwen3-asr-0.6b-gguf".to_string(),
             transcription_model_dir: String::new(),
             output_dir: String::new(),
             paste_mode: "clipboard".to_string(),

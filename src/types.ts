@@ -103,7 +103,7 @@ export interface ModelPreset {
   id: string;
   name: string;
   family: "sherpa" | "whisper" | "funasr" | "qwen";
-  installKind: "sherpaOnnx" | "engineRequired";
+  installKind: "sherpaOnnx" | "qwenGguf" | "engineRequired";
   size: string;
   quality: string;
   memory: string;
@@ -119,6 +119,8 @@ export interface ModelPreset {
 export interface ModelFile {
   url: string;
   path: string;
+  size?: number;
+  sha256?: string;
 }
 
 export interface TranscribeFileResult {

@@ -18,6 +18,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify release version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME -replace '^v', ''
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"$').Matches[0].Groups[1].Value
+          if ($tagVersion -ne $packageVersion -or $tagVersion -ne $tauriVersion -or $tagVersion -ne $cargoVersion) {
+            throw "Release version mismatch: tag=$tagVersion package=$packageVersion tauri=$tauriVersion cargo=$cargoVersion"
+          }
+
+      - name: Scan tracked source for embedded secrets
+        shell: pwsh
+        run: |
+          $files = git ls-files | Where-Object { $_ -match '\.(rs|ts|tsx|js|json|md|yml|yaml|ps1|toml)$' }
+          $patterns = @(
+            'AIza[0-9A-Za-z_-]{20,}',
+            'sk-[0-9A-Za-z]{20,}',
+            'gh[pousr]_[0-9A-Za-z]{20,}',
+            'Bearer\s+[0-9A-Za-z._-]{20,}',
+            '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
+            'AKIA[0-9A-Z]{16}'
+          )
+          $matches = Select-String -LiteralPath $files -Pattern $patterns -CaseSensitive:$false -ErrorAction SilentlyContinue
+          if ($matches) {
+            $matches | Format-Table Path, LineNumber, Line -AutoSize
+            throw "Potential embedded secret detected."
+          }
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -65,6 +94,22 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $sourceBin "ffprobe.exe") -Destination (Join-Path $targetDir "ffprobe.exe") -Force
           & (Join-Path $targetDir "ffmpeg.exe") -version
           Get-ChildItem $targetDir
+
+      - name: Prepare llama.cpp CPU runtime
+        shell: pwsh
+        run: ./scripts/prepare-llama-runtime.ps1
+
+      - name: Prepare minimal Sherpa-ONNX CPU runtime
+        shell: pwsh
+        run: ./scripts/prepare-sherpa-runtime.ps1
+
+      - name: Verify bundled resources
+        shell: pwsh
+        run: ./scripts/check-bundled-resources.ps1
+
+      - name: Run Rust tests
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+
       - name: Build Tauri app
         run: npm run tauri -- build
 

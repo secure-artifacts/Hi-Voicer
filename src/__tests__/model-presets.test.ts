@@ -33,6 +33,21 @@ describe("model presets", () => {
     expect(qwen?.sherpaArgs).toContain("--num-threads=6");
     expect(qwen?.sherpaArgs).toContain("--qwen3-asr-max-new-tokens=128");
   });
+
+  it("offers the verified Qwen3 GGUF package as a one-click transcription model", () => {
+    const qwen = modelPresets.find((model) => model.id === "qwen3-asr-0.6b-gguf");
+
+    expect(qwen?.installKind).toBe("qwenGguf");
+    expect(qwen?.modelFiles).toHaveLength(2);
+    expect(qwen?.modelFiles?.map((file) => file.path)).toEqual([
+      "Qwen3-ASR-0.6B-Q8_0.gguf",
+      "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+    ]);
+    for (const file of qwen?.modelFiles ?? []) {
+      expect(file.size).toBeGreaterThan(200_000_000);
+      expect(file.sha256).toMatch(/^[a-f0-9]{64}$/);
+    }
+  });
   it("does not expose superseded Whisper Base or Zipformer presets", () => {
     expect(modelPresets.map((model) => model.id)).not.toContain("whisper-base");
     expect(modelPresets.map((model) => model.id)).not.toContain("sherpa-zipformer-zh");

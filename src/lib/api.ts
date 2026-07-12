@@ -222,7 +222,12 @@ export async function installModel(model: ModelPreset): Promise<string> {
       installKind: model.installKind,
       downloadUrl: model.downloadUrl,
       archiveRoot: model.archiveRoot,
-      modelFiles: model.modelFiles ?? [],
+      modelFiles: (model.modelFiles ?? []).map((file) => ({
+        url: file.url,
+        path: file.path,
+        size: file.size,
+        sha256: file.sha256,
+      })),
       sherpaArgs: model.sherpaArgs ?? "",
     },
   });

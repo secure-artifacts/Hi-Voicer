@@ -40,7 +40,7 @@ export const initialSettings: UserSettings = {
   modelDir: "",
   inputModelId: "sensevoice-small",
   inputModelDir: "",
-  transcriptionModelId: "qwen3-asr-0.6b",
+  transcriptionModelId: "qwen3-asr-0.6b-gguf",
   transcriptionModelDir: "",
   outputDir: "",
   pasteMode: "clipboard",
